@@ -1,0 +1,14 @@
+services:
+  xray-balancer-mw:
+    build: .
+    container_name: xray-balancer-mw
+    restart: unless-stopped
+    volumes:
+      - ./config.json:/app/config.json:ro
+    networks:
+      - remnawave-network
+
+networks:
+  remnawave-network:
+    external: true
+    name: remnawave-network

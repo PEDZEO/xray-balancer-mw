@@ -1,0 +1,25 @@
+{
+    "port": 4100,
+
+    "remnawave_url": "https://panel.example.com",
+    "sub_path": "/api/sub",
+
+    "sub_page_url": "http://subscription-page:3010",
+    "sub_domain": "sub.example.com",
+
+    "api_token": "",
+
+    "strategy": "leastLoad",
+    "probe_interval": "3m",
+    "probe_url": "https://www.gstatic.com/generate_204",
+
+    "fastest_group": true,
+    "auto_groups": false,
+
+    "groups": {
+        "🇫🇮 Finland": ["Finland"],
+        "🇩🇪 Germany": ["German"],
+        "🇳🇱 Netherlands": ["Netherlands"],
+        "🇪🇺 Europe LTE": ["ЕВРОПА", "LTE"]
+    }
+}

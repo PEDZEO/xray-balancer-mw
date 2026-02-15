@@ -1,0 +1,29 @@
+services:
+  xray-balancer-mw:
+    build: ../
+    container_name: xray-balancer-mw
+    restart: unless-stopped
+    volumes:
+      - ../config.json:/app/config.json:ro
+    networks:
+      - remnawave-network
+
+  nginx:
+    image: nginx:alpine
+    container_name: nginx-remnawave
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - /etc/letsencrypt:/etc/nginx/ssl:ro
+    networks:
+      - remnawave-network
+    depends_on:
+      - xray-balancer-mw
+
+networks:
+  remnawave-network:
+    external: true
+    name: remnawave-network
