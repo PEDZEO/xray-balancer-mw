@@ -6,7 +6,13 @@ const path = require('path');
 
 // ─── Загрузка конфига ───
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
-const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+let config;
+try {
+    config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+} catch (err) {
+    console.error(`❌ Ошибка чтения ${CONFIG_PATH}:`, err.message);
+    process.exit(1);
+}
 
 const PORT = config.port || 4100;
 const REMNAWAVE_URL = config.remnawave_url;
@@ -25,9 +31,11 @@ const STRATEGY = config.strategy || 'leastLoad';
 const PROBE_INTERVAL = config.probe_interval || '3m';
 const PROBE_URL = config.probe_url || 'https://www.gstatic.com/generate_204';
 
+const MAX_RESPONSE_SIZE = 10 * 1024 * 1024; // 10 MB лимит ответа от upstream
+
 // ─── Утилиты ───
 
-function fetchUrl(targetUrl, headers = {}) {
+function fetchUrl(targetUrl, headers = {}, maxRedirects = 3) {
     return new Promise((resolve, reject) => {
         const parsed = new URL(targetUrl);
         const mod = parsed.protocol === 'https:' ? https : http;
@@ -39,8 +47,24 @@ function fetchUrl(targetUrl, headers = {}) {
             headers: { ...headers },
         };
         const req = mod.request(opts, (res) => {
+            // Обработка редиректов
+            if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307) && res.headers.location) {
+                if (maxRedirects <= 0) {
+                    return reject(new Error('Too many redirects'));
+                }
+                return fetchUrl(res.headers.location, headers, maxRedirects - 1).then(resolve).catch(reject);
+            }
+
             let data = '';
-            res.on('data', (chunk) => (data += chunk));
+            let size = 0;
+            res.on('data', (chunk) => {
+                size += chunk.length;
+                if (size > MAX_RESPONSE_SIZE) {
+                    req.destroy();
+                    return reject(new Error('Response too large'));
+                }
+                data += chunk;
+            });
             res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
         });
         req.on('error', reject);
@@ -167,16 +191,19 @@ function collectAllProxyOutbounds(configArray) {
             if (systemProtocols.has(ob.protocol)) continue;
             if (!ob.tag) continue;
 
-            let tag = ob.tag;
+            // Deep clone чтобы не мутировать оригинал
+            const cloned = JSON.parse(JSON.stringify(ob));
+
+            let tag = cloned.tag;
             if (tag === 'proxy' && remarks) {
                 tag = remarks;
             }
             if (seenTags.has(tag)) {
                 tag = `${tag}-${i}`;
             }
-            ob.tag = tag;
+            cloned.tag = tag;
             seenTags.add(tag);
-            allOutbounds.push(ob);
+            allOutbounds.push(cloned);
         }
     }
 
@@ -258,7 +285,7 @@ function buildGroupConfig(baseConfig, groupName, outbounds) {
 // ─── HTTP сервер ───
 
 const server = http.createServer(async (req, res) => {
-    const parsedUrl = url.parse(req.url, true);
+    const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname;
 
     if (pathname === '/health' || pathname === '/mw-health') {
@@ -425,6 +452,22 @@ const server = http.createServer(async (req, res) => {
     }
 });
 
+// ─── Graceful shutdown ───
+
+function shutdown(signal) {
+    console.log(`\n[shutdown] ${signal} — завершаем...`);
+    server.close(() => {
+        console.log('[shutdown] Готово');
+        process.exit(0);
+    });
+    setTimeout(() => { process.exit(1); }, 5000);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+// ─── Старт ───
+
 async function start() {
     if (AUTO_GROUPS && API_TOKEN) {
         await refreshGroups();
@@ -437,7 +480,8 @@ async function start() {
         console.log(`\n🚀 Xray Balancer Middleware — порт ${PORT}`);
         console.log(`📋 Группы: ${Object.entries(GROUPS).map(([k, v]) => `${k} [${v.join(',')}]`).join(' | ')}`);
         console.log(`⚡ Fastest: ${fastestEnabled ? '✅' : '❌'}`);
-        console.log(`🎯 Стратегия: ${STRATEGY} (burstObservatory, baselines=1s, tolerance=0.3)`);
+        console.log(`🎯 Стратегия: leastLoad (expected=1, baselines=1s, tolerance=0.3)`);
+        console.log(`📡 Probe: ${PROBE_URL} каждые ${PROBE_INTERVAL}`);
         console.log(`📡 Sub page: ${SUB_PAGE_URL || 'не задан'}`);
         console.log(`🔀 Форвард: все X-* заголовки (HWID, Device и т.д.)`);
         console.log(`\n   Подписка: http://localhost:${PORT}/{token}`);
