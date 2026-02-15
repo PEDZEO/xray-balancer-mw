@@ -236,7 +236,7 @@ function buildGroupConfig(baseConfig, groupName, outbounds) {
                 strategy: {
                     type: 'leastLoad',
                     settings: {
-                        expected: Math.max(1, Math.floor(tags.length / 2)),
+                        expected: 1,
                         baselines: ['1s'],
                         tolerance: 0.3,
                     },
