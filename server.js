@@ -28,10 +28,18 @@ const AUTO_GROUPS = config.auto_groups || false;
 const AUTO_GROUPS_INTERVAL = (config.auto_groups_interval_sec || 300) * 1000;
 
 const STRATEGY = config.strategy || 'leastLoad';
-const PROBE_INTERVAL = config.probe_interval || '1m';
+const PROBE_INTERVAL = config.probe_interval || '3m';
 const PROBE_URL = config.probe_url || 'https://www.gstatic.com/generate_204';
 
-const MAX_RESPONSE_SIZE = 10 * 1024 * 1024; // 10 MB лимит ответа от upstream
+// Node stats — опрос нагрузки нод из API панели
+const NODE_STATS_ENABLED = config.node_stats || false;
+const NODE_STATS_INTERVAL = (config.node_stats_interval_sec || 120) * 1000;
+const MAX_USERS_PER_GB = config.max_users_per_gb || 20;
+
+const MAX_RESPONSE_SIZE = 10 * 1024 * 1024;
+
+// Кэш статистики нод: { "Finland2": { usersOnline: 9, totalRamGb: 2.06, load: 4.37 }, ... }
+let nodeStatsCache = {};
 
 // ─── Утилиты ───
 
@@ -47,7 +55,6 @@ function fetchUrl(targetUrl, headers = {}, maxRedirects = 3) {
             headers: { ...headers },
         };
         const req = mod.request(opts, (res) => {
-            // Обработка редиректов
             if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307) && res.headers.location) {
                 if (maxRedirects <= 0) {
                     return reject(new Error('Too many redirects'));
@@ -87,6 +94,127 @@ function matchGroup(outboundTag) {
         }
     }
     return null;
+}
+
+// ─── Парсинг RAM ───
+
+function parseRamGb(ramStr) {
+    if (!ramStr) return 1;
+    const match = ramStr.match(/([\d.]+)\s*(GB|MB)/i);
+    if (!match) return 1;
+    const val = parseFloat(match[1]);
+    if (match[2].toUpperCase() === 'MB') return val / 1024;
+    return val;
+}
+
+// ─── Node Stats — опрос панели ───
+
+async function fetchNodeStats() {
+    if (!API_TOKEN || !REMNAWAVE_URL) return;
+    try {
+        const response = await fetchUrl(`${REMNAWAVE_URL}/api/nodes/`, {
+            'Authorization': `Bearer ${API_TOKEN}`,
+            'X-Forwarded-For': '127.0.0.1',
+            'X-Forwarded-Proto': 'https',
+        });
+        if (response.status !== 200) {
+            console.error('[node-stats] API вернул', response.status);
+            return;
+        }
+        const data = JSON.parse(response.body);
+        const nodes = data.response || (Array.isArray(data) ? data : []);
+
+        const newCache = {};
+        for (const node of nodes) {
+            const name = node.name || '';
+            const usersOnline = node.usersOnline || 0;
+            const totalRamGb = parseRamGb(node.totalRam);
+            const isConnected = node.isConnected || false;
+            const isDisabled = node.isDisabled || false;
+
+            // load = юзеров на 1GB RAM
+            const load = totalRamGb > 0 ? usersOnline / totalRamGb : 999;
+
+            newCache[name] = {
+                usersOnline,
+                totalRamGb,
+                load: Math.round(load * 100) / 100,
+                isConnected,
+                isDisabled,
+            };
+
+            // Также кэшируем по тегам inbound'ов (для матчинга с outbound тегами)
+            if (node.configProfile && node.configProfile.activeInbounds) {
+                for (const inb of node.configProfile.activeInbounds) {
+                    if (inb.tag && inb.tag !== name) {
+                        newCache[inb.tag] = newCache[name];
+                    }
+                }
+            }
+        }
+
+        nodeStatsCache = newCache;
+        const sorted = Object.entries(newCache)
+            .filter(([_, s]) => s.isConnected && !s.isDisabled)
+            .sort((a, b) => a[1].load - b[1].load);
+
+        console.log(`[node-stats] Обновлено: ${sorted.length} нод`);
+        for (const [name, s] of sorted.slice(0, 5)) {
+            console.log(`  ${name}: ${s.usersOnline} юзеров, ${s.totalRamGb}GB RAM, load=${s.load}`);
+        }
+        if (sorted.length > 5) console.log(`  ... и ещё ${sorted.length - 5}`);
+
+    } catch (err) {
+        console.error('[node-stats] Ошибка:', err.message);
+    }
+}
+
+// ─── Получить статистику ноды по тегу outbound'а ───
+
+function getNodeStats(outboundTag) {
+    // Прямой матч по имени
+    if (nodeStatsCache[outboundTag]) return nodeStatsCache[outboundTag];
+
+    // Fuzzy матч — ищем имя ноды в теге
+    const tagLower = outboundTag.toLowerCase();
+    for (const [nodeName, stats] of Object.entries(nodeStatsCache)) {
+        if (tagLower.includes(nodeName.toLowerCase()) || nodeName.toLowerCase().includes(tagLower)) {
+            return stats;
+        }
+    }
+    return null;
+}
+
+// ─── Фильтрация и сортировка outbound'ов по нагрузке ───
+
+function filterAndSortByLoad(outbounds) {
+    if (Object.keys(nodeStatsCache).length === 0) return outbounds;
+
+    const withStats = outbounds.map(ob => {
+        const stats = getNodeStats(ob.tag);
+        return { ob, stats, load: stats ? stats.load : 0 };
+    });
+
+    // Исключаем перегруженные (load > max_users_per_gb) и отключённые
+    const filtered = withStats.filter(({ stats }) => {
+        if (!stats) return true; // Нет данных — пропускаем
+        if (!stats.isConnected || stats.isDisabled) return false; // Офлайн
+        if (stats.load > MAX_USERS_PER_GB) return false; // Перегружен
+        return true;
+    });
+
+    // Если все отфильтрованы — вернуть всех подключённых (fallback)
+    if (filtered.length === 0) {
+        const connected = withStats.filter(({ stats }) => !stats || (stats.isConnected && !stats.isDisabled));
+        if (connected.length === 0) return outbounds; // Совсем ничего — вернуть как есть
+        connected.sort((a, b) => a.load - b.load);
+        return connected.map(({ ob }) => ob);
+    }
+
+    // Сортируем: менее загруженные первыми
+    filtered.sort((a, b) => a.load - b.load);
+
+    return filtered.map(({ ob }) => ob);
 }
 
 // ─── Remnawave API ───
@@ -191,7 +319,6 @@ function collectAllProxyOutbounds(configArray) {
             if (systemProtocols.has(ob.protocol)) continue;
             if (!ob.tag) continue;
 
-            // Deep clone чтобы не мутировать оригинал
             const cloned = JSON.parse(JSON.stringify(ob));
 
             let tag = cloned.tag;
@@ -241,19 +368,17 @@ function buildGroupConfig(baseConfig, groupName, outbounds) {
     const tags = outbounds.map(o => o.tag);
     const prefix = sanitizeTag(groupName);
 
-    // burstObservatory — пингует серверы группы
     cfg.burstObservatory = {
         subjectSelector: tags,
         pingConfig: {
             destination: PROBE_URL,
             interval: PROBE_INTERVAL,
-            sampling: 2,
+            sampling: 3,
             timeout: '2s',
             httpMethod: 'GET',
         },
     };
 
-    // Routing с балансером
     cfg.routing = {
         domainStrategy: 'IPIfNonMatch',
         balancers: [
@@ -263,9 +388,9 @@ function buildGroupConfig(baseConfig, groupName, outbounds) {
                 strategy: {
                     type: 'leastLoad',
                     settings: {
-                        expected: 2,
+                        expected: 1,
                         baselines: ['1s'],
-                        tolerance: 0.5,
+                        tolerance: 0.8,
                     },
                 },
             },
@@ -295,8 +420,16 @@ const server = http.createServer(async (req, res) => {
             groups: Object.keys(GROUPS),
             auto_groups: AUTO_GROUPS,
             fastest_group: config.fastest_group !== false,
+            node_stats: NODE_STATS_ENABLED,
+            cached_nodes: Object.keys(nodeStatsCache).length,
             sub_page: SUB_PAGE_URL || 'disabled',
         }));
+        return;
+    }
+
+    if (pathname === '/node-stats') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(nodeStatsCache, null, 2));
         return;
     }
 
@@ -304,6 +437,13 @@ const server = http.createServer(async (req, res) => {
         await refreshGroups();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'ok', groups: GROUPS }));
+        return;
+    }
+
+    if (pathname === '/refresh-stats' && API_TOKEN) {
+        await fetchNodeStats();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok', nodes: nodeStatsCache }));
         return;
     }
 
@@ -329,8 +469,6 @@ const server = http.createServer(async (req, res) => {
         if (req.headers['accept-language']) forwardHeaders['Accept-Language'] = req.headers['accept-language'];
         if (!req.headers['user-agent']) forwardHeaders['User-Agent'] = 'Happ/1.0';
 
-        // Форвардим ВСЕ X-* заголовки (HWID, Device-Os, Device-Model и т.д.)
-        // НЕ форвардим Accept-Encoding чтобы upstream не сжимал ответ
         for (const [key, value] of Object.entries(req.headers)) {
             if (key.startsWith('x-') && !forwardHeaders[key]) {
                 forwardHeaders[key] = value;
@@ -380,13 +518,23 @@ const server = http.createServer(async (req, res) => {
         }
 
         const baseConfig = configArray[0];
-        const allOutbounds = collectAllProxyOutbounds(configArray);
+        let allOutbounds = collectAllProxyOutbounds(configArray);
         console.log(`[proxy] Собрано ${allOutbounds.length} прокси-outbound(ов)`);
 
         if (allOutbounds.length === 0) {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(upstream.body);
             return;
+        }
+
+        // ─── Фильтрация и сортировка по нагрузке ───
+        if (NODE_STATS_ENABLED && Object.keys(nodeStatsCache).length > 0) {
+            const before = allOutbounds.length;
+            allOutbounds = filterAndSortByLoad(allOutbounds);
+            const after = allOutbounds.length;
+            if (before !== after) {
+                console.log(`[node-stats] Отфильтровано: ${before} → ${after} серверов (исключены перегруженные >${MAX_USERS_PER_GB} users/GB)`);
+            }
         }
 
         // ─── Группируем ───
@@ -413,10 +561,17 @@ const server = http.createServer(async (req, res) => {
             }
         }
 
+        // ─── Сортировка внутри групп по нагрузке ───
+        if (NODE_STATS_ENABLED && Object.keys(nodeStatsCache).length > 0) {
+            for (const [groupName, outbounds] of Object.entries(grouped)) {
+                grouped[groupName] = filterAndSortByLoad(outbounds);
+            }
+        }
+
         // ─── Конфиги ───
         const resultConfigs = [];
 
-        // ⚡ "Fastest" — все серверы, автовыбор лучшего (отключается в config.json)
+        // ⚡ Fastest
         const fastestEnabled = config.fastest_group !== false;
         if (fastestEnabled && allOutbounds.length > 1) {
             const fastestConfig = buildGroupConfig(baseConfig, '⚡ Fastest', allOutbounds);
@@ -429,7 +584,17 @@ const server = http.createServer(async (req, res) => {
             if (outbounds.length === 0) continue;
             const groupConfig = buildGroupConfig(baseConfig, groupName, outbounds);
             resultConfigs.push(groupConfig);
-            console.log(`[group] ${groupName}: ${outbounds.length} серверов`);
+
+            // Логируем порядок серверов если есть стата
+            if (NODE_STATS_ENABLED && Object.keys(nodeStatsCache).length > 0) {
+                const order = outbounds.map(ob => {
+                    const s = getNodeStats(ob.tag);
+                    return s ? `${ob.tag}(${s.usersOnline}u/${s.totalRamGb}G)` : ob.tag;
+                }).join(', ');
+                console.log(`[group] ${groupName}: ${outbounds.length} серверов → ${order}`);
+            } else {
+                console.log(`[group] ${groupName}: ${outbounds.length} серверов`);
+            }
         }
 
         console.log(`[proxy] Итого: ${resultConfigs.length} групп, ${allOutbounds.length} серверов`);
@@ -474,18 +639,25 @@ async function start() {
         setInterval(() => refreshGroups(), AUTO_GROUPS_INTERVAL);
     }
 
+    if (NODE_STATS_ENABLED && API_TOKEN) {
+        await fetchNodeStats();
+        setInterval(() => fetchNodeStats(), NODE_STATS_INTERVAL);
+    }
+
     const fastestEnabled = config.fastest_group !== false;
 
     server.listen(PORT, () => {
-        console.log(`\n🚀 Xray Balancer Middleware — порт ${PORT}`);
+        console.log(`\n🚀 Xray Balancer Middleware (dev) — порт ${PORT}`);
         console.log(`📋 Группы: ${Object.entries(GROUPS).map(([k, v]) => `${k} [${v.join(',')}]`).join(' | ')}`);
         console.log(`⚡ Fastest: ${fastestEnabled ? '✅' : '❌'}`);
-        console.log(`🎯 Стратегия: leastLoad (expected=2, baselines=1s, tolerance=0.5)`);
+        console.log(`🎯 Стратегия: leastLoad (expected=1, baselines=1s, tolerance=0.8)`);
         console.log(`📡 Probe: ${PROBE_URL} каждые ${PROBE_INTERVAL}`);
+        console.log(`📊 Node stats: ${NODE_STATS_ENABLED ? `✅ (каждые ${NODE_STATS_INTERVAL/1000}с, макс ${MAX_USERS_PER_GB} users/GB)` : '❌'}`);
         console.log(`📡 Sub page: ${SUB_PAGE_URL || 'не задан'}`);
         console.log(`🔀 Форвард: все X-* заголовки (HWID, Device и т.д.)`);
         console.log(`\n   Подписка: http://localhost:${PORT}/{token}`);
-        console.log(`   Health:   http://localhost:${PORT}/health\n`);
+        console.log(`   Health:   http://localhost:${PORT}/health`);
+        console.log(`   Стата:    http://localhost:${PORT}/node-stats\n`);
     });
 }
 

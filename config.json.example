@@ -16,6 +16,10 @@
     "fastest_group": true,
     "auto_groups": false,
 
+    "node_stats": false,
+    "node_stats_interval_sec": 120,
+    "max_users_per_gb": 20,
+
     "groups": {
         "🇫🇮 Finland": ["Finland"],
         "🇩🇪 Germany": ["German"],
