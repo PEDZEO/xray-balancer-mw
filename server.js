@@ -28,7 +28,7 @@ const AUTO_GROUPS = config.auto_groups || false;
 const AUTO_GROUPS_INTERVAL = (config.auto_groups_interval_sec || 300) * 1000;
 
 const STRATEGY = config.strategy || 'leastLoad';
-const PROBE_INTERVAL = config.probe_interval || '3m';
+const PROBE_INTERVAL = config.probe_interval || '1m';
 const PROBE_URL = config.probe_url || 'https://www.gstatic.com/generate_204';
 
 const MAX_RESPONSE_SIZE = 10 * 1024 * 1024; // 10 MB лимит ответа от upstream
@@ -247,7 +247,7 @@ function buildGroupConfig(baseConfig, groupName, outbounds) {
         pingConfig: {
             destination: PROBE_URL,
             interval: PROBE_INTERVAL,
-            sampling: 3,
+            sampling: 2,
             timeout: '2s',
             httpMethod: 'GET',
         },
@@ -263,9 +263,9 @@ function buildGroupConfig(baseConfig, groupName, outbounds) {
                 strategy: {
                     type: 'leastLoad',
                     settings: {
-                        expected: 1,
+                        expected: 2,
                         baselines: ['1s'],
-                        tolerance: 0.3,
+                        tolerance: 0.5,
                     },
                 },
             },
@@ -480,7 +480,7 @@ async function start() {
         console.log(`\n🚀 Xray Balancer Middleware — порт ${PORT}`);
         console.log(`📋 Группы: ${Object.entries(GROUPS).map(([k, v]) => `${k} [${v.join(',')}]`).join(' | ')}`);
         console.log(`⚡ Fastest: ${fastestEnabled ? '✅' : '❌'}`);
-        console.log(`🎯 Стратегия: leastLoad (expected=1, baselines=1s, tolerance=0.3)`);
+        console.log(`🎯 Стратегия: leastLoad (expected=2, baselines=1s, tolerance=0.5)`);
         console.log(`📡 Probe: ${PROBE_URL} каждые ${PROBE_INTERVAL}`);
         console.log(`📡 Sub page: ${SUB_PAGE_URL || 'не задан'}`);
         console.log(`🔀 Форвард: все X-* заголовки (HWID, Device и т.д.)`);
