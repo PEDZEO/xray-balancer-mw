@@ -37,6 +37,22 @@ const MAX_USERS_PER_GB = config.max_users_per_gb || 20;
 
 const MAX_RESPONSE_SIZE = 10 * 1024 * 1024;
 
+// Cookie-авторизация для панели за nginx (egam.es и подобные)
+const PANEL_AUTH_COOKIE = config.panel_auth_cookie || '';
+
+// Собрать заголовки для API панели
+function panelHeaders() {
+    const h = {
+        'Authorization': `Bearer ${API_TOKEN}`,
+        'X-Forwarded-For': '127.0.0.1',
+        'X-Forwarded-Proto': 'https',
+    };
+    if (PANEL_AUTH_COOKIE) {
+        h['Cookie'] = PANEL_AUTH_COOKIE;
+    }
+    return h;
+}
+
 // Кэш статистики нод: { "Finland2": { usersOnline: 9, totalRamGb: 2.06, load: 4.37 }, ... }
 let nodeStatsCache = {};
 
@@ -111,11 +127,7 @@ function parseRamGb(ramStr) {
 async function fetchNodeStats() {
     if (!API_TOKEN || !REMNAWAVE_URL) return;
     try {
-        const response = await fetchUrl(`${REMNAWAVE_URL}/api/nodes/`, {
-            'Authorization': `Bearer ${API_TOKEN}`,
-            'X-Forwarded-For': '127.0.0.1',
-            'X-Forwarded-Proto': 'https',
-        });
+        const response = await fetchUrl(`${REMNAWAVE_URL}/api/nodes/`, panelHeaders());
         if (response.status !== 200) {
             console.error('[node-stats] API вернул', response.status);
             return;
@@ -274,11 +286,7 @@ function detectCountryFromRemark(remark) {
 async function fetchHostsFromApi() {
     if (!API_TOKEN) return null;
     try {
-        const response = await fetchUrl(`${REMNAWAVE_URL}/api/hosts/`, {
-            'Authorization': `Bearer ${API_TOKEN}`,
-            'X-Forwarded-For': '127.0.0.1',
-            'X-Forwarded-Proto': 'https',
-        });
+        const response = await fetchUrl(`${REMNAWAVE_URL}/api/hosts/`, panelHeaders());
         if (response.status !== 200) return null;
         const data = JSON.parse(response.body);
         return data.response || (Array.isArray(data) ? data : null);
@@ -429,6 +437,7 @@ const server = http.createServer(async (req, res) => {
             auto_groups: AUTO_GROUPS,
             fastest_group: config.fastest_group !== false,
             node_stats: NODE_STATS_ENABLED,
+            panel_auth: PANEL_AUTH_COOKIE ? true : false,
             cached_nodes: Object.keys(nodeStatsCache).length,
             sub_page: SUB_PAGE_URL || 'disabled',
         }));
@@ -669,6 +678,7 @@ async function start() {
         console.log(`🎯 Стратегия: leastLoad (expected=1, baselines=1s, tolerance=0.8)`);
         console.log(`📡 Probe: ${PROBE_URL} каждые ${PROBE_INTERVAL}`);
         console.log(`📊 Node stats: ${NODE_STATS_ENABLED ? `✅ (каждые ${NODE_STATS_INTERVAL/1000}с, макс ${MAX_USERS_PER_GB} users/GB)` : '❌'}`);
+        console.log(`🔐 Panel cookie: ${PANEL_AUTH_COOKIE ? '✅' : '❌ (не нужен)'}`);
         console.log(`📡 Sub page: ${SUB_PAGE_URL || 'не задан'}`);
         console.log(`🔀 Форвард: все X-* заголовки (HWID, Device и т.д.)`);
         console.log(`\n   Подписка: http://localhost:${PORT}/{token}`);

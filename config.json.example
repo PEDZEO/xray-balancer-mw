@@ -8,6 +8,7 @@
     "sub_domain": "sub.example.com",
 
     "api_token": "",
+    "panel_auth_cookie": "",
 
     "strategy": "leastLoad",
     "probe_interval": "3m",
