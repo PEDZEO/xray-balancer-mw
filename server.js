@@ -1,6 +1,5 @@
 const http = require('http');
 const https = require('https');
-const url = require('url');
 const fs = require('fs');
 const path = require('path');
 
@@ -175,14 +174,23 @@ function getNodeStats(outboundTag) {
     // Прямой матч по имени
     if (nodeStatsCache[outboundTag]) return nodeStatsCache[outboundTag];
 
-    // Fuzzy матч — ищем имя ноды в теге
+    // Матч по словам — ищем имя ноды как отдельное слово в теге
+    // Защита от ложных совпадений (nl → finland, de → node и т.д.)
     const tagLower = outboundTag.toLowerCase();
+    let bestMatch = null;
+    let bestLen = 0;
+
     for (const [nodeName, stats] of Object.entries(nodeStatsCache)) {
-        if (tagLower.includes(nodeName.toLowerCase()) || nodeName.toLowerCase().includes(tagLower)) {
-            return stats;
+        const nameL = nodeName.toLowerCase();
+        // Минимум 3 символа для fuzzy матча (защита от "nl", "de", "fi")
+        if (nameL.length < 3) continue;
+        // Ищем имя ноды в теге
+        if (tagLower.includes(nameL) && nameL.length > bestLen) {
+            bestMatch = stats;
+            bestLen = nameL.length;
         }
     }
-    return null;
+    return bestMatch;
 }
 
 // ─── Фильтрация и сортировка outbound'ов по нагрузке ───
@@ -192,7 +200,7 @@ function filterAndSortByLoad(outbounds) {
 
     const withStats = outbounds.map(ob => {
         const stats = getNodeStats(ob.tag);
-        return { ob, stats, load: stats ? stats.load : 0 };
+        return { ob, stats, load: stats ? stats.load : MAX_USERS_PER_GB / 2 };
     });
 
     // Исключаем перегруженные (load > max_users_per_gb) и отключённые
@@ -561,10 +569,16 @@ const server = http.createServer(async (req, res) => {
             }
         }
 
-        // ─── Сортировка внутри групп по нагрузке ───
+        // ─── Сортировка внутри групп по нагрузке (без повторной фильтрации) ───
         if (NODE_STATS_ENABLED && Object.keys(nodeStatsCache).length > 0) {
-            for (const [groupName, outbounds] of Object.entries(grouped)) {
-                grouped[groupName] = filterAndSortByLoad(outbounds);
+            for (const [groupName, obs] of Object.entries(grouped)) {
+                grouped[groupName] = obs.slice().sort((a, b) => {
+                    const sa = getNodeStats(a.tag);
+                    const sb = getNodeStats(b.tag);
+                    const la = sa ? sa.load : MAX_USERS_PER_GB / 2;
+                    const lb = sb ? sb.load : MAX_USERS_PER_GB / 2;
+                    return la - lb;
+                });
             }
         }
 
@@ -612,8 +626,10 @@ const server = http.createServer(async (req, res) => {
 
     } catch (err) {
         console.error('[error]', err.message);
-        res.writeHead(502, { 'Content-Type': 'text/plain' });
-        res.end('Bad Gateway: ' + err.message);
+        if (!res.headersSent) {
+            res.writeHead(502, { 'Content-Type': 'text/plain' });
+            res.end('Bad Gateway: ' + err.message);
+        }
     }
 });
 
