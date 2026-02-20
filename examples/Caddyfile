@@ -1,7 +1,12 @@
 # ─── Caddyfile для Remnawave + Xray Balancer Middleware ───
 #
+# Переменные окружения (задаются в docker-compose или .env):
+#   SUB_DOMAIN              — домен подписки (например sub.example.com)
+#   SUB_PAGE_CONTAINER      — имя контейнера subscription page (например remnawave-subscription-page)
+#   SUB_PORT                — порт subscription page (например 3010)
+#
 # Xray-клиенты (Happ, Streisand, V2RayTUN и т.д.) → middleware (:4100)
-# Браузеры и остальные клиенты → subscription page (:3010)
+# Браузеры и остальные клиенты → subscription page
 
 {
     servers {
@@ -34,15 +39,23 @@ https://{$SUB_DOMAIN} {
     }
     handle @xray_client {
         reverse_proxy xray-balancer-mw:4100 {
-            header_up X-Real-IP {remote_host}
             header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-Host {host}
+            header_up X-Forwarded-Port {server_port}
         }
     }
 
     handle /* {
         reverse_proxy {$SUB_PAGE_CONTAINER}:{$SUB_PORT} {
-            header_up X-Real-IP {remote_host}
             header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-Host {host}
+            header_up X-Forwarded-Port {server_port}
         }
     }
 }

@@ -27,7 +27,7 @@ const SUB_DOMAIN = process.env.SUB_DOMAIN || config.sub_domain || '';
 
 let GROUPS = config.groups || {};
 
-const AUTO_GROUPS = config.auto_groups || false;
+const AUTO_GROUPS = config.auto_groups === true;
 const AUTO_GROUPS_INTERVAL = (config.auto_groups_interval_sec || 300) * 1000;
 
 const STRATEGY = config.strategy || 'leastLoad';
@@ -35,7 +35,7 @@ const PROBE_INTERVAL = config.probe_interval || '3m';
 const PROBE_URL = config.probe_url || 'https://www.gstatic.com/generate_204';
 
 // Node stats — опрос нагрузки нод из API панели
-const NODE_STATS_ENABLED = process.env.NODE_STATS === 'true' || config.node_stats || false;
+const NODE_STATS_ENABLED = process.env.NODE_STATS === 'true' || config.node_stats === true;
 const NODE_STATS_INTERVAL = (parseInt(process.env.NODE_STATS_INTERVAL_SEC, 10) || config.node_stats_interval_sec || 120) * 1000;
 const MAX_USERS_PER_GB = parseInt(process.env.MAX_USERS_PER_GB, 10) || config.max_users_per_gb || 20;
 
@@ -399,7 +399,7 @@ function collectAllProxyOutbounds(configArray) {
             if (systemProtocols.has(ob.protocol)) continue;
             if (!ob.tag) continue;
 
-            const cloned = JSON.parse(JSON.stringify(ob));
+            const cloned = structuredClone(ob);
 
             let tag = cloned.tag;
             if (tag === 'proxy' && remarks) {
@@ -428,18 +428,18 @@ function buildGroupConfig(baseConfig, groupName, outbounds) {
     const inherited = {};
     for (const [key, val] of Object.entries(baseConfig)) {
         if (!MANAGED_FIELDS.has(key)) {
-            inherited[key] = JSON.parse(JSON.stringify(val));
+            inherited[key] = structuredClone(val);
         }
     }
 
     const cfg = {
         ...inherited,
         remarks: groupName,
-        dns: baseConfig.dns ? JSON.parse(JSON.stringify(baseConfig.dns)) : {
+        dns: baseConfig.dns ? structuredClone(baseConfig.dns) : {
             servers: ['1.1.1.1', '1.0.0.1'],
             queryStrategy: 'UseIP',
         },
-        inbounds: baseConfig.inbounds ? JSON.parse(JSON.stringify(baseConfig.inbounds)) : [
+        inbounds: baseConfig.inbounds ? structuredClone(baseConfig.inbounds) : [
             {
                 tag: 'socks', port: 10808, listen: '127.0.0.1', protocol: 'socks',
                 settings: { udp: true, auth: 'noauth' },
@@ -452,7 +452,7 @@ function buildGroupConfig(baseConfig, groupName, outbounds) {
             },
         ],
         outbounds: [
-            ...JSON.parse(JSON.stringify(outbounds)),
+            ...structuredClone(outbounds),
             { tag: 'direct', protocol: 'freedom' },
             { tag: 'block', protocol: 'blackhole' },
         ],

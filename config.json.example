@@ -8,6 +8,7 @@
 
     "fastest_group": true,
     "auto_groups": false,
+    "auto_groups_interval_sec": 300,
 
     "node_stats": false,
     "node_stats_interval_sec": 120,
