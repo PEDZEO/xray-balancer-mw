@@ -38,6 +38,7 @@ const PROBE_URL = config.probe_url || 'https://www.gstatic.com/generate_204';
 const NODE_STATS_ENABLED = process.env.NODE_STATS === 'true' || config.node_stats === true;
 const NODE_STATS_INTERVAL = (parseInt(process.env.NODE_STATS_INTERVAL_SEC, 10) || config.node_stats_interval_sec || 120) * 1000;
 const MAX_USERS_PER_GB = parseInt(process.env.MAX_USERS_PER_GB, 10) || config.max_users_per_gb || 20;
+const MAX_USERS_PER_CPU = parseInt(process.env.MAX_USERS_PER_CPU, 10) || config.max_users_per_cpu || 40;
 
 const MAX_RESPONSE_SIZE = 10 * 1024 * 1024;
 
@@ -57,7 +58,7 @@ function panelHeaders() {
     return h;
 }
 
-// Кэш статистики нод: { "Finland2": { usersOnline: 9, totalRamGb: 2.06, load: 4.37 }, ... }
+// Кэш статистики нод: { "Finland2": { usersOnline: 9, totalRamGb: 2.06, cpuCount: 1, ramLoad: 4.37, cpuLoad: 9, load: 0.23 }, ... }
 let nodeStatsCache = {};
 
 // ─── Утилиты ───
@@ -156,16 +157,27 @@ async function fetchNodeStats() {
             const name = node.name || '';
             const usersOnline = node.usersOnline || 0;
             const totalRamGb = parseRamGb(node.totalRam);
+            const cpuCount = node.cpuCount || 1;
             const isConnected = node.isConnected || false;
             const isDisabled = node.isDisabled || false;
 
-            // load = юзеров на 1GB RAM
-            const load = totalRamGb > 0 ? usersOnline / totalRamGb : 999;
+            // Нагрузка по RAM и CPU отдельно
+            const ramLoad = totalRamGb > 0 ? usersOnline / totalRamGb : 999;
+            const cpuLoad = cpuCount > 0 ? usersOnline / cpuCount : 999;
+
+            // Нормализованная нагрузка: 0..1 = нормально, >1 = перегружен
+            // Берём ХУДШИЙ из двух показателей (bottleneck)
+            const ramNorm = ramLoad / MAX_USERS_PER_GB;
+            const cpuNorm = cpuLoad / MAX_USERS_PER_CPU;
+            const load = Math.round(Math.max(ramNorm, cpuNorm) * 100) / 100;
 
             newCache[name] = {
                 usersOnline,
                 totalRamGb,
-                load: Math.round(load * 100) / 100,
+                cpuCount,
+                ramLoad: Math.round(ramLoad * 100) / 100,
+                cpuLoad: Math.round(cpuLoad * 100) / 100,
+                load,
                 isConnected,
                 isDisabled,
             };
@@ -185,9 +197,9 @@ async function fetchNodeStats() {
             .filter(([_, s]) => s.isConnected && !s.isDisabled)
             .sort((a, b) => a[1].load - b[1].load);
 
-        console.log(`[node-stats] Обновлено: ${sorted.length} нод`);
+        console.log(`[node-stats] Обновлено: ${sorted.length} нод (пороги: ${MAX_USERS_PER_GB} u/GB, ${MAX_USERS_PER_CPU} u/CPU)`);
         for (const [name, s] of sorted.slice(0, 5)) {
-            console.log(`  ${name}: ${s.usersOnline} юзеров, ${s.totalRamGb}GB RAM, load=${s.load}`);
+            console.log(`  ${name}: ${s.usersOnline}u, ${s.totalRamGb}GB/${s.cpuCount}CPU, ram=${s.ramLoad} cpu=${s.cpuLoad} load=${s.load}`);
         }
         if (sorted.length > 5) console.log(`  ... и ещё ${sorted.length - 5}`);
 
@@ -228,14 +240,14 @@ function filterAndSortByLoad(outbounds) {
 
     const withStats = outbounds.map(ob => {
         const stats = getNodeStats(ob.tag);
-        return { ob, stats, load: stats ? stats.load : MAX_USERS_PER_GB / 2 };
+        return { ob, stats, load: stats ? stats.load : 0.5 };
     });
 
-    // Исключаем перегруженные (load > max_users_per_gb) и отключённые
+    // Исключаем перегруженные (load > 1.0 = превышен порог RAM или CPU) и отключённые
     const filtered = withStats.filter(({ stats }) => {
         if (!stats) return true; // Нет данных — пропускаем
         if (!stats.isConnected || stats.isDisabled) return false; // Офлайн
-        if (stats.load > MAX_USERS_PER_GB) return false; // Перегружен
+        if (stats.load > 1.0) return false; // Перегружен по RAM или CPU
         return true;
     });
 
@@ -698,7 +710,7 @@ const server = http.createServer(async (req, res) => {
             allOutbounds = filterAndSortByLoad(allOutbounds);
             const after = allOutbounds.length;
             if (before !== after) {
-                console.log(`[node-stats] Отфильтровано: ${before} → ${after} серверов (исключены перегруженные >${MAX_USERS_PER_GB} users/GB)`);
+                console.log(`[node-stats] Отфильтровано: ${before} → ${after} серверов (исключены перегруженные >${MAX_USERS_PER_GB} u/GB или >${MAX_USERS_PER_CPU} u/CPU)`);
             }
         }
 
@@ -732,8 +744,8 @@ const server = http.createServer(async (req, res) => {
                 grouped[groupName] = obs.slice().sort((a, b) => {
                     const sa = getNodeStats(a.tag);
                     const sb = getNodeStats(b.tag);
-                    const la = sa ? sa.load : MAX_USERS_PER_GB / 2;
-                    const lb = sb ? sb.load : MAX_USERS_PER_GB / 2;
+                    const la = sa ? sa.load : 0.5;
+                    const lb = sb ? sb.load : 0.5;
                     return la - lb;
                 });
             }
@@ -760,7 +772,7 @@ const server = http.createServer(async (req, res) => {
             if (NODE_STATS_ENABLED && Object.keys(nodeStatsCache).length > 0) {
                 const order = outbounds.map(ob => {
                     const s = getNodeStats(ob.tag);
-                    return s ? `${ob.tag}(${s.usersOnline}u/${s.totalRamGb}G)` : ob.tag;
+                    return s ? `${ob.tag}(${s.usersOnline}u/${s.totalRamGb}G/${s.cpuCount}C)` : ob.tag;
                 }).join(', ');
                 console.log(`[group] ${groupName}: ${outbounds.length} серверов → ${order}`);
             } else {
@@ -821,7 +833,7 @@ async function start() {
         console.log(`🏁 Самые быстрые: ${fastestEnabled ? '✅' : '❌'}`);
         console.log(`🎯 Стратегия: ${STRATEGY} (expected=1, baselines=1s, tolerance=0.8)`);
         console.log(`📡 Probe: ${PROBE_URL} каждые ${PROBE_INTERVAL}`);
-        console.log(`📊 Node stats: ${NODE_STATS_ENABLED ? `✅ (каждые ${NODE_STATS_INTERVAL/1000}с, макс ${MAX_USERS_PER_GB} users/GB)` : '❌'}`);
+        console.log(`📊 Node stats: ${NODE_STATS_ENABLED ? `✅ (каждые ${NODE_STATS_INTERVAL/1000}с, макс ${MAX_USERS_PER_GB} u/GB, ${MAX_USERS_PER_CPU} u/CPU)` : '❌'}`);
         console.log(`🔐 Panel cookie: ${PANEL_AUTH_COOKIE ? '✅' : '❌ (не нужен)'}`);
         console.log(`📡 Sub page: ${SUB_PAGE_URL || 'не задан'}`);
         console.log(`🔀 Форвард: все заголовки клиента → upstream, все заголовки upstream → клиент`);

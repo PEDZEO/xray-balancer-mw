@@ -13,6 +13,7 @@
     "node_stats": false,
     "node_stats_interval_sec": 120,
     "max_users_per_gb": 20,
+    "max_users_per_cpu": 40,
 
     "groups": {
         "🇫🇮 Finland": ["Finland"],
