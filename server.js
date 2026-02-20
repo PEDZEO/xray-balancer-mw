@@ -13,13 +13,17 @@ try {
     process.exit(1);
 }
 
-const PORT = config.port || 4100;
-const REMNAWAVE_URL = config.remnawave_url;
-const REMNAWAVE_SUB_PATH = config.sub_path || '/api/sub';
-const API_TOKEN = config.api_token || process.env.REMNAWAVE_API_TOKEN || '';
+const PORT = parseInt(process.env.PORT, 10) || config.port || 4100;
+const REMNAWAVE_URL = process.env.REMNAWAVE_URL || config.remnawave_url;
+if (!REMNAWAVE_URL && !process.env.SUB_PAGE_URL && !config.sub_page_url) {
+    console.error('❌ REMNAWAVE_URL не задан (ни в .env, ни в config.json). Укажите хотя бы REMNAWAVE_URL или SUB_PAGE_URL.');
+    process.exit(1);
+}
+const REMNAWAVE_SUB_PATH = process.env.SUB_PATH || config.sub_path || '/api/sub';
+const API_TOKEN = process.env.API_TOKEN || config.api_token || '';
 
-const SUB_PAGE_URL = config.sub_page_url || '';
-const SUB_DOMAIN = config.sub_domain || '';
+const SUB_PAGE_URL = process.env.SUB_PAGE_URL || config.sub_page_url || '';
+const SUB_DOMAIN = process.env.SUB_DOMAIN || config.sub_domain || '';
 
 let GROUPS = config.groups || {};
 
@@ -31,14 +35,14 @@ const PROBE_INTERVAL = config.probe_interval || '3m';
 const PROBE_URL = config.probe_url || 'https://www.gstatic.com/generate_204';
 
 // Node stats — опрос нагрузки нод из API панели
-const NODE_STATS_ENABLED = config.node_stats || false;
-const NODE_STATS_INTERVAL = (config.node_stats_interval_sec || 120) * 1000;
-const MAX_USERS_PER_GB = config.max_users_per_gb || 20;
+const NODE_STATS_ENABLED = process.env.NODE_STATS === 'true' || config.node_stats || false;
+const NODE_STATS_INTERVAL = (parseInt(process.env.NODE_STATS_INTERVAL_SEC, 10) || config.node_stats_interval_sec || 120) * 1000;
+const MAX_USERS_PER_GB = parseInt(process.env.MAX_USERS_PER_GB, 10) || config.max_users_per_gb || 20;
 
 const MAX_RESPONSE_SIZE = 10 * 1024 * 1024;
 
 // Cookie-авторизация для панели за nginx (egam.es и подобные)
-const PANEL_AUTH_COOKIE = config.panel_auth_cookie || '';
+const PANEL_AUTH_COOKIE = process.env.PANEL_AUTH_COOKIE || config.panel_auth_cookie || '';
 
 // Собрать заголовки для API панели
 function panelHeaders() {
@@ -74,7 +78,7 @@ function fetchUrl(targetUrl, headers = {}, maxRedirects = 3) {
                 if (maxRedirects <= 0) {
                     return reject(new Error('Too many redirects'));
                 }
-                return fetchUrl(res.headers.location, headers, maxRedirects - 1).then(resolve).catch(reject);
+                return fetchUrl(new URL(res.headers.location, targetUrl).href, headers, maxRedirects - 1).then(resolve).catch(reject);
             }
 
             let data = '';
@@ -101,14 +105,26 @@ function sanitizeTag(name) {
 
 function matchGroup(outboundTag) {
     const tagLower = outboundTag.toLowerCase();
+    let bestGroup = null;
+    let bestLen = 0;
+
     for (const [groupName, patterns] of Object.entries(GROUPS)) {
         for (const pattern of patterns) {
-            if (tagLower.includes(pattern.toLowerCase())) {
-                return groupName;
+            const patLower = pattern.toLowerCase();
+            // Короткие паттерны (≤2 символа) проверяем только как отдельные слова
+            if (patLower.length <= 2) {
+                const regex = new RegExp(`(?:^|[^a-z])${patLower}(?:$|[^a-z])`);
+                if (regex.test(tagLower) && patLower.length > bestLen) {
+                    bestGroup = groupName;
+                    bestLen = patLower.length;
+                }
+            } else if (tagLower.includes(patLower) && patLower.length > bestLen) {
+                bestGroup = groupName;
+                bestLen = patLower.length;
             }
         }
     }
-    return null;
+    return bestGroup;
 }
 
 // ─── Парсинг RAM ───
@@ -273,14 +289,28 @@ const COUNTRY_PATTERNS = {
 
 function detectCountryFromRemark(remark) {
     const remarkLower = remark.toLowerCase();
+    let bestMatch = null;
+    let bestLen = 0;
+
     for (const [country, info] of Object.entries(COUNTRY_PATTERNS)) {
         for (const pattern of info.patterns) {
-            if (remarkLower.includes(pattern.toLowerCase())) {
-                return { country, emoji: info.emoji, patterns: info.patterns };
+            const patLower = pattern.toLowerCase();
+            let matched = false;
+
+            if (patLower.length <= 2) {
+                const regex = new RegExp(`(?:^|[^a-z])${patLower}(?:$|[^a-z])`);
+                matched = regex.test(remarkLower);
+            } else {
+                matched = remarkLower.includes(patLower);
+            }
+
+            if (matched && patLower.length > bestLen) {
+                bestMatch = { country, emoji: info.emoji, patterns: info.patterns };
+                bestLen = patLower.length;
             }
         }
     }
-    return null;
+    return bestMatch;
 }
 
 async function fetchHostsFromApi() {
@@ -319,6 +349,40 @@ async function refreshGroups() {
     console.log(`[auto-groups] Обновлены: ${Object.entries(GROUPS).map(([k, v]) => `${k} [${v}]`).join(' | ')}`);
 }
 
+// ─── Детектировать фейковый конфиг (лимит устройств, истекла подписка) ───
+
+function isFakeConfig(configArray) {
+    const systemProtocols = new Set(['freedom', 'blackhole', 'dns']);
+    let proxyCount = 0;
+    let fakeCount = 0;
+
+    for (const cfg of configArray) {
+        for (const ob of (cfg.outbounds || [])) {
+            if (systemProtocols.has(ob.protocol)) continue;
+            if (!ob.tag) continue;
+            proxyCount++;
+
+            // Проверяем все известные форматы: vless/vmess/trojan/shadowsocks
+            const addr = (
+                ob.settings?.vnext?.[0]?.address ||
+                ob.settings?.servers?.[0]?.address ||
+                ''
+            );
+            const port = (
+                ob.settings?.vnext?.[0]?.port ||
+                ob.settings?.servers?.[0]?.port ||
+                null
+            );
+
+            if (addr === '0.0.0.0' && port === 1) {
+                fakeCount++;
+            }
+        }
+    }
+
+    return proxyCount > 0 && proxyCount === fakeCount;
+}
+
 // ─── Собрать все прокси-outbound'ы из XRAY-JSON массива ───
 
 function collectAllProxyOutbounds(configArray) {
@@ -355,8 +419,21 @@ function collectAllProxyOutbounds(configArray) {
 
 // ─── Создать конфиг для одной группы с балансировкой ───
 
+// Поля, которые балансировщик контролирует сам — остальное наследуем из baseConfig
+const MANAGED_FIELDS = new Set(['remarks', 'dns', 'inbounds', 'outbounds', 'routing', 'burstObservatory']);
+
 function buildGroupConfig(baseConfig, groupName, outbounds) {
+    // Наследуем все верхнеуровневые поля из baseConfig которые мы не перезаписываем:
+    // announce, log, stats и всё остальное что Remnawave может добавить
+    const inherited = {};
+    for (const [key, val] of Object.entries(baseConfig)) {
+        if (!MANAGED_FIELDS.has(key)) {
+            inherited[key] = JSON.parse(JSON.stringify(val));
+        }
+    }
+
     const cfg = {
+        ...inherited,
         remarks: groupName,
         dns: baseConfig.dns ? JSON.parse(JSON.stringify(baseConfig.dns)) : {
             servers: ['1.1.1.1', '1.0.0.1'],
@@ -402,7 +479,7 @@ function buildGroupConfig(baseConfig, groupName, outbounds) {
                 tag: `${prefix}-balancer`,
                 selector: tags,
                 strategy: {
-                    type: 'leastLoad',
+                    type: STRATEGY,
                     settings: {
                         expected: 1,
                         baselines: ['1s'],
@@ -414,8 +491,33 @@ function buildGroupConfig(baseConfig, groupName, outbounds) {
         rules: [
             { type: 'field', network: 'udp', port: '443', outboundTag: 'block' },
             { type: 'field', protocol: ['bittorrent'], outboundTag: 'direct' },
-            { type: 'field', domain: ['geosite:private'], outboundTag: 'direct' },
-            { type: 'field', ip: ['geoip:private'], outboundTag: 'direct' },
+            {
+                type: 'field',
+                domain: [
+                    'localhost',
+                    'localhost.localdomain',
+                    'local',
+                    '*.local',
+                    '*.localdomain',
+                    '*.lan',
+                    '*.internal',
+                ],
+                outboundTag: 'direct',
+            },
+            {
+                type: 'field',
+                ip: [
+                    '127.0.0.0/8',
+                    '10.0.0.0/8',
+                    '172.16.0.0/12',
+                    '192.168.0.0/16',
+                    '169.254.0.0/16',
+                    '::1/128',
+                    'fc00::/7',
+                    'fe80::/10',
+                ],
+                outboundTag: 'direct',
+            },
             { type: 'field', network: 'tcp,udp', balancerTag: `${prefix}-balancer` },
         ],
     };
@@ -424,6 +526,45 @@ function buildGroupConfig(baseConfig, groupName, outbounds) {
 }
 
 // ─── HTTP сервер ───
+
+// Заголовки запроса которые НЕ пробрасываем на upstream
+const SKIP_REQUEST_HEADERS = new Set([
+    'accept-encoding',      // Чтобы upstream не сжимал ответ
+    'host',                 // Перезаписываем сами
+    'connection',           // Hop-by-hop
+    'keep-alive',           // Hop-by-hop
+    'transfer-encoding',    // Hop-by-hop
+    'te',                   // Hop-by-hop
+    'upgrade',              // Hop-by-hop
+    'proxy-authorization',  // Не нужен для upstream
+    'proxy-connection',     // Hop-by-hop
+]);
+
+// Заголовки ответа которые НЕ пробрасываем клиенту
+const SKIP_RESPONSE_HEADERS = new Set([
+    'connection',
+    'keep-alive',
+    'transfer-encoding',
+    'te',
+    'upgrade',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'content-length',       // Пересчитываем сами
+    'content-encoding',     // Мы отдаём без сжатия
+    'date',                 // Своё выставит Node.js
+    'server',               // Не светим upstream (nginx и т.д.)
+]);
+
+// Собрать все заголовки от upstream кроме служебных
+function forwardResponseHeaders(upstreamHeaders, contentType) {
+    const result = { 'Content-Type': contentType || 'application/json; charset=utf-8' };
+    for (const [key, val] of Object.entries(upstreamHeaders)) {
+        if (!SKIP_RESPONSE_HEADERS.has(key) && key !== 'content-type') {
+            result[key] = val;
+        }
+    }
+    return result;
+}
 
 const server = http.createServer(async (req, res) => {
     const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -479,19 +620,20 @@ const server = http.createServer(async (req, res) => {
     console.log(`[proxy] ${req.method} ${pathname} → ${targetUrl}`);
 
     try {
+        // Пробрасываем ВСЕ заголовки от клиента, кроме тех что ломают проксирование
         const forwardHeaders = {};
-
-        if (req.headers['user-agent']) forwardHeaders['User-Agent'] = req.headers['user-agent'];
-        if (req.headers['accept']) forwardHeaders['Accept'] = req.headers['accept'];
-        if (req.headers['accept-language']) forwardHeaders['Accept-Language'] = req.headers['accept-language'];
-        if (!req.headers['user-agent']) forwardHeaders['User-Agent'] = 'Happ/1.0';
-
         for (const [key, value] of Object.entries(req.headers)) {
-            if (key.startsWith('x-') && !forwardHeaders[key]) {
+            if (!SKIP_REQUEST_HEADERS.has(key)) {
                 forwardHeaders[key] = value;
             }
         }
 
+        // Дефолтный User-Agent если клиент не прислал
+        if (!forwardHeaders['user-agent']) {
+            forwardHeaders['user-agent'] = 'Happ/1.0';
+        }
+
+        // Проксирование через subscription page — подставляем правильные заголовки
         if (SUB_PAGE_URL) {
             const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1';
             forwardHeaders['X-Forwarded-Proto'] = 'https';
@@ -506,7 +648,7 @@ const server = http.createServer(async (req, res) => {
         console.log(`[proxy] Upstream: ${upstream.status}, ${upstream.body.length} bytes`);
 
         if (upstream.status !== 200) {
-            res.writeHead(upstream.status, { 'Content-Type': 'text/plain' });
+            res.writeHead(upstream.status, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'text/plain'));
             res.end(upstream.body);
             return;
         }
@@ -516,12 +658,7 @@ const server = http.createServer(async (req, res) => {
             parsed = JSON.parse(upstream.body);
         } catch (e) {
             console.log('[proxy] Не JSON, проксируем');
-            res.writeHead(200, {
-                'Content-Type': upstream.headers['content-type'] || 'text/plain',
-                'subscription-userinfo': upstream.headers['subscription-userinfo'] || '',
-                'profile-update-interval': upstream.headers['profile-update-interval'] || '',
-                'content-disposition': upstream.headers['content-disposition'] || '',
-            });
+            res.writeHead(200, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'text/plain'));
             res.end(upstream.body);
             return;
         }
@@ -529,17 +666,28 @@ const server = http.createServer(async (req, res) => {
         let configArray = Array.isArray(parsed) ? parsed : [parsed];
 
         if (configArray.length === 0) {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.writeHead(200, forwardResponseHeaders(upstream.headers, 'application/json; charset=utf-8'));
             res.end(upstream.body);
             return;
         }
 
         const baseConfig = configArray[0];
+
+        // Детектируем фейковые конфиги — когда Remnawave возвращает сообщение об ошибке
+        // (лимит устройств, истекла подписка и т.д.) вместо реальных серверов.
+        // Признак: все прокси-outbound'ы имеют адрес 0.0.0.0 и порт 1.
+        if (isFakeConfig(configArray)) {
+            console.log('[proxy] Обнаружен фейковый конфиг (лимит устройств / истекла подписка) — проксируем как есть');
+            res.writeHead(200, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'application/json; charset=utf-8'));
+            res.end(upstream.body);
+            return;
+        }
+
         let allOutbounds = collectAllProxyOutbounds(configArray);
         console.log(`[proxy] Собрано ${allOutbounds.length} прокси-outbound(ов)`);
 
         if (allOutbounds.length === 0) {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.writeHead(200, forwardResponseHeaders(upstream.headers, 'application/json; charset=utf-8'));
             res.end(upstream.body);
             return;
         }
@@ -597,9 +745,9 @@ const server = http.createServer(async (req, res) => {
         // ⚡ Fastest
         const fastestEnabled = config.fastest_group !== false;
         if (fastestEnabled && allOutbounds.length > 1) {
-            const fastestConfig = buildGroupConfig(baseConfig, '⚡ Fastest', allOutbounds);
+            const fastestConfig = buildGroupConfig(baseConfig, '🏁 Самые быстрые', allOutbounds);
             resultConfigs.push(fastestConfig);
-            console.log(`[group] ⚡ Fastest: ${allOutbounds.length} серверов (все)`);
+            console.log(`[group] 🏁 Самые быстрые: ${allOutbounds.length} серверов (все)`);
         }
 
         // Группы по странам
@@ -624,11 +772,7 @@ const server = http.createServer(async (req, res) => {
 
         const responseBody = JSON.stringify(resultConfigs, null, 2);
 
-        const responseHeaders = { 'Content-Type': 'application/json; charset=utf-8' };
-        if (upstream.headers['subscription-userinfo']) responseHeaders['subscription-userinfo'] = upstream.headers['subscription-userinfo'];
-        if (upstream.headers['profile-update-interval']) responseHeaders['profile-update-interval'] = upstream.headers['profile-update-interval'];
-        if (upstream.headers['content-disposition']) responseHeaders['content-disposition'] = upstream.headers['content-disposition'];
-        if (upstream.headers['profile-title']) responseHeaders['profile-title'] = upstream.headers['profile-title'];
+        const responseHeaders = forwardResponseHeaders(upstream.headers, 'application/json; charset=utf-8');
 
         res.writeHead(200, responseHeaders);
         res.end(responseBody);
@@ -672,15 +816,15 @@ async function start() {
     const fastestEnabled = config.fastest_group !== false;
 
     server.listen(PORT, () => {
-        console.log(`\n🚀 Xray Balancer Middleware (dev) — порт ${PORT}`);
+        console.log(`\n🚀 Xray Balancer Middleware — порт ${PORT}`);
         console.log(`📋 Группы: ${Object.entries(GROUPS).map(([k, v]) => `${k} [${v.join(',')}]`).join(' | ')}`);
-        console.log(`⚡ Fastest: ${fastestEnabled ? '✅' : '❌'}`);
-        console.log(`🎯 Стратегия: leastLoad (expected=1, baselines=1s, tolerance=0.8)`);
+        console.log(`🏁 Самые быстрые: ${fastestEnabled ? '✅' : '❌'}`);
+        console.log(`🎯 Стратегия: ${STRATEGY} (expected=1, baselines=1s, tolerance=0.8)`);
         console.log(`📡 Probe: ${PROBE_URL} каждые ${PROBE_INTERVAL}`);
         console.log(`📊 Node stats: ${NODE_STATS_ENABLED ? `✅ (каждые ${NODE_STATS_INTERVAL/1000}с, макс ${MAX_USERS_PER_GB} users/GB)` : '❌'}`);
         console.log(`🔐 Panel cookie: ${PANEL_AUTH_COOKIE ? '✅' : '❌ (не нужен)'}`);
         console.log(`📡 Sub page: ${SUB_PAGE_URL || 'не задан'}`);
-        console.log(`🔀 Форвард: все X-* заголовки (HWID, Device и т.д.)`);
+        console.log(`🔀 Форвард: все заголовки клиента → upstream, все заголовки upstream → клиент`);
         console.log(`\n   Подписка: http://localhost:${PORT}/{token}`);
         console.log(`   Health:   http://localhost:${PORT}/health`);
         console.log(`   Стата:    http://localhost:${PORT}/node-stats\n`);
