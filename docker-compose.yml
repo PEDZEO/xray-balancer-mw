@@ -3,6 +3,8 @@ services:
     build: .
     container_name: xray-balancer-mw
     restart: unless-stopped
+    env_file:
+      - .env
     volumes:
       - ./config.json:/app/config.json:ro
     networks:
