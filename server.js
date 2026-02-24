@@ -234,12 +234,12 @@ function parseRamGb(ramStr) {
 // ─── Node Stats — опрос панели ───
 
 async function fetchNodeStats() {
-    if (!API_TOKEN || !REMNAWAVE_URL) return;
+    if (!API_TOKEN || !REMNAWAVE_URL) return { ok: false, error: 'API token or REMNAWAVE_URL is missing' };
     try {
         const response = await fetchUrl(`${REMNAWAVE_URL}/api/nodes/`, panelHeaders());
         if (response.status !== 200) {
             console.error('[node-stats] API вернул', response.status);
-            return;
+            return { ok: false, error: `Panel API returned ${response.status}` };
         }
         const data = JSON.parse(response.body);
         const nodes = data.response || (Array.isArray(data) ? data : []);
@@ -300,9 +300,11 @@ async function fetchNodeStats() {
             console.log(`  ${name}: ${s.usersOnline}u, ${s.totalRamGb}GB/${s.cpuCount}CPU, ram=${s.ramLoad} cpu=${s.cpuLoad} load=${s.load}`);
         }
         if (sorted.length > 5) console.log(`  ... и ещё ${sorted.length - 5}`);
+        return { ok: true, nodes: sorted.length };
 
     } catch (err) {
         console.error('[node-stats] Ошибка:', err.message);
+        return { ok: false, error: err.message };
     }
 }
 
@@ -367,15 +369,17 @@ function detectCountryFromRemark(remark) {
 }
 
 async function fetchHostsFromApi() {
-    if (!API_TOKEN) return null;
+    if (!API_TOKEN) return { ok: false, error: 'API token is missing', hosts: null };
     try {
         const response = await fetchUrl(`${REMNAWAVE_URL}/api/hosts/`, panelHeaders());
-        if (response.status !== 200) return null;
+        if (response.status !== 200) return { ok: false, error: `Panel API returned ${response.status}`, hosts: null };
         const data = JSON.parse(response.body);
-        return data.response || (Array.isArray(data) ? data : null);
+        const hosts = data.response || (Array.isArray(data) ? data : null);
+        if (!hosts) return { ok: false, error: 'Panel API response does not contain hosts', hosts: null };
+        return { ok: true, error: null, hosts };
     } catch (err) {
         console.error('[auto-groups] Ошибка:', err.message);
-        return null;
+        return { ok: false, error: err.message, hosts: null };
     }
 }
 
@@ -394,12 +398,14 @@ function buildGroupsFromHosts(hosts) {
 }
 
 async function refreshGroups() {
-    const hosts = await fetchHostsFromApi();
-    if (!hosts) return;
+    const hostsResult = await fetchHostsFromApi();
+    if (!hostsResult.ok || !hostsResult.hosts) return { ok: false, error: hostsResult.error || 'Failed to fetch hosts' };
+    const hosts = hostsResult.hosts;
     const newGroups = buildGroupsFromHosts(hosts);
-    if (Object.keys(newGroups).length === 0) return;
+    if (Object.keys(newGroups).length === 0) return { ok: false, error: 'No groups detected from enabled hosts' };
     GROUPS = { ...newGroups, ...(config.groups || {}) };
     console.log(`[auto-groups] Обновлены: ${Object.entries(GROUPS).map(([k, v]) => `${k} [${v}]`).join(' | ')}`);
+    return { ok: true, groups: GROUPS };
 }
 
 // ─── Собрать все прокси-outbound'ы из XRAY-JSON массива ───
@@ -622,35 +628,38 @@ const server = http.createServer(async (req, res) => {
     }
 
     const debugTokenMatch = pathname.match(/^\/debug\/token\/([a-zA-Z0-9_-]+)$/);
-    if (pathname === '/node-stats' || pathname === '/refresh-groups' || pathname === '/refresh-stats' || pathname === '/debug/stats' || debugTokenMatch) {
-        if (!isAdminAuthorized(req)) {
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
-            return;
-        }
-    }
 
-    if (pathname === '/node-stats') {
+    if (pathname === '/node-stats' && isAdminAuthorized(req)) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(nodeStatsCache, null, 2));
         return;
     }
 
-    if (pathname === '/refresh-groups' && API_TOKEN) {
-        await refreshGroups();
+    if (pathname === '/refresh-groups' && API_TOKEN && isAdminAuthorized(req)) {
+        const refreshed = await refreshGroups();
+        if (!refreshed.ok) {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'REFRESH_GROUPS_FAILED', request_id: requestId, message: refreshed.error }));
+            return;
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'ok', groups: GROUPS }));
         return;
     }
 
-    if (pathname === '/refresh-stats' && API_TOKEN) {
-        await fetchNodeStats();
+    if (pathname === '/refresh-stats' && API_TOKEN && isAdminAuthorized(req)) {
+        const refreshed = await fetchNodeStats();
+        if (!refreshed.ok) {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'REFRESH_STATS_FAILED', request_id: requestId, message: refreshed.error }));
+            return;
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'ok', nodes: nodeStatsCache }));
         return;
     }
 
-    if (pathname === '/debug/stats') {
+    if (pathname === '/debug/stats' && isAdminAuthorized(req)) {
         const cb = circuitBreaker.status();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -663,7 +672,7 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (debugTokenMatch) {
+    if (debugTokenMatch && isAdminAuthorized(req)) {
         const debugToken = debugTokenMatch[1];
         const debugTarget = SUB_PAGE_URL
             ? `${SUB_PAGE_URL}/${debugToken}`
