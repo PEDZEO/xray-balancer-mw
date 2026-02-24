@@ -15,6 +15,7 @@ const { buildLogger } = require('./lib/log');
 const { resolveProfile } = require('./lib/profile');
 const { classifyUpstreamPayload } = require('./lib/upstream-contract');
 const { buildGroupConfig } = require('./lib/group-builder');
+const { createRequestGuard } = require('./lib/request-guard');
 
 // ─── Загрузка конфига ───
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
@@ -116,6 +117,12 @@ const runtimeStats = {
     fake_config_passthrough_total: 0,
 };
 const logger = buildLogger();
+const requestGuard = createRequestGuard({
+    ipLimiter: rateLimiter,
+    tokenLimiter: tokenRateLimiter,
+    circuitBreaker,
+    stats: runtimeStats,
+});
 
 // ─── Утилиты ───
 
@@ -596,33 +603,28 @@ const server = http.createServer(async (req, res) => {
 
     const safePath = redactTokenPath(pathname);
     runtimeStats.requests_total += 1;
-    if (!rateLimiter.allow(clientIp)) {
-        runtimeStats.rate_limited_ip_total += 1;
-        logger.warn('rate_limited', { request_id: requestId, ip: clientIp, path: safePath });
-        res.writeHead(429, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'error', code: 'RATE_LIMITED', request_id: requestId }));
-        return;
-    }
-    if (!tokenRateLimiter.allow(token)) {
-        runtimeStats.rate_limited_token_total += 1;
-        logger.warn('token_rate_limited', { request_id: requestId, path: safePath });
-        res.writeHead(429, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'error', code: 'TOKEN_RATE_LIMITED', request_id: requestId }));
-        return;
-    }
-    if (!circuitBreaker.allowRequest()) {
-        runtimeStats.circuit_open_total += 1;
-        const fallback = getCachedFallback(token);
-        if (fallback) {
-            runtimeStats.cache_fallback_total += 1;
-            if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
-            logger.warn('cache_fallback_circuit_open', { request_id: requestId, cache_kind: fallback.kind });
-            res.writeHead(200, forwardResponseHeaders(fallback.item.headers, 'application/json; charset=utf-8'));
-            res.end(fallback.item.body);
-            return;
+    const guardDecision = requestGuard.evaluate(clientIp, token);
+    if (!guardDecision.ok) {
+        if (guardDecision.code === 'RATE_LIMITED') {
+            logger.warn('rate_limited', { request_id: requestId, ip: clientIp, path: safePath });
+        } else if (guardDecision.code === 'TOKEN_RATE_LIMITED') {
+            logger.warn('token_rate_limited', { request_id: requestId, path: safePath });
         }
-        res.writeHead(503, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'error', code: 'UPSTREAM_CIRCUIT_OPEN', request_id: requestId }));
+
+        if (guardDecision.allowFallback) {
+            const fallback = getCachedFallback(token);
+            if (fallback) {
+                runtimeStats.cache_fallback_total += 1;
+                if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
+                logger.warn('cache_fallback_circuit_open', { request_id: requestId, cache_kind: fallback.kind });
+                res.writeHead(200, forwardResponseHeaders(fallback.item.headers, 'application/json; charset=utf-8'));
+                res.end(fallback.item.body);
+                return;
+            }
+        }
+
+        res.writeHead(guardDecision.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'error', code: guardDecision.code, request_id: requestId }));
         return;
     }
     logger.info('request_start', { request_id: requestId, method: req.method, path: safePath, ip: clientIp });
