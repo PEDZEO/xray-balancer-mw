@@ -264,13 +264,19 @@ async function fetchNodeStats() {
                 load,
                 isConnected,
                 isDisabled,
+                isAlias: false,
+                sourceNode: name,
             };
 
             // Также кэшируем по тегам inbound'ов (для матчинга с outbound тегами)
             if (node.configProfile && node.configProfile.activeInbounds) {
                 for (const inb of node.configProfile.activeInbounds) {
                     if (inb.tag && inb.tag !== name) {
-                        newCache[inb.tag] = newCache[name];
+                        newCache[inb.tag] = {
+                            ...newCache[name],
+                            isAlias: true,
+                            sourceNode: name,
+                        };
                     }
                 }
             }
