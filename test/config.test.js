@@ -28,3 +28,15 @@ test('validateConfig rejects invalid port', () => {
 test('validateConfig rejects malformed groups', () => {
     assert.throws(() => validateConfig({ groups: { test: [] } }), /at least one pattern/);
 });
+
+test('validateConfig accepts runtime and fastest-exclude options', () => {
+    const cfg = {
+        fastest_exclude_groups: ['🇷🇺 White List'],
+        cache_ttl_sec: 300,
+        rate_limit_per_minute: 120,
+        rate_limit_burst_10s: 30,
+        ready_success_window_sec: 300,
+    };
+
+    assert.deepEqual(validateConfig(cfg), cfg);
+});

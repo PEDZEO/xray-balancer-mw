@@ -2,6 +2,7 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { validateConfig } = require('./lib/config');
 const { redactTokenPath, sanitizeClientMetadata } = require('./lib/security');
 const {
@@ -10,6 +11,8 @@ const {
     isFakeConfig,
     matchGroup,
 } = require('./lib/balancing');
+const { createRateLimiter, createTokenCache } = require('./lib/runtime');
+const { buildLogger } = require('./lib/log');
 
 // ─── Загрузка конфига ───
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
@@ -48,6 +51,11 @@ const NODE_STATS_ENABLED = process.env.NODE_STATS === 'true' || config.node_stat
 const NODE_STATS_INTERVAL = (parseInt(process.env.NODE_STATS_INTERVAL_SEC, 10) || config.node_stats_interval_sec || 120) * 1000;
 const MAX_USERS_PER_GB = parseInt(process.env.MAX_USERS_PER_GB, 10) || config.max_users_per_gb || 20;
 const MAX_USERS_PER_CPU = parseInt(process.env.MAX_USERS_PER_CPU, 10) || config.max_users_per_cpu || 40;
+const CACHE_TTL_SEC = parseInt(process.env.CACHE_TTL_SEC, 10) || config.cache_ttl_sec || 300;
+const RATE_LIMIT_PER_MINUTE = parseInt(process.env.RATE_LIMIT_PER_MINUTE, 10) || config.rate_limit_per_minute || 120;
+const RATE_LIMIT_BURST_10S = parseInt(process.env.RATE_LIMIT_BURST_10S, 10) || config.rate_limit_burst_10s || 30;
+const READY_SUCCESS_WINDOW_SEC = parseInt(process.env.READY_SUCCESS_WINDOW_SEC, 10) || config.ready_success_window_sec || 300;
+const FASTEST_EXCLUDE_GROUPS = Array.isArray(config.fastest_exclude_groups) ? config.fastest_exclude_groups : [];
 
 const MAX_RESPONSE_SIZE = 10 * 1024 * 1024;
 
@@ -69,6 +77,10 @@ function panelHeaders() {
 
 // Кэш статистики нод: { "Finland2": { usersOnline: 9, totalRamGb: 2.06, cpuCount: 1, ramLoad: 4.37, cpuLoad: 9, load: 0.23 }, ... }
 let nodeStatsCache = {};
+let lastUpstreamSuccessAt = 0;
+const subscriptionCache = createTokenCache(CACHE_TTL_SEC);
+const rateLimiter = createRateLimiter(RATE_LIMIT_PER_MINUTE, RATE_LIMIT_BURST_10S);
+const logger = buildLogger();
 
 // ─── Утилиты ───
 
@@ -475,11 +487,14 @@ function forwardResponseHeaders(upstreamHeaders, contentType) {
 const server = http.createServer(async (req, res) => {
     const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname;
+    const requestId = req.headers['x-request-id'] || crypto.randomUUID();
+    const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1').toString().split(',')[0].trim();
 
     if (pathname === '/health' || pathname === '/mw-health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
             status: 'ok',
+            request_id: requestId,
             groups: Object.keys(GROUPS),
             auto_groups: AUTO_GROUPS,
             fastest_group: config.fastest_group !== false,
@@ -487,6 +502,22 @@ const server = http.createServer(async (req, res) => {
             panel_auth: PANEL_AUTH_COOKIE ? true : false,
             cached_nodes: Object.keys(nodeStatsCache).length,
             sub_page: SUB_PAGE_URL || 'disabled',
+        }));
+        return;
+    }
+
+    if (pathname === '/ready') {
+        const healthyWindowMs = READY_SUCCESS_WINDOW_SEC * 1000;
+        const hasRecentUpstream = lastUpstreamSuccessAt > 0 && (Date.now() - lastUpstreamSuccessAt) <= healthyWindowMs;
+        const hasCache = subscriptionCache.hasFreshAny();
+        const ready = hasRecentUpstream || hasCache;
+        res.writeHead(ready ? 200 : 503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            status: ready ? 'ready' : 'not_ready',
+            request_id: requestId,
+            has_recent_upstream: hasRecentUpstream,
+            has_cache: hasCache,
+            cache_ttl_sec: CACHE_TTL_SEC,
         }));
         return;
     }
@@ -524,7 +555,13 @@ const server = http.createServer(async (req, res) => {
         : `${REMNAWAVE_URL}${REMNAWAVE_SUB_PATH}/${token}`;
 
     const safePath = redactTokenPath(pathname);
-    console.log(`[proxy] ${req.method} ${safePath} → upstream`);
+    if (!rateLimiter.allow(clientIp)) {
+        logger.warn('rate_limited', { request_id: requestId, ip: clientIp, path: safePath });
+        res.writeHead(429, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'error', code: 'RATE_LIMITED', request_id: requestId }));
+        return;
+    }
+    logger.info('request_start', { request_id: requestId, method: req.method, path: safePath, ip: clientIp });
 
     try {
         // Пробрасываем ВСЕ заголовки от клиента, кроме тех что ломают проксирование
@@ -542,7 +579,6 @@ const server = http.createServer(async (req, res) => {
 
         // Проксирование через subscription page — подставляем правильные заголовки
         if (SUB_PAGE_URL) {
-            const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1';
             forwardHeaders['X-Forwarded-Proto'] = 'https';
             forwardHeaders['X-Forwarded-For'] = clientIp;
             forwardHeaders['X-Real-IP'] = clientIp;
@@ -550,12 +586,28 @@ const server = http.createServer(async (req, res) => {
         }
 
         const clientMeta = sanitizeClientMetadata(req);
-        console.log(`[proxy] Client meta: hwid=${clientMeta.hwid} device=${clientMeta.device} os=${clientMeta.os}`);
+        logger.info('request_meta', {
+            request_id: requestId,
+            hwid: clientMeta.hwid,
+            device: clientMeta.device,
+            os: clientMeta.os,
+        });
 
         const upstream = await fetchUrl(targetUrl, forwardHeaders);
-        console.log(`[proxy] Upstream: ${upstream.status}, ${upstream.body.length} bytes`);
+        logger.info('upstream_response', {
+            request_id: requestId,
+            status: upstream.status,
+            bytes: upstream.body.length,
+        });
 
         if (upstream.status !== 200) {
+            const cached = subscriptionCache.get(token);
+            if (cached) {
+                logger.warn('cache_fallback_by_status', { request_id: requestId, status: upstream.status });
+                res.writeHead(200, forwardResponseHeaders(cached.headers, 'application/json; charset=utf-8'));
+                res.end(cached.body);
+                return;
+            }
             res.writeHead(upstream.status, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'text/plain'));
             res.end(upstream.body);
             return;
@@ -565,7 +617,7 @@ const server = http.createServer(async (req, res) => {
         try {
             parsed = JSON.parse(upstream.body);
         } catch (e) {
-            console.log('[proxy] Не JSON, проксируем');
+            logger.info('upstream_non_json_passthrough', { request_id: requestId });
             res.writeHead(200, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'text/plain'));
             res.end(upstream.body);
             return;
@@ -585,14 +637,14 @@ const server = http.createServer(async (req, res) => {
         // (лимит устройств, истекла подписка и т.д.) вместо реальных серверов.
         // Признак: все прокси-outbound'ы имеют адрес 0.0.0.0 и порт 1.
         if (isFakeConfig(configArray)) {
-            console.log('[proxy] Обнаружен фейковый конфиг (лимит устройств / истекла подписка) — проксируем как есть');
+            logger.info('fake_config_passthrough', { request_id: requestId });
             res.writeHead(200, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'application/json; charset=utf-8'));
             res.end(upstream.body);
             return;
         }
 
         let allOutbounds = collectAllProxyOutbounds(configArray);
-        console.log(`[proxy] Собрано ${allOutbounds.length} прокси-outbound(ов)`);
+        logger.info('outbounds_collected', { request_id: requestId, count: allOutbounds.length });
 
         if (allOutbounds.length === 0) {
             res.writeHead(200, forwardResponseHeaders(upstream.headers, 'application/json; charset=utf-8'));
@@ -606,7 +658,7 @@ const server = http.createServer(async (req, res) => {
             allOutbounds = filterAndSortByLoad(allOutbounds, nodeStatsCache);
             const after = allOutbounds.length;
             if (before !== after) {
-                console.log(`[node-stats] Отфильтровано: ${before} → ${after} серверов (исключены перегруженные >${MAX_USERS_PER_GB} u/GB или >${MAX_USERS_PER_CPU} u/CPU)`);
+                logger.info('outbounds_filtered_by_load', { request_id: requestId, before, after });
             }
         }
 
@@ -628,7 +680,7 @@ const server = http.createServer(async (req, res) => {
             const firstGroup = Object.keys(grouped)[0];
             if (firstGroup) {
                 grouped[firstGroup].push(...ungrouped);
-                console.log(`[proxy] ${ungrouped.length} без группы → ${firstGroup}`);
+                logger.info('ungrouped_appended', { request_id: requestId, count: ungrouped.length, group: firstGroup });
             } else {
                 grouped['🌐 Other'] = ungrouped;
             }
@@ -652,10 +704,20 @@ const server = http.createServer(async (req, res) => {
 
         // ⚡ Fastest
         const fastestEnabled = config.fastest_group !== false;
-        if (fastestEnabled && allOutbounds.length > 1) {
-            const fastestConfig = buildGroupConfig(baseConfig, '🏁 🇪🇺 Самые быстрые', allOutbounds);
+        const excludedTags = new Set();
+        for (const [groupName, outbounds] of Object.entries(grouped)) {
+            if (FASTEST_EXCLUDE_GROUPS.includes(groupName)) {
+                for (const outbound of outbounds) excludedTags.add(outbound.tag);
+            }
+        }
+        const fastestOutbounds = excludedTags.size > 0
+            ? allOutbounds.filter(outbound => !excludedTags.has(outbound.tag))
+            : allOutbounds;
+
+        if (fastestEnabled && fastestOutbounds.length > 1) {
+            const fastestConfig = buildGroupConfig(baseConfig, '🏁 🇪🇺 Самые быстрые', fastestOutbounds);
             resultConfigs.push(fastestConfig);
-            console.log(`[group] 🏁 Самые быстрые: ${allOutbounds.length} серверов (все)`);
+            logger.info('group_fastest', { request_id: requestId, count: fastestOutbounds.length, excluded_groups: FASTEST_EXCLUDE_GROUPS });
         }
 
         // Группы по странам
@@ -670,15 +732,17 @@ const server = http.createServer(async (req, res) => {
                     const s = getNodeStats(nodeStatsCache, ob.tag);
                     return s ? `${ob.tag}(${s.usersOnline}u/${s.totalRamGb}G/${s.cpuCount}C)` : ob.tag;
                 }).join(', ');
-                console.log(`[group] ${groupName}: ${outbounds.length} серверов → ${order}`);
+                logger.info('group_built', { request_id: requestId, group: groupName, count: outbounds.length, order });
             } else {
-                console.log(`[group] ${groupName}: ${outbounds.length} серверов`);
+                logger.info('group_built', { request_id: requestId, group: groupName, count: outbounds.length });
             }
         }
 
-        console.log(`[proxy] Итого: ${resultConfigs.length} групп, ${allOutbounds.length} серверов`);
+        logger.info('response_built', { request_id: requestId, groups: resultConfigs.length, servers: allOutbounds.length });
 
         const responseBody = JSON.stringify(resultConfigs, null, 2);
+        lastUpstreamSuccessAt = Date.now();
+        subscriptionCache.set(token, responseBody, upstream.headers);
 
         const responseHeaders = forwardResponseHeaders(upstream.headers, 'application/json; charset=utf-8');
 
@@ -686,7 +750,14 @@ const server = http.createServer(async (req, res) => {
         res.end(responseBody);
 
     } catch (err) {
-        console.error('[error]', err.message);
+        logger.error('request_failed', { request_id: requestId, message: err.message });
+        const cached = subscriptionCache.get(token);
+        if (cached) {
+            logger.warn('cache_fallback_by_error', { request_id: requestId });
+            res.writeHead(200, forwardResponseHeaders(cached.headers, 'application/json; charset=utf-8'));
+            res.end(cached.body);
+            return;
+        }
         if (!res.headersSent) {
             res.writeHead(502, { 'Content-Type': 'text/plain' });
             res.end('Bad Gateway: ' + err.message);
