@@ -8,6 +8,7 @@
     "probe_url": "https://www.gstatic.com/generate_204",
 
     "fastest_group": true,
+    "fastest_group_name": "🏁 🇪🇺 Самые быстрые",
     "fastest_exclude_groups": [],
     "auto_groups": false,
     "auto_groups_interval_sec": 300,

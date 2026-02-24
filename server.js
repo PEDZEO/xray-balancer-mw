@@ -76,6 +76,7 @@ const MAX_REDIRECTS = pickRuntimeInt('MAX_REDIRECTS', 'max_redirects');
 const CIRCUIT_BREAKER_FAILURES = pickRuntimeInt('CIRCUIT_BREAKER_FAILURES', 'circuit_breaker_failures');
 const CIRCUIT_BREAKER_OPEN_SEC = pickRuntimeInt('CIRCUIT_BREAKER_OPEN_SEC', 'circuit_breaker_open_sec');
 let FASTEST_EXCLUDE_GROUPS = Array.isArray(config.fastest_exclude_groups) ? config.fastest_exclude_groups : [];
+const DEFAULT_FASTEST_GROUP_NAME = '🏁 🇪🇺 Самые быстрые';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || config.admin_token || '';
 const WARMUP_TOKENS = Array.isArray(config.warmup_tokens) ? config.warmup_tokens : [];
 
@@ -532,6 +533,7 @@ const server = http.createServer(async (req, res) => {
                 request_id: requestId,
                 groups: GROUPS,
                 fastest_group: config.fastest_group !== false,
+                fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
             }));
             return;
@@ -548,11 +550,13 @@ const server = http.createServer(async (req, res) => {
             const incomingGroups = payload.groups;
             const incomingExclude = payload.fastest_exclude_groups;
             const incomingFastest = payload.fastest_group;
+            const incomingFastestName = payload.fastest_group_name;
 
             const nextConfig = { ...config };
             if (incomingGroups !== undefined) nextConfig.groups = incomingGroups;
             if (incomingExclude !== undefined) nextConfig.fastest_exclude_groups = incomingExclude;
             if (incomingFastest !== undefined) nextConfig.fastest_group = incomingFastest;
+            if (incomingFastestName !== undefined) nextConfig.fastest_group_name = incomingFastestName;
 
             validateConfig(nextConfig);
             config = nextConfig;
@@ -564,6 +568,7 @@ const server = http.createServer(async (req, res) => {
                 request_id: requestId,
                 groups_count: Object.keys(GROUPS).length,
                 fastest_group: config.fastest_group !== false,
+                fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups_count: FASTEST_EXCLUDE_GROUPS.length,
             });
 
@@ -573,6 +578,7 @@ const server = http.createServer(async (req, res) => {
                 request_id: requestId,
                 groups: GROUPS,
                 fastest_group: config.fastest_group !== false,
+                fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
             }));
             return;
@@ -893,7 +899,8 @@ const server = http.createServer(async (req, res) => {
             : allOutbounds;
 
         if (fastestEnabled && fastestOutbounds.length > 1) {
-            const fastestConfig = buildGroupConfig(baseConfig, '🏁 🇪🇺 Самые быстрые', fastestOutbounds, {
+            const fastestGroupName = (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME);
+            const fastestConfig = buildGroupConfig(baseConfig, fastestGroupName, fastestOutbounds, {
                 probeUrl: PROBE_URL,
                 probeInterval: PROBE_INTERVAL,
                 strategy: STRATEGY,
@@ -996,7 +1003,8 @@ async function start() {
     server.listen(PORT, () => {
         console.log(`\n🚀 Xray Balancer Middleware — порт ${PORT}`);
         console.log(`📋 Группы: ${Object.entries(GROUPS).map(([k, v]) => `${k} [${v.join(',')}]`).join(' | ')}`);
-        console.log(`🏁 Самые быстрые: ${fastestEnabled ? '✅' : '❌'}`);
+        const fastestLabel = config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME;
+        console.log(`🏁 Fastest group (${fastestLabel}): ${fastestEnabled ? '✅' : '❌'}`);
         console.log(`🎯 Стратегия: ${STRATEGY} (expected=1, baselines=1s, tolerance=0.8)`);
         console.log(`🧭 Profile: ${PROFILE.name}`);
         console.log(`📡 Probe: ${PROBE_URL} каждые ${PROBE_INTERVAL}`);

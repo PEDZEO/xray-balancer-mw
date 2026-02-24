@@ -11,6 +11,7 @@
     "probe_interval": { "type": "string" },
     "probe_url": { "type": "string", "pattern": "^https?://" },
     "fastest_group": { "type": "boolean" },
+    "fastest_group_name": { "type": "string", "minLength": 1 },
     "fastest_exclude_groups": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
