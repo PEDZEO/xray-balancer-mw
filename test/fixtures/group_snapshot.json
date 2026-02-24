@@ -1,0 +1,117 @@
+{
+  "extraField": {
+    "x": 1
+  },
+  "remarks": "🇪🇺 Europe",
+  "dns": {
+    "servers": [
+      "1.1.1.1"
+    ]
+  },
+  "inbounds": [
+    {
+      "tag": "socks",
+      "protocol": "socks"
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "Germany-1",
+      "protocol": "vless"
+    },
+    {
+      "tag": "USA-1",
+      "protocol": "vless"
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ],
+  "burstObservatory": {
+    "subjectSelector": [
+      "Germany-1",
+      "USA-1"
+    ],
+    "pingConfig": {
+      "destination": "https://example.com/ping",
+      "interval": "3m",
+      "sampling": 3,
+      "timeout": "2s",
+      "httpMethod": "GET"
+    }
+  },
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "balancers": [
+      {
+        "tag": "_Europe-balancer",
+        "selector": [
+          "Germany-1",
+          "USA-1"
+        ],
+        "strategy": {
+          "type": "leastLoad",
+          "settings": {
+            "expected": 1,
+            "baselines": [
+              "1s"
+            ],
+            "tolerance": 0.8
+          }
+        }
+      }
+    ],
+    "rules": [
+      {
+        "type": "field",
+        "network": "udp",
+        "port": "443",
+        "outboundTag": "block"
+      },
+      {
+        "type": "field",
+        "protocol": [
+          "bittorrent"
+        ],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "domain": [
+          "localhost",
+          "localhost.localdomain",
+          "local",
+          "*.local",
+          "*.localdomain",
+          "*.lan",
+          "*.internal"
+        ],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "ip": [
+          "127.0.0.0/8",
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "169.254.0.0/16",
+          "::1/128",
+          "fc00::/7",
+          "fe80::/10"
+        ],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "network": "tcp,udp",
+        "balancerTag": "_Europe-balancer"
+      }
+    ]
+  }
+}

@@ -10,10 +10,11 @@ const {
     getNodeStats,
     matchGroup,
 } = require('./lib/balancing');
-const { createRateLimiter, createTokenCache } = require('./lib/runtime');
+const { createCircuitBreaker, createKeyedRateLimiter, createRateLimiter, createTokenCache } = require('./lib/runtime');
 const { buildLogger } = require('./lib/log');
 const { resolveProfile } = require('./lib/profile');
 const { classifyUpstreamPayload } = require('./lib/upstream-contract');
+const { buildGroupConfig } = require('./lib/group-builder');
 
 // ─── Загрузка конфига ───
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
@@ -66,9 +67,16 @@ const CACHE_STALE_IF_ERROR_SEC = pickRuntimeInt('CACHE_STALE_IF_ERROR_SEC', 'cac
 const CACHE_MAX_ENTRIES = pickRuntimeInt('CACHE_MAX_ENTRIES', 'cache_max_entries');
 const RATE_LIMIT_PER_MINUTE = pickRuntimeInt('RATE_LIMIT_PER_MINUTE', 'rate_limit_per_minute');
 const RATE_LIMIT_BURST_10S = pickRuntimeInt('RATE_LIMIT_BURST_10S', 'rate_limit_burst_10s');
+const TOKEN_RATE_LIMIT_PER_MINUTE = pickRuntimeInt('TOKEN_RATE_LIMIT_PER_MINUTE', 'token_rate_limit_per_minute');
+const TOKEN_RATE_LIMIT_BURST_10S = pickRuntimeInt('TOKEN_RATE_LIMIT_BURST_10S', 'token_rate_limit_burst_10s');
 const READY_SUCCESS_WINDOW_SEC = pickRuntimeInt('READY_SUCCESS_WINDOW_SEC', 'ready_success_window_sec');
+const REQUEST_TIMEOUT_MS = pickRuntimeInt('REQUEST_TIMEOUT_MS', 'request_timeout_ms');
+const MAX_REDIRECTS = pickRuntimeInt('MAX_REDIRECTS', 'max_redirects');
+const CIRCUIT_BREAKER_FAILURES = pickRuntimeInt('CIRCUIT_BREAKER_FAILURES', 'circuit_breaker_failures');
+const CIRCUIT_BREAKER_OPEN_SEC = pickRuntimeInt('CIRCUIT_BREAKER_OPEN_SEC', 'circuit_breaker_open_sec');
 const FASTEST_EXCLUDE_GROUPS = Array.isArray(config.fastest_exclude_groups) ? config.fastest_exclude_groups : [];
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || config.admin_token || '';
+const WARMUP_TOKENS = Array.isArray(config.warmup_tokens) ? config.warmup_tokens : [];
 
 const MAX_RESPONSE_SIZE = 10 * 1024 * 1024;
 
@@ -93,11 +101,25 @@ let nodeStatsCache = {};
 let lastUpstreamSuccessAt = 0;
 const subscriptionCache = createTokenCache(CACHE_TTL_SEC, CACHE_MAX_ENTRIES);
 const rateLimiter = createRateLimiter(RATE_LIMIT_PER_MINUTE, RATE_LIMIT_BURST_10S);
+const tokenRateLimiter = createKeyedRateLimiter(TOKEN_RATE_LIMIT_PER_MINUTE, TOKEN_RATE_LIMIT_BURST_10S);
+const circuitBreaker = createCircuitBreaker(CIRCUIT_BREAKER_FAILURES, CIRCUIT_BREAKER_OPEN_SEC);
+const runtimeStats = {
+    started_at: Date.now(),
+    requests_total: 0,
+    request_failures: 0,
+    cache_fallback_total: 0,
+    cache_fallback_stale_total: 0,
+    circuit_open_total: 0,
+    rate_limited_ip_total: 0,
+    rate_limited_token_total: 0,
+    upstream_non_json_total: 0,
+    fake_config_passthrough_total: 0,
+};
 const logger = buildLogger();
 
 // ─── Утилиты ───
 
-function fetchUrl(targetUrl, headers = {}, maxRedirects = 3) {
+function fetchUrl(targetUrl, headers = {}, maxRedirects = MAX_REDIRECTS) {
     return new Promise((resolve, reject) => {
         const parsed = new URL(targetUrl);
         const mod = parsed.protocol === 'https:' ? https : http;
@@ -129,13 +151,9 @@ function fetchUrl(targetUrl, headers = {}, maxRedirects = 3) {
             res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
         });
         req.on('error', reject);
-        req.setTimeout(10000, () => { req.destroy(); reject(new Error('Timeout')); });
+        req.setTimeout(REQUEST_TIMEOUT_MS, () => { req.destroy(); reject(new Error('Timeout')); });
         req.end();
     });
-}
-
-function sanitizeTag(name) {
-    return name.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_');
 }
 
 function timingSafeEqualString(a, b) {
@@ -363,114 +381,6 @@ function collectAllProxyOutbounds(configArray) {
     return allOutbounds;
 }
 
-// ─── Создать конфиг для одной группы с балансировкой ───
-
-// Поля, которые балансировщик контролирует сам — остальное наследуем из baseConfig
-const MANAGED_FIELDS = new Set(['remarks', 'dns', 'inbounds', 'outbounds', 'routing', 'burstObservatory']);
-
-function buildGroupConfig(baseConfig, groupName, outbounds) {
-    // Наследуем все верхнеуровневые поля из baseConfig которые мы не перезаписываем:
-    // announce, log, stats и всё остальное что Remnawave может добавить
-    const inherited = {};
-    for (const [key, val] of Object.entries(baseConfig)) {
-        if (!MANAGED_FIELDS.has(key)) {
-            inherited[key] = structuredClone(val);
-        }
-    }
-
-    const cfg = {
-        ...inherited,
-        remarks: groupName,
-        dns: baseConfig.dns ? structuredClone(baseConfig.dns) : {
-            servers: ['1.1.1.1', '1.0.0.1'],
-            queryStrategy: 'UseIP',
-        },
-        inbounds: baseConfig.inbounds ? structuredClone(baseConfig.inbounds) : [
-            {
-                tag: 'socks', port: 10808, listen: '127.0.0.1', protocol: 'socks',
-                settings: { udp: true, auth: 'noauth' },
-                sniffing: { enabled: true, routeOnly: false, destOverride: ['http', 'tls', 'quic'] },
-            },
-            {
-                tag: 'http', port: 10809, listen: '127.0.0.1', protocol: 'http',
-                settings: { allowTransparent: false },
-                sniffing: { enabled: true, routeOnly: false, destOverride: ['http', 'tls', 'quic'] },
-            },
-        ],
-        outbounds: [
-            ...structuredClone(outbounds),
-            { tag: 'direct', protocol: 'freedom' },
-            { tag: 'block', protocol: 'blackhole' },
-        ],
-    };
-
-    const tags = outbounds.map(o => o.tag);
-    const prefix = sanitizeTag(groupName);
-
-    cfg.burstObservatory = {
-        subjectSelector: tags,
-        pingConfig: {
-            destination: PROBE_URL,
-            interval: PROBE_INTERVAL,
-            sampling: 3,
-            timeout: '2s',
-            httpMethod: 'GET',
-        },
-    };
-
-    cfg.routing = {
-        domainStrategy: 'IPIfNonMatch',
-        balancers: [
-            {
-                tag: `${prefix}-balancer`,
-                selector: tags,
-                strategy: {
-                    type: STRATEGY,
-                    settings: {
-                        expected: 1,
-                        baselines: ['1s'],
-                        tolerance: 0.8,
-                    },
-                },
-            },
-        ],
-        rules: [
-            { type: 'field', network: 'udp', port: '443', outboundTag: 'block' },
-            { type: 'field', protocol: ['bittorrent'], outboundTag: 'direct' },
-            {
-                type: 'field',
-                domain: [
-                    'localhost',
-                    'localhost.localdomain',
-                    'local',
-                    '*.local',
-                    '*.localdomain',
-                    '*.lan',
-                    '*.internal',
-                ],
-                outboundTag: 'direct',
-            },
-            {
-                type: 'field',
-                ip: [
-                    '127.0.0.0/8',
-                    '10.0.0.0/8',
-                    '172.16.0.0/12',
-                    '192.168.0.0/16',
-                    '169.254.0.0/16',
-                    '::1/128',
-                    'fc00::/7',
-                    'fe80::/10',
-                ],
-                outboundTag: 'direct',
-            },
-            { type: 'field', network: 'tcp,udp', balancerTag: `${prefix}-balancer` },
-        ],
-    };
-
-    return cfg;
-}
-
 // ─── HTTP сервер ───
 
 // Заголовки запроса которые НЕ пробрасываем на upstream
@@ -520,6 +430,25 @@ function getCachedFallback(token) {
     return null;
 }
 
+async function warmupToken(token) {
+    const targetUrl = SUB_PAGE_URL
+        ? `${SUB_PAGE_URL}/${token}`
+        : `${REMNAWAVE_URL}${REMNAWAVE_SUB_PATH}/${token}`;
+    try {
+        const upstream = await fetchUrl(targetUrl, { 'user-agent': 'Happ/1.0' });
+        if (upstream.status !== 200) return false;
+        const classified = classifyUpstreamPayload(upstream.body);
+        if (classified.type === 'xray_json') {
+            subscriptionCache.set(token, upstream.body, upstream.headers);
+            lastUpstreamSuccessAt = Date.now();
+            return true;
+        }
+        return false;
+    } catch {
+        return false;
+    }
+}
+
 const server = http.createServer(async (req, res) => {
     const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname;
@@ -547,6 +476,7 @@ const server = http.createServer(async (req, res) => {
         const hasRecentUpstream = lastUpstreamSuccessAt > 0 && (Date.now() - lastUpstreamSuccessAt) <= healthyWindowMs;
         const hasCache = subscriptionCache.hasFreshAny();
         const ready = hasRecentUpstream || hasCache;
+        const cb = circuitBreaker.status();
         res.writeHead(ready ? 200 : 503, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
             status: ready ? 'ready' : 'not_ready',
@@ -554,12 +484,13 @@ const server = http.createServer(async (req, res) => {
             has_recent_upstream: hasRecentUpstream,
             has_cache: hasCache,
             cache_ttl_sec: CACHE_TTL_SEC,
+            circuit_open: cb.open,
         }));
         return;
     }
 
     const debugTokenMatch = pathname.match(/^\/debug\/token\/([a-zA-Z0-9_-]+)$/);
-    if (pathname === '/node-stats' || pathname === '/refresh-groups' || pathname === '/refresh-stats' || debugTokenMatch) {
+    if (pathname === '/node-stats' || pathname === '/refresh-groups' || pathname === '/refresh-stats' || pathname === '/debug/stats' || debugTokenMatch) {
         if (!isAdminAuthorized(req, parsedUrl)) {
             res.writeHead(401, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
@@ -584,6 +515,19 @@ const server = http.createServer(async (req, res) => {
         await fetchNodeStats();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'ok', nodes: nodeStatsCache }));
+        return;
+    }
+
+    if (pathname === '/debug/stats') {
+        const cb = circuitBreaker.status();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            status: 'ok',
+            request_id: requestId,
+            profile_mode: PROFILE.name,
+            runtime_stats: runtimeStats,
+            circuit_breaker: cb,
+        }));
         return;
     }
 
@@ -630,7 +574,10 @@ const server = http.createServer(async (req, res) => {
                 cache_max_entries: CACHE_MAX_ENTRIES,
                 rate_limit_per_minute: RATE_LIMIT_PER_MINUTE,
                 rate_limit_burst_10s: RATE_LIMIT_BURST_10S,
+                token_rate_limit_per_minute: TOKEN_RATE_LIMIT_PER_MINUTE,
+                token_rate_limit_burst_10s: TOKEN_RATE_LIMIT_BURST_10S,
             },
+            circuit_breaker: circuitBreaker.status(),
         }));
         return;
     }
@@ -648,10 +595,34 @@ const server = http.createServer(async (req, res) => {
         : `${REMNAWAVE_URL}${REMNAWAVE_SUB_PATH}/${token}`;
 
     const safePath = redactTokenPath(pathname);
+    runtimeStats.requests_total += 1;
     if (!rateLimiter.allow(clientIp)) {
+        runtimeStats.rate_limited_ip_total += 1;
         logger.warn('rate_limited', { request_id: requestId, ip: clientIp, path: safePath });
         res.writeHead(429, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'error', code: 'RATE_LIMITED', request_id: requestId }));
+        return;
+    }
+    if (!tokenRateLimiter.allow(token)) {
+        runtimeStats.rate_limited_token_total += 1;
+        logger.warn('token_rate_limited', { request_id: requestId, path: safePath });
+        res.writeHead(429, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'error', code: 'TOKEN_RATE_LIMITED', request_id: requestId }));
+        return;
+    }
+    if (!circuitBreaker.allowRequest()) {
+        runtimeStats.circuit_open_total += 1;
+        const fallback = getCachedFallback(token);
+        if (fallback) {
+            runtimeStats.cache_fallback_total += 1;
+            if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
+            logger.warn('cache_fallback_circuit_open', { request_id: requestId, cache_kind: fallback.kind });
+            res.writeHead(200, forwardResponseHeaders(fallback.item.headers, 'application/json; charset=utf-8'));
+            res.end(fallback.item.body);
+            return;
+        }
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'error', code: 'UPSTREAM_CIRCUIT_OPEN', request_id: requestId }));
         return;
     }
     logger.info('request_start', { request_id: requestId, method: req.method, path: safePath, ip: clientIp });
@@ -694,8 +665,11 @@ const server = http.createServer(async (req, res) => {
         });
 
         if (upstream.status !== 200) {
+            circuitBreaker.recordFailure();
             const fallback = getCachedFallback(token);
             if (fallback) {
+                runtimeStats.cache_fallback_total += 1;
+                if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
                 logger.warn('cache_fallback_by_status', { request_id: requestId, status: upstream.status, cache_kind: fallback.kind });
                 res.writeHead(200, forwardResponseHeaders(fallback.item.headers, 'application/json; charset=utf-8'));
                 res.end(fallback.item.body);
@@ -708,6 +682,8 @@ const server = http.createServer(async (req, res) => {
 
         const classified = classifyUpstreamPayload(upstream.body);
         if (classified.type === 'non_json') {
+            runtimeStats.upstream_non_json_total += 1;
+            circuitBreaker.recordSuccess();
             logger.info('upstream_non_json_passthrough', { request_id: requestId });
             res.writeHead(200, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'text/plain'));
             res.end(upstream.body);
@@ -728,6 +704,8 @@ const server = http.createServer(async (req, res) => {
         // (лимит устройств, истекла подписка и т.д.) вместо реальных серверов.
         // Признак: все прокси-outbound'ы имеют адрес 0.0.0.0 и порт 1.
         if (classified.type === 'fake_config') {
+            runtimeStats.fake_config_passthrough_total += 1;
+            circuitBreaker.recordSuccess();
             logger.info('fake_config_passthrough', { request_id: requestId });
             res.writeHead(200, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'application/json; charset=utf-8'));
             res.end(upstream.body);
@@ -806,7 +784,11 @@ const server = http.createServer(async (req, res) => {
             : allOutbounds;
 
         if (fastestEnabled && fastestOutbounds.length > 1) {
-            const fastestConfig = buildGroupConfig(baseConfig, '🏁 🇪🇺 Самые быстрые', fastestOutbounds);
+            const fastestConfig = buildGroupConfig(baseConfig, '🏁 🇪🇺 Самые быстрые', fastestOutbounds, {
+                probeUrl: PROBE_URL,
+                probeInterval: PROBE_INTERVAL,
+                strategy: STRATEGY,
+            });
             resultConfigs.push(fastestConfig);
             logger.info('group_fastest', { request_id: requestId, count: fastestOutbounds.length, excluded_groups: FASTEST_EXCLUDE_GROUPS });
         }
@@ -814,7 +796,11 @@ const server = http.createServer(async (req, res) => {
         // Группы по странам
         for (const [groupName, outbounds] of Object.entries(grouped)) {
             if (outbounds.length === 0) continue;
-            const groupConfig = buildGroupConfig(baseConfig, groupName, outbounds);
+            const groupConfig = buildGroupConfig(baseConfig, groupName, outbounds, {
+                probeUrl: PROBE_URL,
+                probeInterval: PROBE_INTERVAL,
+                strategy: STRATEGY,
+            });
             resultConfigs.push(groupConfig);
 
             // Логируем порядок серверов если есть стата
@@ -832,6 +818,7 @@ const server = http.createServer(async (req, res) => {
         logger.info('response_built', { request_id: requestId, groups: resultConfigs.length, servers: allOutbounds.length });
 
         const responseBody = JSON.stringify(resultConfigs, null, 2);
+        circuitBreaker.recordSuccess();
         lastUpstreamSuccessAt = Date.now();
         subscriptionCache.set(token, responseBody, upstream.headers);
 
@@ -841,9 +828,13 @@ const server = http.createServer(async (req, res) => {
         res.end(responseBody);
 
     } catch (err) {
+        runtimeStats.request_failures += 1;
+        circuitBreaker.recordFailure();
         logger.error('request_failed', { request_id: requestId, message: err.message });
         const fallback = getCachedFallback(token);
         if (fallback) {
+            runtimeStats.cache_fallback_total += 1;
+            if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
             logger.warn('cache_fallback_by_error', { request_id: requestId, cache_kind: fallback.kind });
             res.writeHead(200, forwardResponseHeaders(fallback.item.headers, 'application/json; charset=utf-8'));
             res.end(fallback.item.body);
@@ -883,6 +874,14 @@ async function start() {
         setInterval(() => fetchNodeStats(), NODE_STATS_INTERVAL);
     }
 
+    if (WARMUP_TOKENS.length > 0) {
+        let warmed = 0;
+        for (const token of WARMUP_TOKENS) {
+            if (await warmupToken(token)) warmed += 1;
+        }
+        console.log(`🔥 Warmup: ${warmed}/${WARMUP_TOKENS.length} токенов`);
+    }
+
     const fastestEnabled = config.fastest_group !== false;
 
     server.listen(PORT, () => {
@@ -895,6 +894,9 @@ async function start() {
         console.log(`📊 Node stats: ${NODE_STATS_ENABLED ? `✅ (каждые ${NODE_STATS_INTERVAL/1000}с, макс ${MAX_USERS_PER_GB} u/GB, ${MAX_USERS_PER_CPU} u/CPU)` : '❌'}`);
         console.log(`🗃️ Cache: ttl=${CACHE_TTL_SEC}s stale-if-error=${CACHE_STALE_IF_ERROR_SEC}s max_entries=${CACHE_MAX_ENTRIES}`);
         console.log(`🚦 Rate limit: ${RATE_LIMIT_PER_MINUTE}/min, burst=${RATE_LIMIT_BURST_10S}/10s`);
+        console.log(`🎟️ Token rate limit: ${TOKEN_RATE_LIMIT_PER_MINUTE}/min, burst=${TOKEN_RATE_LIMIT_BURST_10S}/10s`);
+        console.log(`⏱️ Upstream: timeout=${REQUEST_TIMEOUT_MS}ms redirects=${MAX_REDIRECTS}`);
+        console.log(`🧱 Circuit breaker: fails=${CIRCUIT_BREAKER_FAILURES} open=${CIRCUIT_BREAKER_OPEN_SEC}s`);
         console.log(`🛡️ Admin routes: ${ADMIN_TOKEN ? '🔒 enabled' : '⚠️ disabled (set ADMIN_TOKEN)'}`);
         console.log(`🔐 Panel cookie: ${PANEL_AUTH_COOKIE ? '✅' : '❌ (не нужен)'}`);
         console.log(`📡 Sub page: ${SUB_PAGE_URL || 'не задан'}`);

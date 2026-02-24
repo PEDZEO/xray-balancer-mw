@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "xray-balancer-mw config",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "sub_path": { "type": "string", "pattern": "^/" },
+    "strategy": { "type": "string", "enum": ["leastLoad", "random", "roundRobin"] },
+    "profile_mode": { "type": "string", "enum": ["balanced", "stable", "aggressive", "debug"] },
+    "probe_interval": { "type": "string" },
+    "probe_url": { "type": "string", "pattern": "^https?://" },
+    "fastest_group": { "type": "boolean" },
+    "fastest_exclude_groups": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "auto_groups": { "type": "boolean" },
+    "auto_groups_interval_sec": { "type": "integer", "minimum": 1 },
+    "node_stats": { "type": "boolean" },
+    "node_stats_interval_sec": { "type": "integer", "minimum": 1 },
+    "max_users_per_gb": { "type": "integer", "minimum": 1 },
+    "max_users_per_cpu": { "type": "integer", "minimum": 1 },
+    "cache_ttl_sec": { "type": "integer", "minimum": 1 },
+    "cache_stale_if_error_sec": { "type": "integer", "minimum": 1 },
+    "cache_max_entries": { "type": "integer", "minimum": 1 },
+    "rate_limit_per_minute": { "type": "integer", "minimum": 1 },
+    "rate_limit_burst_10s": { "type": "integer", "minimum": 1 },
+    "token_rate_limit_per_minute": { "type": "integer", "minimum": 1 },
+    "token_rate_limit_burst_10s": { "type": "integer", "minimum": 1 },
+    "ready_success_window_sec": { "type": "integer", "minimum": 1 },
+    "request_timeout_ms": { "type": "integer", "minimum": 1 },
+    "max_redirects": { "type": "integer", "minimum": 1 },
+    "circuit_breaker_failures": { "type": "integer", "minimum": 1 },
+    "circuit_breaker_open_sec": { "type": "integer", "minimum": 1 },
+    "admin_token": { "type": "string", "minLength": 8 },
+    "warmup_tokens": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" }
+    },
+    "groups": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "type": "string", "minLength": 1 },
+        "minItems": 1
+      }
+    }
+  }
+}

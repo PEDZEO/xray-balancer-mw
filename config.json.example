@@ -21,8 +21,15 @@
     "cache_max_entries": 1000,
     "rate_limit_per_minute": 120,
     "rate_limit_burst_10s": 30,
+    "token_rate_limit_per_minute": 240,
+    "token_rate_limit_burst_10s": 60,
     "ready_success_window_sec": 300,
+    "request_timeout_ms": 10000,
+    "max_redirects": 3,
+    "circuit_breaker_failures": 6,
+    "circuit_breaker_open_sec": 30,
     "admin_token": "",
+    "warmup_tokens": [],
 
     "groups": {
         "🇫🇮 Finland": ["Finland"],
