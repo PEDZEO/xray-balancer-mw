@@ -31,8 +31,12 @@ test('validateConfig rejects malformed groups', () => {
 
 test('validateConfig accepts runtime and fastest-exclude options', () => {
     const cfg = {
+        profile_mode: 'stable',
+        admin_token: 'supersecret',
         fastest_exclude_groups: ['🇷🇺 White List'],
         cache_ttl_sec: 300,
+        cache_stale_if_error_sec: 1800,
+        cache_max_entries: 1000,
         rate_limit_per_minute: 120,
         rate_limit_burst_10s: 30,
         ready_success_window_sec: 300,

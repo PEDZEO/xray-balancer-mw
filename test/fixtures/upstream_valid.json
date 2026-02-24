@@ -1,0 +1,16 @@
+[
+  {
+    "remarks": "valid",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "tag": "Germany-1",
+        "settings": {
+          "vnext": [
+            { "address": "node.example.com", "port": 443 }
+          ]
+        }
+      }
+    ]
+  }
+]

@@ -3,10 +3,12 @@
     "sub_path": "/api/sub",
 
     "strategy": "leastLoad",
+    "profile_mode": "balanced",
     "probe_interval": "3m",
     "probe_url": "https://www.gstatic.com/generate_204",
 
     "fastest_group": true,
+    "fastest_exclude_groups": [],
     "auto_groups": false,
     "auto_groups_interval_sec": 300,
 
@@ -14,6 +16,13 @@
     "node_stats_interval_sec": 120,
     "max_users_per_gb": 20,
     "max_users_per_cpu": 40,
+    "cache_ttl_sec": 300,
+    "cache_stale_if_error_sec": 1800,
+    "cache_max_entries": 1000,
+    "rate_limit_per_minute": 120,
+    "rate_limit_burst_10s": 30,
+    "ready_success_window_sec": 300,
+    "admin_token": "",
 
     "groups": {
         "🇫🇮 Finland": ["Finland"],

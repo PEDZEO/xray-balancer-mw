@@ -8,11 +8,12 @@ const { redactTokenPath, sanitizeClientMetadata } = require('./lib/security');
 const {
     filterAndSortByLoad,
     getNodeStats,
-    isFakeConfig,
     matchGroup,
 } = require('./lib/balancing');
 const { createRateLimiter, createTokenCache } = require('./lib/runtime');
 const { buildLogger } = require('./lib/log');
+const { resolveProfile } = require('./lib/profile');
+const { classifyUpstreamPayload } = require('./lib/upstream-contract');
 
 // ─── Загрузка конфига ───
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
@@ -45,17 +46,29 @@ const AUTO_GROUPS_INTERVAL = (config.auto_groups_interval_sec || 300) * 1000;
 const STRATEGY = config.strategy || 'leastLoad';
 const PROBE_INTERVAL = config.probe_interval || '3m';
 const PROBE_URL = config.probe_url || 'https://www.gstatic.com/generate_204';
+const PROFILE_MODE = process.env.PROFILE_MODE || config.profile_mode || 'balanced';
+const PROFILE = resolveProfile(PROFILE_MODE);
+
+function pickRuntimeInt(envKey, configKey) {
+    const envVal = parseInt(process.env[envKey], 10);
+    if (Number.isInteger(envVal) && envVal > 0) return envVal;
+    if (Number.isInteger(config[configKey]) && config[configKey] > 0) return config[configKey];
+    return PROFILE.values[configKey];
+}
 
 // Node stats — опрос нагрузки нод из API панели
 const NODE_STATS_ENABLED = process.env.NODE_STATS === 'true' || config.node_stats === true;
 const NODE_STATS_INTERVAL = (parseInt(process.env.NODE_STATS_INTERVAL_SEC, 10) || config.node_stats_interval_sec || 120) * 1000;
 const MAX_USERS_PER_GB = parseInt(process.env.MAX_USERS_PER_GB, 10) || config.max_users_per_gb || 20;
 const MAX_USERS_PER_CPU = parseInt(process.env.MAX_USERS_PER_CPU, 10) || config.max_users_per_cpu || 40;
-const CACHE_TTL_SEC = parseInt(process.env.CACHE_TTL_SEC, 10) || config.cache_ttl_sec || 300;
-const RATE_LIMIT_PER_MINUTE = parseInt(process.env.RATE_LIMIT_PER_MINUTE, 10) || config.rate_limit_per_minute || 120;
-const RATE_LIMIT_BURST_10S = parseInt(process.env.RATE_LIMIT_BURST_10S, 10) || config.rate_limit_burst_10s || 30;
-const READY_SUCCESS_WINDOW_SEC = parseInt(process.env.READY_SUCCESS_WINDOW_SEC, 10) || config.ready_success_window_sec || 300;
+const CACHE_TTL_SEC = pickRuntimeInt('CACHE_TTL_SEC', 'cache_ttl_sec');
+const CACHE_STALE_IF_ERROR_SEC = pickRuntimeInt('CACHE_STALE_IF_ERROR_SEC', 'cache_stale_if_error_sec');
+const CACHE_MAX_ENTRIES = pickRuntimeInt('CACHE_MAX_ENTRIES', 'cache_max_entries');
+const RATE_LIMIT_PER_MINUTE = pickRuntimeInt('RATE_LIMIT_PER_MINUTE', 'rate_limit_per_minute');
+const RATE_LIMIT_BURST_10S = pickRuntimeInt('RATE_LIMIT_BURST_10S', 'rate_limit_burst_10s');
+const READY_SUCCESS_WINDOW_SEC = pickRuntimeInt('READY_SUCCESS_WINDOW_SEC', 'ready_success_window_sec');
 const FASTEST_EXCLUDE_GROUPS = Array.isArray(config.fastest_exclude_groups) ? config.fastest_exclude_groups : [];
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || config.admin_token || '';
 
 const MAX_RESPONSE_SIZE = 10 * 1024 * 1024;
 
@@ -78,7 +91,7 @@ function panelHeaders() {
 // Кэш статистики нод: { "Finland2": { usersOnline: 9, totalRamGb: 2.06, cpuCount: 1, ramLoad: 4.37, cpuLoad: 9, load: 0.23 }, ... }
 let nodeStatsCache = {};
 let lastUpstreamSuccessAt = 0;
-const subscriptionCache = createTokenCache(CACHE_TTL_SEC);
+const subscriptionCache = createTokenCache(CACHE_TTL_SEC, CACHE_MAX_ENTRIES);
 const rateLimiter = createRateLimiter(RATE_LIMIT_PER_MINUTE, RATE_LIMIT_BURST_10S);
 const logger = buildLogger();
 
@@ -123,6 +136,21 @@ function fetchUrl(targetUrl, headers = {}, maxRedirects = 3) {
 
 function sanitizeTag(name) {
     return name.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_');
+}
+
+function timingSafeEqualString(a, b) {
+    const ba = Buffer.from(a || '');
+    const bb = Buffer.from(b || '');
+    if (ba.length !== bb.length) return false;
+    return crypto.timingSafeEqual(ba, bb);
+}
+
+function isAdminAuthorized(req, parsedUrl) {
+    if (!ADMIN_TOKEN) return false;
+    const headerToken = (req.headers['x-admin-token'] || '').toString();
+    const queryToken = parsedUrl.searchParams.get('admin_token') || '';
+    const candidate = headerToken || queryToken;
+    return timingSafeEqualString(candidate, ADMIN_TOKEN);
 }
 
 // ─── Парсинг RAM ───
@@ -484,6 +512,14 @@ function forwardResponseHeaders(upstreamHeaders, contentType) {
     return result;
 }
 
+function getCachedFallback(token) {
+    const fresh = subscriptionCache.get(token);
+    if (fresh) return { kind: 'fresh', item: fresh };
+    const stale = subscriptionCache.getStale(token, CACHE_STALE_IF_ERROR_SEC);
+    if (stale) return { kind: 'stale', item: stale };
+    return null;
+}
+
 const server = http.createServer(async (req, res) => {
     const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname;
@@ -522,6 +558,15 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    const debugTokenMatch = pathname.match(/^\/debug\/token\/([a-zA-Z0-9_-]+)$/);
+    if (pathname === '/node-stats' || pathname === '/refresh-groups' || pathname === '/refresh-stats' || debugTokenMatch) {
+        if (!isAdminAuthorized(req, parsedUrl)) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+            return;
+        }
+    }
+
     if (pathname === '/node-stats') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(nodeStatsCache, null, 2));
@@ -539,6 +584,54 @@ const server = http.createServer(async (req, res) => {
         await fetchNodeStats();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'ok', nodes: nodeStatsCache }));
+        return;
+    }
+
+    if (debugTokenMatch) {
+        const debugToken = debugTokenMatch[1];
+        const debugTarget = SUB_PAGE_URL
+            ? `${SUB_PAGE_URL}/${debugToken}`
+            : `${REMNAWAVE_URL}${REMNAWAVE_SUB_PATH}/${debugToken}`;
+        const fallback = getCachedFallback(debugToken);
+        let upstreamType = 'unavailable';
+        let upstreamBytes = 0;
+        let upstreamStatus = null;
+        let upstreamError = null;
+
+        try {
+            const upstream = await fetchUrl(debugTarget, {});
+            upstreamStatus = upstream.status;
+            upstreamBytes = upstream.body.length;
+            const classified = classifyUpstreamPayload(upstream.body);
+            upstreamType = classified.type;
+        } catch (err) {
+            upstreamError = err.message;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            status: 'ok',
+            request_id: requestId,
+            token: redactTokenPath(`/${debugToken}`).slice(1),
+            profile_mode: PROFILE.name,
+            upstream: {
+                status: upstreamStatus,
+                bytes: upstreamBytes,
+                type: upstreamType,
+                error: upstreamError,
+            },
+            cache: {
+                has_fallback: Boolean(fallback),
+                fallback_kind: fallback ? fallback.kind : null,
+            },
+            settings: {
+                cache_ttl_sec: CACHE_TTL_SEC,
+                cache_stale_if_error_sec: CACHE_STALE_IF_ERROR_SEC,
+                cache_max_entries: CACHE_MAX_ENTRIES,
+                rate_limit_per_minute: RATE_LIMIT_PER_MINUTE,
+                rate_limit_burst_10s: RATE_LIMIT_BURST_10S,
+            },
+        }));
         return;
     }
 
@@ -601,11 +694,11 @@ const server = http.createServer(async (req, res) => {
         });
 
         if (upstream.status !== 200) {
-            const cached = subscriptionCache.get(token);
-            if (cached) {
-                logger.warn('cache_fallback_by_status', { request_id: requestId, status: upstream.status });
-                res.writeHead(200, forwardResponseHeaders(cached.headers, 'application/json; charset=utf-8'));
-                res.end(cached.body);
+            const fallback = getCachedFallback(token);
+            if (fallback) {
+                logger.warn('cache_fallback_by_status', { request_id: requestId, status: upstream.status, cache_kind: fallback.kind });
+                res.writeHead(200, forwardResponseHeaders(fallback.item.headers, 'application/json; charset=utf-8'));
+                res.end(fallback.item.body);
                 return;
             }
             res.writeHead(upstream.status, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'text/plain'));
@@ -613,17 +706,15 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
-        let parsed;
-        try {
-            parsed = JSON.parse(upstream.body);
-        } catch (e) {
+        const classified = classifyUpstreamPayload(upstream.body);
+        if (classified.type === 'non_json') {
             logger.info('upstream_non_json_passthrough', { request_id: requestId });
             res.writeHead(200, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'text/plain'));
             res.end(upstream.body);
             return;
         }
 
-        let configArray = Array.isArray(parsed) ? parsed : [parsed];
+        let configArray = classified.parsed;
 
         if (configArray.length === 0) {
             res.writeHead(200, forwardResponseHeaders(upstream.headers, 'application/json; charset=utf-8'));
@@ -636,7 +727,7 @@ const server = http.createServer(async (req, res) => {
         // Детектируем фейковые конфиги — когда Remnawave возвращает сообщение об ошибке
         // (лимит устройств, истекла подписка и т.д.) вместо реальных серверов.
         // Признак: все прокси-outbound'ы имеют адрес 0.0.0.0 и порт 1.
-        if (isFakeConfig(configArray)) {
+        if (classified.type === 'fake_config') {
             logger.info('fake_config_passthrough', { request_id: requestId });
             res.writeHead(200, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'application/json; charset=utf-8'));
             res.end(upstream.body);
@@ -751,11 +842,11 @@ const server = http.createServer(async (req, res) => {
 
     } catch (err) {
         logger.error('request_failed', { request_id: requestId, message: err.message });
-        const cached = subscriptionCache.get(token);
-        if (cached) {
-            logger.warn('cache_fallback_by_error', { request_id: requestId });
-            res.writeHead(200, forwardResponseHeaders(cached.headers, 'application/json; charset=utf-8'));
-            res.end(cached.body);
+        const fallback = getCachedFallback(token);
+        if (fallback) {
+            logger.warn('cache_fallback_by_error', { request_id: requestId, cache_kind: fallback.kind });
+            res.writeHead(200, forwardResponseHeaders(fallback.item.headers, 'application/json; charset=utf-8'));
+            res.end(fallback.item.body);
             return;
         }
         if (!res.headersSent) {
@@ -799,8 +890,12 @@ async function start() {
         console.log(`📋 Группы: ${Object.entries(GROUPS).map(([k, v]) => `${k} [${v.join(',')}]`).join(' | ')}`);
         console.log(`🏁 Самые быстрые: ${fastestEnabled ? '✅' : '❌'}`);
         console.log(`🎯 Стратегия: ${STRATEGY} (expected=1, baselines=1s, tolerance=0.8)`);
+        console.log(`🧭 Profile: ${PROFILE.name}`);
         console.log(`📡 Probe: ${PROBE_URL} каждые ${PROBE_INTERVAL}`);
         console.log(`📊 Node stats: ${NODE_STATS_ENABLED ? `✅ (каждые ${NODE_STATS_INTERVAL/1000}с, макс ${MAX_USERS_PER_GB} u/GB, ${MAX_USERS_PER_CPU} u/CPU)` : '❌'}`);
+        console.log(`🗃️ Cache: ttl=${CACHE_TTL_SEC}s stale-if-error=${CACHE_STALE_IF_ERROR_SEC}s max_entries=${CACHE_MAX_ENTRIES}`);
+        console.log(`🚦 Rate limit: ${RATE_LIMIT_PER_MINUTE}/min, burst=${RATE_LIMIT_BURST_10S}/10s`);
+        console.log(`🛡️ Admin routes: ${ADMIN_TOKEN ? '🔒 enabled' : '⚠️ disabled (set ADMIN_TOKEN)'}`);
         console.log(`🔐 Panel cookie: ${PANEL_AUTH_COOKIE ? '✅' : '❌ (не нужен)'}`);
         console.log(`📡 Sub page: ${SUB_PAGE_URL || 'не задан'}`);
         console.log(`🔀 Форвард: все заголовки клиента → upstream, все заголовки upstream → клиент`);
