@@ -39,8 +39,23 @@ test('validateConfig accepts runtime and fastest-exclude options', () => {
         cache_max_entries: 1000,
         rate_limit_per_minute: 120,
         rate_limit_burst_10s: 30,
+        token_limiter_max_entries: 5000,
+        token_limiter_cleanup_batch: 200,
         ready_success_window_sec: 300,
     };
 
     assert.deepEqual(validateConfig(cfg), cfg);
+});
+
+test('validateConfig rejects too many groups and overly long patterns', () => {
+    const groups = {};
+    for (let i = 0; i < 101; i += 1) {
+        groups[`G${i}`] = ['ok'];
+    }
+    assert.throws(() => validateConfig({ groups }), /at most 100 groups/);
+
+    assert.throws(
+        () => validateConfig({ groups: { main: ['x'.repeat(129)] } }),
+        /longer than 128 chars/,
+    );
 });

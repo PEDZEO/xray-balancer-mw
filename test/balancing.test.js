@@ -23,6 +23,15 @@ test('matchGroup treats short patterns as whole words only', () => {
     assert.equal(matchGroup(groups, 'Node NL #1'), '🇳🇱 Netherlands');
 });
 
+test('matchGroup escapes regex metacharacters in short patterns', () => {
+    const groups = {
+        Weird: ['+'],
+    };
+
+    assert.equal(matchGroup(groups, 'node + tag'), 'Weird');
+    assert.equal(matchGroup(groups, 'node tag'), null);
+});
+
 test('isFakeConfig detects fake outbounds with 0.0.0.0:1', () => {
     const fake = [{
         outbounds: [

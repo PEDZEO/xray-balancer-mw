@@ -103,6 +103,9 @@ function panelHeaders() {
 // Кэш статистики нод: { "Finland2": { usersOnline: 9, totalRamGb: 2.06, cpuCount: 1, ramLoad: 4.37, cpuLoad: 9, load: 0.23 }, ... }
 let nodeStatsCache = {};
 let lastUpstreamSuccessAt = 0;
+let lastUpstreamError = null;
+let lastNodeStatsRefreshAt = 0;
+let lastNodeStatsError = null;
 const subscriptionCache = createTokenCache(CACHE_TTL_SEC, CACHE_MAX_ENTRIES);
 const rateLimiter = createRateLimiter(RATE_LIMIT_PER_MINUTE, RATE_LIMIT_BURST_10S);
 const tokenRateLimiter = createKeyedRateLimiter(TOKEN_RATE_LIMIT_PER_MINUTE, TOKEN_RATE_LIMIT_BURST_10S, {
@@ -234,12 +237,16 @@ function parseRamGb(ramStr) {
 // ─── Node Stats — опрос панели ───
 
 async function fetchNodeStats() {
-    if (!API_TOKEN || !REMNAWAVE_URL) return { ok: false, error: 'API token or REMNAWAVE_URL is missing' };
+    if (!API_TOKEN || !REMNAWAVE_URL) {
+        lastNodeStatsError = 'API token or REMNAWAVE_URL is missing';
+        return { ok: false, error: lastNodeStatsError };
+    }
     try {
         const response = await fetchUrl(`${REMNAWAVE_URL}/api/nodes/`, panelHeaders());
         if (response.status !== 200) {
             console.error('[node-stats] API вернул', response.status);
-            return { ok: false, error: `Panel API returned ${response.status}` };
+            lastNodeStatsError = `Panel API returned ${response.status}`;
+            return { ok: false, error: lastNodeStatsError };
         }
         const data = JSON.parse(response.body);
         const nodes = data.response || (Array.isArray(data) ? data : []);
@@ -300,11 +307,14 @@ async function fetchNodeStats() {
             console.log(`  ${name}: ${s.usersOnline}u, ${s.totalRamGb}GB/${s.cpuCount}CPU, ram=${s.ramLoad} cpu=${s.cpuLoad} load=${s.load}`);
         }
         if (sorted.length > 5) console.log(`  ... и ещё ${sorted.length - 5}`);
+        lastNodeStatsRefreshAt = Date.now();
+        lastNodeStatsError = null;
         return { ok: true, nodes: sorted.length };
 
     } catch (err) {
         console.error('[node-stats] Ошибка:', err.message);
-        return { ok: false, error: err.message };
+        lastNodeStatsError = err.message;
+        return { ok: false, error: lastNodeStatsError };
     }
 }
 
@@ -496,6 +506,10 @@ function getCachedFallback(token) {
     return null;
 }
 
+function toIsoTimestamp(ms) {
+    return ms > 0 ? new Date(ms).toISOString() : null;
+}
+
 async function warmupToken(token) {
     const targetUrl = SUB_PAGE_URL
         ? `${SUB_PAGE_URL}/${token}`
@@ -623,11 +637,29 @@ const server = http.createServer(async (req, res) => {
             has_cache: hasCache,
             cache_ttl_sec: CACHE_TTL_SEC,
             circuit_open: cb.open,
+            last_upstream_success_at: toIsoTimestamp(lastUpstreamSuccessAt),
+            last_upstream_error: lastUpstreamError,
+            last_node_stats_refresh_at: toIsoTimestamp(lastNodeStatsRefreshAt),
+            last_node_stats_error: lastNodeStatsError,
+            token_limiter_size: tokenRateLimiter.size(),
         }));
         return;
     }
 
     const debugTokenMatch = pathname.match(/^\/debug\/token\/([a-zA-Z0-9_-]+)$/);
+    const adminDebugTokenMatch = pathname.match(/^\/admin\/debug\/token\/([a-zA-Z0-9_-]+)$/);
+    const debugTokenValue = debugTokenMatch?.[1] || adminDebugTokenMatch?.[1] || null;
+
+    if (pathname === '/admin/node-stats') {
+        if (!isAdminAuthorized(req)) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(nodeStatsCache, null, 2));
+        return;
+    }
 
     if (pathname === '/node-stats' && isAdminAuthorized(req)) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -635,7 +667,17 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (pathname === '/refresh-groups' && API_TOKEN && isAdminAuthorized(req)) {
+    if (pathname === '/admin/refresh-groups' || (pathname === '/refresh-groups' && isAdminAuthorized(req))) {
+        if (!isAdminAuthorized(req)) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+            return;
+        }
+        if (!API_TOKEN) {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'REFRESH_GROUPS_FAILED', request_id: requestId, message: 'API token is missing' }));
+            return;
+        }
         const refreshed = await refreshGroups();
         if (!refreshed.ok) {
             res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -647,7 +689,17 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (pathname === '/refresh-stats' && API_TOKEN && isAdminAuthorized(req)) {
+    if (pathname === '/admin/refresh-stats' || (pathname === '/refresh-stats' && isAdminAuthorized(req))) {
+        if (!isAdminAuthorized(req)) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+            return;
+        }
+        if (!API_TOKEN) {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'REFRESH_STATS_FAILED', request_id: requestId, message: 'API token is missing' }));
+            return;
+        }
         const refreshed = await fetchNodeStats();
         if (!refreshed.ok) {
             res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -659,7 +711,12 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (pathname === '/debug/stats' && isAdminAuthorized(req)) {
+    if (pathname === '/admin/debug/stats' || (pathname === '/debug/stats' && isAdminAuthorized(req))) {
+        if (!isAdminAuthorized(req)) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+            return;
+        }
         const cb = circuitBreaker.status();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -672,8 +729,13 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (debugTokenMatch && isAdminAuthorized(req)) {
-        const debugToken = debugTokenMatch[1];
+    if (debugTokenValue) {
+        if (!isAdminAuthorized(req)) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+            return;
+        }
+        const debugToken = debugTokenValue;
         const debugTarget = SUB_PAGE_URL
             ? `${SUB_PAGE_URL}/${debugToken}`
             : `${REMNAWAVE_URL}${REMNAWAVE_SUB_PATH}/${debugToken}`;
@@ -801,6 +863,7 @@ const server = http.createServer(async (req, res) => {
         });
 
         if (upstream.status !== 200) {
+            lastUpstreamError = `upstream_status_${upstream.status}`;
             circuitBreaker.recordFailure();
             const fallback = getCachedFallback(token);
             if (fallback) {
@@ -821,6 +884,7 @@ const server = http.createServer(async (req, res) => {
             runtimeStats.upstream_non_json_total += 1;
             circuitBreaker.recordSuccess();
             lastUpstreamSuccessAt = Date.now();
+            lastUpstreamError = null;
             logger.info('upstream_non_json_passthrough', { request_id: requestId });
             res.writeHead(200, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'text/plain'));
             res.end(upstream.body);
@@ -831,6 +895,7 @@ const server = http.createServer(async (req, res) => {
 
         if (configArray.length === 0) {
             lastUpstreamSuccessAt = Date.now();
+            lastUpstreamError = null;
             res.writeHead(200, forwardResponseHeaders(upstream.headers, 'application/json; charset=utf-8'));
             res.end(upstream.body);
             return;
@@ -845,6 +910,7 @@ const server = http.createServer(async (req, res) => {
             runtimeStats.fake_config_passthrough_total += 1;
             circuitBreaker.recordSuccess();
             lastUpstreamSuccessAt = Date.now();
+            lastUpstreamError = null;
             logger.info('fake_config_passthrough', { request_id: requestId });
             res.writeHead(200, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'application/json; charset=utf-8'));
             res.end(upstream.body);
@@ -960,6 +1026,7 @@ const server = http.createServer(async (req, res) => {
         const responseBody = JSON.stringify(resultConfigs, null, 2);
         circuitBreaker.recordSuccess();
         lastUpstreamSuccessAt = Date.now();
+        lastUpstreamError = null;
         subscriptionCache.set(token, responseBody, upstream.headers);
 
         const responseHeaders = forwardResponseHeaders(upstream.headers, 'application/json; charset=utf-8');
@@ -969,6 +1036,7 @@ const server = http.createServer(async (req, res) => {
 
     } catch (err) {
         runtimeStats.request_failures += 1;
+        lastUpstreamError = err.message;
         circuitBreaker.recordFailure();
         logger.error('request_failed', { request_id: requestId, message: err.message });
         const fallback = getCachedFallback(token);
