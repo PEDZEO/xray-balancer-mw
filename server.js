@@ -75,7 +75,7 @@ const REQUEST_TIMEOUT_MS = pickRuntimeInt('REQUEST_TIMEOUT_MS', 'request_timeout
 const MAX_REDIRECTS = pickRuntimeInt('MAX_REDIRECTS', 'max_redirects');
 const CIRCUIT_BREAKER_FAILURES = pickRuntimeInt('CIRCUIT_BREAKER_FAILURES', 'circuit_breaker_failures');
 const CIRCUIT_BREAKER_OPEN_SEC = pickRuntimeInt('CIRCUIT_BREAKER_OPEN_SEC', 'circuit_breaker_open_sec');
-const FASTEST_EXCLUDE_GROUPS = Array.isArray(config.fastest_exclude_groups) ? config.fastest_exclude_groups : [];
+let FASTEST_EXCLUDE_GROUPS = Array.isArray(config.fastest_exclude_groups) ? config.fastest_exclude_groups : [];
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || config.admin_token || '';
 const WARMUP_TOKENS = Array.isArray(config.warmup_tokens) ? config.warmup_tokens : [];
 
@@ -176,6 +176,40 @@ function isAdminAuthorized(req, parsedUrl) {
     const queryToken = parsedUrl.searchParams.get('admin_token') || '';
     const candidate = headerToken || queryToken;
     return timingSafeEqualString(candidate, ADMIN_TOKEN);
+}
+
+function writeConfigFile(nextConfig) {
+    const tempPath = `${CONFIG_PATH}.tmp`;
+    fs.writeFileSync(tempPath, JSON.stringify(nextConfig, null, 2));
+    fs.renameSync(tempPath, CONFIG_PATH);
+}
+
+function readJsonBody(req, maxBytes = 512 * 1024) {
+    return new Promise((resolve, reject) => {
+        let raw = '';
+        let size = 0;
+        req.on('data', (chunk) => {
+            size += chunk.length;
+            if (size > maxBytes) {
+                reject(new Error('Payload too large'));
+                req.destroy();
+                return;
+            }
+            raw += chunk;
+        });
+        req.on('end', () => {
+            if (!raw.trim()) {
+                resolve({});
+                return;
+            }
+            try {
+                resolve(JSON.parse(raw));
+            } catch (err) {
+                reject(new Error('Invalid JSON body'));
+            }
+        });
+        req.on('error', reject);
+    });
 }
 
 // ─── Парсинг RAM ───
@@ -476,6 +510,73 @@ const server = http.createServer(async (req, res) => {
             sub_page: SUB_PAGE_URL || 'disabled',
         }));
         return;
+    }
+
+    if (pathname === '/admin/groups') {
+        if (!isAdminAuthorized(req, parsedUrl)) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+            return;
+        }
+
+        if (req.method === 'GET') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                status: 'ok',
+                request_id: requestId,
+                groups: GROUPS,
+                fastest_group: config.fastest_group !== false,
+                fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
+            }));
+            return;
+        }
+
+        if (req.method !== 'PUT') {
+            res.writeHead(405, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'METHOD_NOT_ALLOWED', request_id: requestId }));
+            return;
+        }
+
+        try {
+            const payload = await readJsonBody(req);
+            const incomingGroups = payload.groups;
+            const incomingExclude = payload.fastest_exclude_groups;
+            const incomingFastest = payload.fastest_group;
+
+            const nextConfig = { ...config };
+            if (incomingGroups !== undefined) nextConfig.groups = incomingGroups;
+            if (incomingExclude !== undefined) nextConfig.fastest_exclude_groups = incomingExclude;
+            if (incomingFastest !== undefined) nextConfig.fastest_group = incomingFastest;
+
+            validateConfig(nextConfig);
+            config = nextConfig;
+            GROUPS = nextConfig.groups || {};
+            FASTEST_EXCLUDE_GROUPS = Array.isArray(nextConfig.fastest_exclude_groups) ? nextConfig.fastest_exclude_groups : [];
+            writeConfigFile(nextConfig);
+
+            logger.info('admin_groups_updated', {
+                request_id: requestId,
+                groups_count: Object.keys(GROUPS).length,
+                fastest_group: config.fastest_group !== false,
+                fastest_exclude_groups_count: FASTEST_EXCLUDE_GROUPS.length,
+            });
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                status: 'ok',
+                request_id: requestId,
+                groups: GROUPS,
+                fastest_group: config.fastest_group !== false,
+                fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
+            }));
+            return;
+        } catch (err) {
+            logger.error('admin_groups_update_failed', { request_id: requestId, error: err.message });
+            const code = err.message === 'Invalid JSON body' ? 400 : 422;
+            res.writeHead(code, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', request_id: requestId, message: err.message }));
+            return;
+        }
     }
 
     if (pathname === '/ready') {
