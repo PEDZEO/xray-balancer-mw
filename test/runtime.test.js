@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createTokenCache, createRateLimiter } = require('../lib/runtime');
+const { createTokenCache, createRateLimiter, createKeyedRateLimiter } = require('../lib/runtime');
 
 test('token cache returns fresh values and expires old ones', async () => {
     const cache = createTokenCache(1, 10);
@@ -42,4 +42,20 @@ test('rate limiter blocks burst overflow', () => {
     assert.equal(limiter.allow(ip, 1000), true);
     assert.equal(limiter.allow(ip, 1001), true);
     assert.equal(limiter.allow(ip, 1002), false);
+});
+
+test('keyed limiter keeps bounded number of token buckets', () => {
+    const limiter = createKeyedRateLimiter(100, 100, {
+        idleMs: 600000,
+        maxEntries: 3,
+        cleanupBatch: 1,
+    });
+
+    assert.equal(limiter.allow('t1', 1000), true);
+    assert.equal(limiter.allow('t2', 1001), true);
+    assert.equal(limiter.allow('t3', 1002), true);
+    assert.equal(limiter.size(), 3);
+
+    assert.equal(limiter.allow('t4', 1003), true);
+    assert.equal(limiter.size(), 3);
 });

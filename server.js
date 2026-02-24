@@ -70,6 +70,8 @@ const RATE_LIMIT_PER_MINUTE = pickRuntimeInt('RATE_LIMIT_PER_MINUTE', 'rate_limi
 const RATE_LIMIT_BURST_10S = pickRuntimeInt('RATE_LIMIT_BURST_10S', 'rate_limit_burst_10s');
 const TOKEN_RATE_LIMIT_PER_MINUTE = pickRuntimeInt('TOKEN_RATE_LIMIT_PER_MINUTE', 'token_rate_limit_per_minute');
 const TOKEN_RATE_LIMIT_BURST_10S = pickRuntimeInt('TOKEN_RATE_LIMIT_BURST_10S', 'token_rate_limit_burst_10s');
+const TOKEN_LIMITER_MAX_ENTRIES = parseInt(process.env.TOKEN_LIMITER_MAX_ENTRIES, 10) || config.token_limiter_max_entries || 5000;
+const TOKEN_LIMITER_CLEANUP_BATCH = parseInt(process.env.TOKEN_LIMITER_CLEANUP_BATCH, 10) || config.token_limiter_cleanup_batch || 200;
 const READY_SUCCESS_WINDOW_SEC = pickRuntimeInt('READY_SUCCESS_WINDOW_SEC', 'ready_success_window_sec');
 const REQUEST_TIMEOUT_MS = pickRuntimeInt('REQUEST_TIMEOUT_MS', 'request_timeout_ms');
 const MAX_REDIRECTS = pickRuntimeInt('MAX_REDIRECTS', 'max_redirects');
@@ -103,7 +105,10 @@ let nodeStatsCache = {};
 let lastUpstreamSuccessAt = 0;
 const subscriptionCache = createTokenCache(CACHE_TTL_SEC, CACHE_MAX_ENTRIES);
 const rateLimiter = createRateLimiter(RATE_LIMIT_PER_MINUTE, RATE_LIMIT_BURST_10S);
-const tokenRateLimiter = createKeyedRateLimiter(TOKEN_RATE_LIMIT_PER_MINUTE, TOKEN_RATE_LIMIT_BURST_10S);
+const tokenRateLimiter = createKeyedRateLimiter(TOKEN_RATE_LIMIT_PER_MINUTE, TOKEN_RATE_LIMIT_BURST_10S, {
+    maxEntries: TOKEN_LIMITER_MAX_ENTRIES,
+    cleanupBatch: TOKEN_LIMITER_CLEANUP_BATCH,
+});
 const circuitBreaker = createCircuitBreaker(CIRCUIT_BREAKER_FAILURES, CIRCUIT_BREAKER_OPEN_SEC);
 const runtimeStats = {
     started_at: Date.now(),
@@ -143,7 +148,11 @@ function fetchUrl(targetUrl, headers = {}, maxRedirects = MAX_REDIRECTS) {
                 if (maxRedirects <= 0) {
                     return reject(new Error('Too many redirects'));
                 }
-                return fetchUrl(new URL(res.headers.location, targetUrl).href, headers, maxRedirects - 1).then(resolve).catch(reject);
+                const redirectUrl = new URL(res.headers.location, targetUrl);
+                if (redirectUrl.protocol !== parsed.protocol || redirectUrl.host !== parsed.host) {
+                    return reject(new Error('Unsafe redirect blocked'));
+                }
+                return fetchUrl(redirectUrl.href, headers, maxRedirects - 1).then(resolve).catch(reject);
             }
 
             let data = '';
@@ -171,12 +180,10 @@ function timingSafeEqualString(a, b) {
     return crypto.timingSafeEqual(ba, bb);
 }
 
-function isAdminAuthorized(req, parsedUrl) {
+function isAdminAuthorized(req) {
     if (!ADMIN_TOKEN) return false;
     const headerToken = (req.headers['x-admin-token'] || '').toString();
-    const queryToken = parsedUrl.searchParams.get('admin_token') || '';
-    const candidate = headerToken || queryToken;
-    return timingSafeEqualString(candidate, ADMIN_TOKEN);
+    return timingSafeEqualString(headerToken, ADMIN_TOKEN);
 }
 
 function writeConfigFile(nextConfig) {
@@ -418,7 +425,12 @@ function collectAllProxyOutbounds(configArray) {
                 tag = remarks;
             }
             if (seenTags.has(tag)) {
-                tag = `${tag}-${i}`;
+                const baseTag = tag;
+                let suffix = i;
+                while (seenTags.has(tag)) {
+                    tag = `${baseTag}-${suffix}`;
+                    suffix += 1;
+                }
             }
             cloned.tag = tag;
             seenTags.add(tag);
@@ -520,7 +532,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === '/admin/groups') {
-        if (!isAdminAuthorized(req, parsedUrl)) {
+        if (!isAdminAuthorized(req)) {
             res.writeHead(401, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
             return;
@@ -611,7 +623,7 @@ const server = http.createServer(async (req, res) => {
 
     const debugTokenMatch = pathname.match(/^\/debug\/token\/([a-zA-Z0-9_-]+)$/);
     if (pathname === '/node-stats' || pathname === '/refresh-groups' || pathname === '/refresh-stats' || pathname === '/debug/stats' || debugTokenMatch) {
-        if (!isAdminAuthorized(req, parsedUrl)) {
+        if (!isAdminAuthorized(req)) {
             res.writeHead(401, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
             return;
@@ -799,6 +811,7 @@ const server = http.createServer(async (req, res) => {
         if (classified.type === 'non_json') {
             runtimeStats.upstream_non_json_total += 1;
             circuitBreaker.recordSuccess();
+            lastUpstreamSuccessAt = Date.now();
             logger.info('upstream_non_json_passthrough', { request_id: requestId });
             res.writeHead(200, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'text/plain'));
             res.end(upstream.body);
@@ -808,6 +821,7 @@ const server = http.createServer(async (req, res) => {
         let configArray = classified.parsed;
 
         if (configArray.length === 0) {
+            lastUpstreamSuccessAt = Date.now();
             res.writeHead(200, forwardResponseHeaders(upstream.headers, 'application/json; charset=utf-8'));
             res.end(upstream.body);
             return;
@@ -821,6 +835,7 @@ const server = http.createServer(async (req, res) => {
         if (classified.type === 'fake_config') {
             runtimeStats.fake_config_passthrough_total += 1;
             circuitBreaker.recordSuccess();
+            lastUpstreamSuccessAt = Date.now();
             logger.info('fake_config_passthrough', { request_id: requestId });
             res.writeHead(200, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'application/json; charset=utf-8'));
             res.end(upstream.body);
