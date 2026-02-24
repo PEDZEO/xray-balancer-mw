@@ -5,7 +5,8 @@
     "main": "server.js",
     "scripts": {
         "start": "node server.js",
-        "check": "node -c server.js"
+        "check": "node -c server.js",
+        "test": "node --test"
     },
     "author": "Haxonate",
     "license": "SEE LICENSE IN LICENSE",

@@ -5,6 +5,7 @@ WORKDIR /app
 # Копируем только код — config.json монтируется через volume
 COPY server.js .
 COPY package.json .
+COPY lib ./lib
 
 # Не-root пользователь
 USER node

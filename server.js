@@ -2,12 +2,21 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const { validateConfig } = require('./lib/config');
+const { redactTokenPath, sanitizeClientMetadata } = require('./lib/security');
+const {
+    filterAndSortByLoad,
+    getNodeStats,
+    isFakeConfig,
+    matchGroup,
+} = require('./lib/balancing');
 
 // ─── Загрузка конфига ───
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
 let config;
 try {
     config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    validateConfig(config);
 } catch (err) {
     console.error(`❌ Ошибка чтения ${CONFIG_PATH}:`, err.message);
     process.exit(1);
@@ -104,30 +113,6 @@ function sanitizeTag(name) {
     return name.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_');
 }
 
-function matchGroup(outboundTag) {
-    const tagLower = outboundTag.toLowerCase();
-    let bestGroup = null;
-    let bestLen = 0;
-
-    for (const [groupName, patterns] of Object.entries(GROUPS)) {
-        for (const pattern of patterns) {
-            const patLower = pattern.toLowerCase();
-            // Короткие паттерны (≤2 символа) проверяем только как отдельные слова
-            if (patLower.length <= 2) {
-                const regex = new RegExp(`(?:^|[^a-z])${patLower}(?:$|[^a-z])`);
-                if (regex.test(tagLower) && patLower.length > bestLen) {
-                    bestGroup = groupName;
-                    bestLen = patLower.length;
-                }
-            } else if (tagLower.includes(patLower) && patLower.length > bestLen) {
-                bestGroup = groupName;
-                bestLen = patLower.length;
-            }
-        }
-    }
-    return bestGroup;
-}
-
 // ─── Парсинг RAM ───
 
 function parseRamGb(ramStr) {
@@ -206,63 +191,6 @@ async function fetchNodeStats() {
     } catch (err) {
         console.error('[node-stats] Ошибка:', err.message);
     }
-}
-
-// ─── Получить статистику ноды по тегу outbound'а ───
-
-function getNodeStats(outboundTag) {
-    // Прямой матч по имени
-    if (nodeStatsCache[outboundTag]) return nodeStatsCache[outboundTag];
-
-    // Матч по словам — ищем имя ноды как отдельное слово в теге
-    // Защита от ложных совпадений (nl → finland, de → node и т.д.)
-    const tagLower = outboundTag.toLowerCase();
-    let bestMatch = null;
-    let bestLen = 0;
-
-    for (const [nodeName, stats] of Object.entries(nodeStatsCache)) {
-        const nameL = nodeName.toLowerCase();
-        // Минимум 3 символа для fuzzy матча (защита от "nl", "de", "fi")
-        if (nameL.length < 3) continue;
-        // Ищем имя ноды в теге
-        if (tagLower.includes(nameL) && nameL.length > bestLen) {
-            bestMatch = stats;
-            bestLen = nameL.length;
-        }
-    }
-    return bestMatch;
-}
-
-// ─── Фильтрация и сортировка outbound'ов по нагрузке ───
-
-function filterAndSortByLoad(outbounds) {
-    if (Object.keys(nodeStatsCache).length === 0) return outbounds;
-
-    const withStats = outbounds.map(ob => {
-        const stats = getNodeStats(ob.tag);
-        return { ob, stats, load: stats ? stats.load : 0.5 };
-    });
-
-    // Исключаем перегруженные (load > 1.0 = превышен порог RAM или CPU) и отключённые
-    const filtered = withStats.filter(({ stats }) => {
-        if (!stats) return true; // Нет данных — пропускаем
-        if (!stats.isConnected || stats.isDisabled) return false; // Офлайн
-        if (stats.load > 1.0) return false; // Перегружен по RAM или CPU
-        return true;
-    });
-
-    // Если все отфильтрованы — вернуть всех подключённых (fallback)
-    if (filtered.length === 0) {
-        const connected = withStats.filter(({ stats }) => !stats || (stats.isConnected && !stats.isDisabled));
-        if (connected.length === 0) return outbounds; // Совсем ничего — вернуть как есть
-        connected.sort((a, b) => a.load - b.load);
-        return connected.map(({ ob }) => ob);
-    }
-
-    // Сортируем: менее загруженные первыми
-    filtered.sort((a, b) => a.load - b.load);
-
-    return filtered.map(({ ob }) => ob);
 }
 
 // ─── Remnawave API ───
@@ -359,40 +287,6 @@ async function refreshGroups() {
     if (Object.keys(newGroups).length === 0) return;
     GROUPS = { ...newGroups, ...(config.groups || {}) };
     console.log(`[auto-groups] Обновлены: ${Object.entries(GROUPS).map(([k, v]) => `${k} [${v}]`).join(' | ')}`);
-}
-
-// ─── Детектировать фейковый конфиг (лимит устройств, истекла подписка) ───
-
-function isFakeConfig(configArray) {
-    const systemProtocols = new Set(['freedom', 'blackhole', 'dns']);
-    let proxyCount = 0;
-    let fakeCount = 0;
-
-    for (const cfg of configArray) {
-        for (const ob of (cfg.outbounds || [])) {
-            if (systemProtocols.has(ob.protocol)) continue;
-            if (!ob.tag) continue;
-            proxyCount++;
-
-            // Проверяем все известные форматы: vless/vmess/trojan/shadowsocks
-            const addr = (
-                ob.settings?.vnext?.[0]?.address ||
-                ob.settings?.servers?.[0]?.address ||
-                ''
-            );
-            const port = (
-                ob.settings?.vnext?.[0]?.port ||
-                ob.settings?.servers?.[0]?.port ||
-                null
-            );
-
-            if (addr === '0.0.0.0' && port === 1) {
-                fakeCount++;
-            }
-        }
-    }
-
-    return proxyCount > 0 && proxyCount === fakeCount;
 }
 
 // ─── Собрать все прокси-outbound'ы из XRAY-JSON массива ───
@@ -629,7 +523,8 @@ const server = http.createServer(async (req, res) => {
         ? `${SUB_PAGE_URL}/${token}`
         : `${REMNAWAVE_URL}${REMNAWAVE_SUB_PATH}/${token}`;
 
-    console.log(`[proxy] ${req.method} ${pathname} → ${targetUrl}`);
+    const safePath = redactTokenPath(pathname);
+    console.log(`[proxy] ${req.method} ${safePath} → upstream`);
 
     try {
         // Пробрасываем ВСЕ заголовки от клиента, кроме тех что ломают проксирование
@@ -654,7 +549,8 @@ const server = http.createServer(async (req, res) => {
             forwardHeaders['Host'] = SUB_DOMAIN || req.headers['host'] || 'localhost';
         }
 
-        console.log(`[proxy] Headers: HWID=${req.headers['x-hwid'] || 'нет'} Device=${req.headers['x-device-model'] || 'нет'} OS=${req.headers['x-device-os'] || 'нет'}`);
+        const clientMeta = sanitizeClientMetadata(req);
+        console.log(`[proxy] Client meta: hwid=${clientMeta.hwid} device=${clientMeta.device} os=${clientMeta.os}`);
 
         const upstream = await fetchUrl(targetUrl, forwardHeaders);
         console.log(`[proxy] Upstream: ${upstream.status}, ${upstream.body.length} bytes`);
@@ -707,7 +603,7 @@ const server = http.createServer(async (req, res) => {
         // ─── Фильтрация и сортировка по нагрузке ───
         if (NODE_STATS_ENABLED && Object.keys(nodeStatsCache).length > 0) {
             const before = allOutbounds.length;
-            allOutbounds = filterAndSortByLoad(allOutbounds);
+            allOutbounds = filterAndSortByLoad(allOutbounds, nodeStatsCache);
             const after = allOutbounds.length;
             if (before !== after) {
                 console.log(`[node-stats] Отфильтровано: ${before} → ${after} серверов (исключены перегруженные >${MAX_USERS_PER_GB} u/GB или >${MAX_USERS_PER_CPU} u/CPU)`);
@@ -719,7 +615,7 @@ const server = http.createServer(async (req, res) => {
         const ungrouped = [];
 
         for (const ob of allOutbounds) {
-            const group = matchGroup(ob.tag);
+            const group = matchGroup(GROUPS, ob.tag);
             if (group) {
                 if (!grouped[group]) grouped[group] = [];
                 grouped[group].push(ob);
@@ -742,8 +638,8 @@ const server = http.createServer(async (req, res) => {
         if (NODE_STATS_ENABLED && Object.keys(nodeStatsCache).length > 0) {
             for (const [groupName, obs] of Object.entries(grouped)) {
                 grouped[groupName] = obs.slice().sort((a, b) => {
-                    const sa = getNodeStats(a.tag);
-                    const sb = getNodeStats(b.tag);
+                    const sa = getNodeStats(nodeStatsCache, a.tag);
+                    const sb = getNodeStats(nodeStatsCache, b.tag);
                     const la = sa ? sa.load : 0.5;
                     const lb = sb ? sb.load : 0.5;
                     return la - lb;
@@ -757,7 +653,7 @@ const server = http.createServer(async (req, res) => {
         // ⚡ Fastest
         const fastestEnabled = config.fastest_group !== false;
         if (fastestEnabled && allOutbounds.length > 1) {
-            const fastestConfig = buildGroupConfig(baseConfig, '🏁 Самые быстрые', allOutbounds);
+            const fastestConfig = buildGroupConfig(baseConfig, '🏁 🇪🇺 Самые быстрые', allOutbounds);
             resultConfigs.push(fastestConfig);
             console.log(`[group] 🏁 Самые быстрые: ${allOutbounds.length} серверов (все)`);
         }
@@ -771,7 +667,7 @@ const server = http.createServer(async (req, res) => {
             // Логируем порядок серверов если есть стата
             if (NODE_STATS_ENABLED && Object.keys(nodeStatsCache).length > 0) {
                 const order = outbounds.map(ob => {
-                    const s = getNodeStats(ob.tag);
+                    const s = getNodeStats(nodeStatsCache, ob.tag);
                     return s ? `${ob.tag}(${s.usersOnline}u/${s.totalRamGb}G/${s.cpuCount}C)` : ob.tag;
                 }).join(', ');
                 console.log(`[group] ${groupName}: ${outbounds.length} серверов → ${order}`);
