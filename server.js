@@ -1148,6 +1148,12 @@ const server = http.createServer(async (req, res) => {
         // ─── Группируем ───
         const grouped = {};
         const ungrouped = [];
+        const configuredGroupOrder = Object.keys(GROUPS);
+
+        // Preserve explicit admin order even if some groups are empty.
+        for (const groupName of configuredGroupOrder) {
+            grouped[groupName] = [];
+        }
 
         for (const ob of allOutbounds) {
             const group = matchGroup(GROUPS, ob.tag);
@@ -1160,7 +1166,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (ungrouped.length > 0) {
-            const firstGroup = Object.keys(grouped)[0];
+            const firstGroup = configuredGroupOrder[0] || Object.keys(grouped)[0];
             if (firstGroup) {
                 grouped[firstGroup].push(...ungrouped);
                 logger.info('ungrouped_appended', { request_id: requestId, count: ungrouped.length, group: firstGroup });
@@ -1209,7 +1215,9 @@ const server = http.createServer(async (req, res) => {
         }
 
         // Группы по странам
-        for (const [groupName, outbounds] of Object.entries(grouped)) {
+        const responseGroupOrder = [...configuredGroupOrder, ...Object.keys(grouped).filter((name) => !configuredGroupOrder.includes(name))];
+        for (const groupName of responseGroupOrder) {
+            const outbounds = grouped[groupName] || [];
             if (outbounds.length === 0) continue;
             const groupConfig = buildGroupConfig(baseConfig, groupName, outbounds, {
                 probeUrl: PROBE_URL,
