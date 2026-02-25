@@ -25,6 +25,6 @@
 
 ## Operational Endpoints
 - Public: `/health`, `/ready`
-- Admin: `/admin/node-stats`, `/admin/refresh-stats`, `/admin/refresh-groups`, `/admin/debug/stats`, `/admin/debug/token/{token}`
+- Admin: `/admin/node-stats`, `/admin/refresh-stats`, `/admin/refresh-groups`, `/admin/debug/stats`, `/admin/debug/token/{token}`, `/admin/quarantine`
 
 Admin endpoints require `x-admin-token`.

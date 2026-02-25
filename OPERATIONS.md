@@ -11,6 +11,8 @@ All endpoints below require `x-admin-token` header:
 - `/admin/refresh-groups`
 - `/admin/debug/stats`
 - `/admin/debug/token/{token}`
+- `/admin/quarantine` (`GET` list, `POST` add `{ "node": "name" }`)
+- `/admin/quarantine/{node}` (`DELETE` remove)
 
 ## Token Rotation
 1. Generate a new token.
@@ -31,6 +33,11 @@ All endpoints below require `x-admin-token` header:
 ### Wrong grouping or fallback to `Other`
 - Adjust `groups` patterns.
 - Use `/admin/debug/token/{token}` to inspect payload type and cache behavior.
+
+### Need to isolate a broken node quickly
+- Add node to quarantine via `/admin/quarantine`.
+- Verify `quarantine_count` in `/health`.
+- Remove when node is healthy again.
 
 ## Safe Defaults
 - `profile_mode: stable`

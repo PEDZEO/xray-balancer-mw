@@ -31,6 +31,7 @@
     "circuit_breaker_open_sec": 30,
     "admin_token": "",
     "warmup_tokens": [],
+    "quarantine_nodes": [],
 
     "groups": {
         "🇫🇮 Finland": ["Finland"],

@@ -41,6 +41,11 @@
       "type": "array",
       "items": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" }
     },
+    "quarantine_nodes": {
+      "type": "array",
+      "maxItems": 500,
+      "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+    },
     "groups": {
       "type": "object",
       "maxProperties": 100,

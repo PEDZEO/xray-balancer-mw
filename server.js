@@ -81,6 +81,9 @@ let FASTEST_EXCLUDE_GROUPS = Array.isArray(config.fastest_exclude_groups) ? conf
 const DEFAULT_FASTEST_GROUP_NAME = '🏁 🇪🇺 Самые быстрые';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || config.admin_token || '';
 const WARMUP_TOKENS = Array.isArray(config.warmup_tokens) ? config.warmup_tokens : [];
+let QUARANTINE_NODES = Array.isArray(config.quarantine_nodes)
+    ? config.quarantine_nodes.filter((name) => typeof name === 'string' && name.trim().length > 0)
+    : [];
 
 const MAX_RESPONSE_SIZE = 10 * 1024 * 1024;
 
@@ -124,6 +127,7 @@ const runtimeStats = {
     rate_limited_token_total: 0,
     upstream_non_json_total: 0,
     fake_config_passthrough_total: 0,
+    quarantine_filtered_total: 0,
 };
 const logger = buildLogger();
 const requestGuard = createRequestGuard({
@@ -510,6 +514,26 @@ function toIsoTimestamp(ms) {
     return ms > 0 ? new Date(ms).toISOString() : null;
 }
 
+function normalizeNodeName(value) {
+    return (value || '').toString().trim().toLowerCase();
+}
+
+function buildQuarantineSet() {
+    return new Set(QUARANTINE_NODES.map(normalizeNodeName).filter(Boolean));
+}
+
+function isNodeQuarantined(tag, quarantineSet) {
+    const normalizedTag = normalizeNodeName(tag);
+    if (!normalizedTag || quarantineSet.size === 0) return false;
+    if (quarantineSet.has(normalizedTag)) return true;
+
+    for (const entry of quarantineSet) {
+        if (entry.length < 3) continue;
+        if (normalizedTag.includes(entry) || entry.includes(normalizedTag)) return true;
+    }
+    return false;
+}
+
 async function warmupToken(token) {
     const targetUrl = SUB_PAGE_URL
         ? `${SUB_PAGE_URL}/${token}`
@@ -546,6 +570,8 @@ const server = http.createServer(async (req, res) => {
             node_stats: NODE_STATS_ENABLED,
             panel_auth: PANEL_AUTH_COOKIE ? true : false,
             cached_nodes: Object.keys(nodeStatsCache).length,
+            quarantine_nodes: QUARANTINE_NODES,
+            quarantine_count: QUARANTINE_NODES.length,
             sub_page: SUB_PAGE_URL || 'disabled',
         }));
         return;
@@ -567,6 +593,7 @@ const server = http.createServer(async (req, res) => {
                 fastest_group: config.fastest_group !== false,
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
+                quarantine_nodes: QUARANTINE_NODES,
             }));
             return;
         }
@@ -612,6 +639,7 @@ const server = http.createServer(async (req, res) => {
                 fastest_group: config.fastest_group !== false,
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
+                quarantine_nodes: QUARANTINE_NODES,
             }));
             return;
         } catch (err) {
@@ -655,8 +683,113 @@ const server = http.createServer(async (req, res) => {
             res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
             return;
         }
+        const quarantineSet = buildQuarantineSet();
+        const enriched = Object.fromEntries(
+            Object.entries(nodeStatsCache).map(([name, stats]) => [
+                name,
+                {
+                    ...stats,
+                    quarantined: isNodeQuarantined(name, quarantineSet),
+                },
+            ]),
+        );
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(nodeStatsCache, null, 2));
+        res.end(JSON.stringify(enriched, null, 2));
+        return;
+    }
+
+    if (pathname === '/admin/quarantine') {
+        if (!isAdminAuthorized(req)) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+            return;
+        }
+
+        if (req.method === 'GET') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                status: 'ok',
+                request_id: requestId,
+                quarantine_nodes: QUARANTINE_NODES,
+                quarantine_count: QUARANTINE_NODES.length,
+            }));
+            return;
+        }
+
+        if (req.method !== 'POST') {
+            res.writeHead(405, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'METHOD_NOT_ALLOWED', request_id: requestId }));
+            return;
+        }
+
+        try {
+            const payload = await readJsonBody(req);
+            const nodeRaw = (payload.node || '').toString().trim();
+            if (!nodeRaw) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ status: 'error', code: 'NODE_REQUIRED', request_id: requestId }));
+                return;
+            }
+            const normalized = normalizeNodeName(nodeRaw);
+            const existing = new Set(QUARANTINE_NODES.map(normalizeNodeName));
+            if (!existing.has(normalized)) {
+                QUARANTINE_NODES = [...QUARANTINE_NODES, nodeRaw];
+                const nextConfig = { ...config, quarantine_nodes: QUARANTINE_NODES };
+                validateConfig(nextConfig);
+                config = nextConfig;
+                writeConfigFile(nextConfig);
+            }
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                status: 'ok',
+                request_id: requestId,
+                quarantine_nodes: QUARANTINE_NODES,
+                quarantine_count: QUARANTINE_NODES.length,
+            }));
+            return;
+        } catch (err) {
+            const code = err.message === 'Invalid JSON body' ? 400 : 422;
+            res.writeHead(code, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', request_id: requestId, message: err.message }));
+            return;
+        }
+    }
+
+    const adminQuarantineDeleteMatch = pathname.match(/^\/admin\/quarantine\/(.+)$/);
+    if (adminQuarantineDeleteMatch) {
+        if (!isAdminAuthorized(req)) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+            return;
+        }
+        if (req.method !== 'DELETE') {
+            res.writeHead(405, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'METHOD_NOT_ALLOWED', request_id: requestId }));
+            return;
+        }
+
+        const nodeRaw = decodeURIComponent(adminQuarantineDeleteMatch[1] || '').trim();
+        const normalized = normalizeNodeName(nodeRaw);
+        if (!normalized) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'NODE_REQUIRED', request_id: requestId }));
+            return;
+        }
+
+        QUARANTINE_NODES = QUARANTINE_NODES.filter((name) => normalizeNodeName(name) !== normalized);
+        const nextConfig = { ...config, quarantine_nodes: QUARANTINE_NODES };
+        validateConfig(nextConfig);
+        config = nextConfig;
+        writeConfigFile(nextConfig);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            status: 'ok',
+            request_id: requestId,
+            quarantine_nodes: QUARANTINE_NODES,
+            quarantine_count: QUARANTINE_NODES.length,
+        }));
         return;
     }
 
@@ -718,6 +851,8 @@ const server = http.createServer(async (req, res) => {
             profile_mode: PROFILE.name,
             runtime_stats: runtimeStats,
             circuit_breaker: cb,
+            quarantine_nodes: QUARANTINE_NODES,
+            quarantine_count: QUARANTINE_NODES.length,
         }));
         return;
     }
@@ -929,6 +1064,29 @@ const server = http.createServer(async (req, res) => {
             }
         }
 
+        const quarantineSet = buildQuarantineSet();
+        if (quarantineSet.size > 0) {
+            const before = allOutbounds.length;
+            allOutbounds = allOutbounds.filter((ob) => !isNodeQuarantined(ob.tag, quarantineSet));
+            const removed = before - allOutbounds.length;
+            if (removed > 0) {
+                runtimeStats.quarantine_filtered_total += removed;
+                logger.info('outbounds_filtered_by_quarantine', {
+                    request_id: requestId,
+                    before,
+                    after: allOutbounds.length,
+                    quarantine_count: QUARANTINE_NODES.length,
+                });
+            }
+        }
+
+        if (allOutbounds.length === 0) {
+            logger.warn('all_outbounds_quarantined', { request_id: requestId, quarantine_count: QUARANTINE_NODES.length });
+            res.writeHead(200, forwardResponseHeaders(upstream.headers, 'application/json; charset=utf-8'));
+            res.end(upstream.body);
+            return;
+        }
+
         // ─── Группируем ───
         const grouped = {};
         const ungrouped = [];
@@ -1099,6 +1257,7 @@ async function start() {
         console.log(`🎟️ Token rate limit: ${TOKEN_RATE_LIMIT_PER_MINUTE}/min, burst=${TOKEN_RATE_LIMIT_BURST_10S}/10s`);
         console.log(`⏱️ Upstream: timeout=${REQUEST_TIMEOUT_MS}ms redirects=${MAX_REDIRECTS}`);
         console.log(`🧱 Circuit breaker: fails=${CIRCUIT_BREAKER_FAILURES} open=${CIRCUIT_BREAKER_OPEN_SEC}s`);
+        console.log(`🚫 Quarantine: ${QUARANTINE_NODES.length} nodes`);
         console.log(`🛡️ Admin routes: ${ADMIN_TOKEN ? '🔒 enabled' : '⚠️ disabled (set ADMIN_TOKEN)'}`);
         console.log(`🔐 Panel cookie: ${PANEL_AUTH_COOKIE ? '✅' : '❌ (не нужен)'}`);
         console.log(`📡 Sub page: ${SUB_PAGE_URL || 'не задан'}`);

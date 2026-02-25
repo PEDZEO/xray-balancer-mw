@@ -59,3 +59,15 @@ test('validateConfig rejects too many groups and overly long patterns', () => {
         /longer than 128 chars/,
     );
 });
+
+test('validateConfig validates quarantine_nodes', () => {
+    const cfg = {
+        quarantine_nodes: ['Germany-1', 'USA Main'],
+    };
+    assert.deepEqual(validateConfig(cfg), cfg);
+
+    assert.throws(
+        () => validateConfig({ quarantine_nodes: [''] }),
+        /quarantine_nodes contains invalid node name/,
+    );
+});
