@@ -199,6 +199,20 @@ function writeConfigFile(nextConfig) {
     fs.renameSync(tempPath, CONFIG_PATH);
 }
 
+function persistConfigIfPossible(nextConfig, requestId) {
+    try {
+        writeConfigFile(nextConfig);
+        return { persisted: true, error: null };
+    } catch (err) {
+        logger.warn('config_persist_skipped', {
+            request_id: requestId,
+            error: err.message,
+            config_path: CONFIG_PATH,
+        });
+        return { persisted: false, error: err.message };
+    }
+}
+
 function readJsonBody(req, maxBytes = 512 * 1024) {
     return new Promise((resolve, reject) => {
         let raw = '';
@@ -621,7 +635,7 @@ const server = http.createServer(async (req, res) => {
             config = nextConfig;
             GROUPS = nextConfig.groups || {};
             FASTEST_EXCLUDE_GROUPS = Array.isArray(nextConfig.fastest_exclude_groups) ? nextConfig.fastest_exclude_groups : [];
-            writeConfigFile(nextConfig);
+            const persistResult = persistConfigIfPossible(nextConfig, requestId);
 
             logger.info('admin_groups_updated', {
                 request_id: requestId,
@@ -629,6 +643,7 @@ const server = http.createServer(async (req, res) => {
                 fastest_group: config.fastest_group !== false,
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups_count: FASTEST_EXCLUDE_GROUPS.length,
+                persisted: persistResult.persisted,
             });
 
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -640,6 +655,8 @@ const server = http.createServer(async (req, res) => {
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
                 quarantine_nodes: QUARANTINE_NODES,
+                persisted: persistResult.persisted,
+                persist_error: persistResult.error,
             }));
             return;
         } catch (err) {
@@ -737,7 +754,17 @@ const server = http.createServer(async (req, res) => {
                 const nextConfig = { ...config, quarantine_nodes: QUARANTINE_NODES };
                 validateConfig(nextConfig);
                 config = nextConfig;
-                writeConfigFile(nextConfig);
+                const persistResult = persistConfigIfPossible(nextConfig, requestId);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    status: 'ok',
+                    request_id: requestId,
+                    quarantine_nodes: QUARANTINE_NODES,
+                    quarantine_count: QUARANTINE_NODES.length,
+                    persisted: persistResult.persisted,
+                    persist_error: persistResult.error,
+                }));
+                return;
             }
 
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -746,6 +773,8 @@ const server = http.createServer(async (req, res) => {
                 request_id: requestId,
                 quarantine_nodes: QUARANTINE_NODES,
                 quarantine_count: QUARANTINE_NODES.length,
+                persisted: true,
+                persist_error: null,
             }));
             return;
         } catch (err) {
@@ -781,7 +810,7 @@ const server = http.createServer(async (req, res) => {
         const nextConfig = { ...config, quarantine_nodes: QUARANTINE_NODES };
         validateConfig(nextConfig);
         config = nextConfig;
-        writeConfigFile(nextConfig);
+        const persistResult = persistConfigIfPossible(nextConfig, requestId);
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -789,6 +818,8 @@ const server = http.createServer(async (req, res) => {
             request_id: requestId,
             quarantine_nodes: QUARANTINE_NODES,
             quarantine_count: QUARANTINE_NODES.length,
+            persisted: persistResult.persisted,
+            persist_error: persistResult.error,
         }));
         return;
     }
