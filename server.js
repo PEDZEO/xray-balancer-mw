@@ -646,9 +646,8 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    const debugTokenMatch = pathname.match(/^\/debug\/token\/([a-zA-Z0-9_-]+)$/);
     const adminDebugTokenMatch = pathname.match(/^\/admin\/debug\/token\/([a-zA-Z0-9_-]+)$/);
-    const debugTokenValue = debugTokenMatch?.[1] || adminDebugTokenMatch?.[1] || null;
+    const debugTokenValue = adminDebugTokenMatch?.[1] || null;
 
     if (pathname === '/admin/node-stats') {
         if (!isAdminAuthorized(req)) {
@@ -661,13 +660,7 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (pathname === '/node-stats' && isAdminAuthorized(req)) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(nodeStatsCache, null, 2));
-        return;
-    }
-
-    if (pathname === '/admin/refresh-groups' || (pathname === '/refresh-groups' && isAdminAuthorized(req))) {
+    if (pathname === '/admin/refresh-groups') {
         if (!isAdminAuthorized(req)) {
             res.writeHead(401, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
@@ -689,7 +682,7 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (pathname === '/admin/refresh-stats' || (pathname === '/refresh-stats' && isAdminAuthorized(req))) {
+    if (pathname === '/admin/refresh-stats') {
         if (!isAdminAuthorized(req)) {
             res.writeHead(401, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
@@ -711,7 +704,7 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (pathname === '/admin/debug/stats' || (pathname === '/debug/stats' && isAdminAuthorized(req))) {
+    if (pathname === '/admin/debug/stats') {
         if (!isAdminAuthorized(req)) {
             res.writeHead(401, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
@@ -1112,7 +1105,7 @@ async function start() {
         console.log(`🔀 Форвард: все заголовки клиента → upstream, все заголовки upstream → клиент`);
         console.log(`\n   Подписка: http://localhost:${PORT}/{token}`);
         console.log(`   Health:   http://localhost:${PORT}/health`);
-        console.log(`   Стата:    http://localhost:${PORT}/node-stats\n`);
+        console.log(`   Стата:    http://localhost:${PORT}/admin/node-stats (x-admin-token)\n`);
     });
 }
 

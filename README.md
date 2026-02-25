@@ -239,7 +239,7 @@ server {
 curl http://localhost:4100/health
 
 # Статистика нод (если node_stats включён)
-curl http://localhost:4100/node-stats
+curl -H "x-admin-token: YOUR_ADMIN_TOKEN" http://localhost:4100/admin/node-stats
 
 # Тест подписки (замени YOUR_TOKEN)
 curl -s -H "User-Agent: Happ/3.10.0" https://sub.example.com/YOUR_TOKEN | python3 -c "
@@ -477,9 +477,11 @@ Middleware использует **blacklist** подход — пробрасы�
 | Endpoint | Описание |
 |----------|----------|
 | `GET /health` | Health check |
-| `GET /node-stats` | Текущая статистика нод |
-| `GET /refresh-stats` | Принудительно обновить статистику |
-| `GET /refresh-groups` | Обновить auto-groups |
+| `GET /admin/node-stats` | Текущая статистика нод (admin) |
+| `GET /admin/refresh-stats` | Принудительно обновить статистику (admin) |
+| `GET /admin/refresh-groups` | Обновить auto-groups (admin) |
+| `GET /admin/debug/stats` | Runtime статистика и circuit-breaker (admin) |
+| `GET /admin/debug/token/{token}` | Debug классификации upstream (admin) |
 | `GET /{token}` | Подписка с балансировкой |
 | `GET /sub/{token}` | Подписка (альтернативный путь) |
 
@@ -512,7 +514,7 @@ Subscription page сжимает ответ. Убедитесь что испо�
 ### node_stats не работает
 
 1. Убедитесь что `API_TOKEN` указан в `.env`
-2. Проверьте: `curl http://localhost:4100/node-stats`
+2. Проверьте: `curl -H "x-admin-token: YOUR_ADMIN_TOKEN" http://localhost:4100/admin/node-stats`
 3. Для панели за nginx (egam.es) — укажите `PANEL_AUTH_COOKIE` в `.env`
 
 ---
