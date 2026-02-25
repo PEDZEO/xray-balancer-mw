@@ -14,6 +14,8 @@ All endpoints below require `x-admin-token` header:
 - `/admin/quarantine` (`GET` list, `POST` add `{ "node": "name" }`)
 - `/admin/quarantine/{node}` (`DELETE` remove)
 
+Admin endpoints are also rate-limited (`admin_rate_limit_per_minute`, `admin_rate_limit_burst_10s`).
+
 ## Runtime Persistence
 - Keep base `config.json` mounted read-only.
 - Persist admin UI changes (`groups`, `fastest_*`, `quarantine_nodes`) into `CONFIG_RUNTIME_PATH`.
@@ -36,6 +38,11 @@ All endpoints below require `x-admin-token` header:
 ### Massive request bursts
 - Tighten `rate_limit_per_minute` and `token_rate_limit_per_minute`.
 - Check logs for `rate_limited` and `token_rate_limited` events.
+- For admin abuse/bruteforce, lower `admin_rate_limit_per_minute`.
+
+### All clients appear as one IP behind proxy
+- Set `trust_x_forwarded_for: true` only when middleware is behind your trusted reverse proxy.
+- If middleware is exposed directly, keep `trust_x_forwarded_for: false`.
 
 ### Wrong grouping or fallback to `Other`
 - Adjust `groups` patterns.

@@ -89,6 +89,9 @@ const TOKEN_RATE_LIMIT_PER_MINUTE = pickRuntimeInt('TOKEN_RATE_LIMIT_PER_MINUTE'
 const TOKEN_RATE_LIMIT_BURST_10S = pickRuntimeInt('TOKEN_RATE_LIMIT_BURST_10S', 'token_rate_limit_burst_10s');
 const TOKEN_LIMITER_MAX_ENTRIES = parseInt(process.env.TOKEN_LIMITER_MAX_ENTRIES, 10) || config.token_limiter_max_entries || 5000;
 const TOKEN_LIMITER_CLEANUP_BATCH = parseInt(process.env.TOKEN_LIMITER_CLEANUP_BATCH, 10) || config.token_limiter_cleanup_batch || 200;
+const TRUST_X_FORWARDED_FOR = process.env.TRUST_X_FORWARDED_FOR === 'true' || config.trust_x_forwarded_for === true;
+const ADMIN_RATE_LIMIT_PER_MINUTE = parseInt(process.env.ADMIN_RATE_LIMIT_PER_MINUTE, 10) || config.admin_rate_limit_per_minute || 60;
+const ADMIN_RATE_LIMIT_BURST_10S = parseInt(process.env.ADMIN_RATE_LIMIT_BURST_10S, 10) || config.admin_rate_limit_burst_10s || 20;
 const READY_SUCCESS_WINDOW_SEC = pickRuntimeInt('READY_SUCCESS_WINDOW_SEC', 'ready_success_window_sec');
 const REQUEST_TIMEOUT_MS = pickRuntimeInt('REQUEST_TIMEOUT_MS', 'request_timeout_ms');
 const MAX_REDIRECTS = pickRuntimeInt('MAX_REDIRECTS', 'max_redirects');
@@ -132,6 +135,7 @@ const tokenRateLimiter = createKeyedRateLimiter(TOKEN_RATE_LIMIT_PER_MINUTE, TOK
     maxEntries: TOKEN_LIMITER_MAX_ENTRIES,
     cleanupBatch: TOKEN_LIMITER_CLEANUP_BATCH,
 });
+const adminRateLimiter = createRateLimiter(ADMIN_RATE_LIMIT_PER_MINUTE, ADMIN_RATE_LIMIT_BURST_10S);
 const circuitBreaker = createCircuitBreaker(CIRCUIT_BREAKER_FAILURES, CIRCUIT_BREAKER_OPEN_SEC);
 const runtimeStats = {
     started_at: Date.now(),
@@ -208,6 +212,37 @@ function isAdminAuthorized(req) {
     if (!ADMIN_TOKEN) return false;
     const headerToken = (req.headers['x-admin-token'] || '').toString();
     return timingSafeEqualString(headerToken, ADMIN_TOKEN);
+}
+
+function sanitizeAdminPath(pathname) {
+    if (/^\/admin\/debug\/token\/[a-zA-Z0-9_-]+$/.test(pathname)) return '/admin/debug/token/:token';
+    if (/^\/admin\/quarantine\/.+$/.test(pathname)) return '/admin/quarantine/:node';
+    return pathname;
+}
+
+function resolveClientIp(req) {
+    const remoteIp = (req.socket.remoteAddress || '127.0.0.1').toString().trim();
+    if (!TRUST_X_FORWARDED_FOR) return remoteIp;
+    const forwardedIp = (req.headers['x-forwarded-for'] || '').toString().split(',')[0].trim();
+    return forwardedIp || remoteIp;
+}
+
+function enforceAdminAccess(req, res, requestId, clientIp, pathname) {
+    if (!adminRateLimiter.allow(clientIp)) {
+        logger.warn('admin_rate_limited', { request_id: requestId, ip: clientIp, path: sanitizeAdminPath(pathname) });
+        res.writeHead(429, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'error', code: 'RATE_LIMITED', request_id: requestId }));
+        return false;
+    }
+
+    if (!isAdminAuthorized(req)) {
+        logger.warn('admin_auth_failed', { request_id: requestId, ip: clientIp, path: sanitizeAdminPath(pathname) });
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+        return false;
+    }
+
+    return true;
 }
 
 function writeConfigFile(nextConfig) {
@@ -479,7 +514,7 @@ function collectAllProxyOutbounds(configArray) {
             if (systemProtocols.has(ob.protocol)) continue;
             if (!ob.tag) continue;
 
-            const cloned = structuredClone(ob);
+            const cloned = { ...ob };
 
             let tag = cloned.tag;
             if (tag === 'proxy' && remarks) {
@@ -598,7 +633,7 @@ const server = http.createServer(async (req, res) => {
     const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname;
     const requestId = req.headers['x-request-id'] || crypto.randomUUID();
-    const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1').toString().split(',')[0].trim();
+    const clientIp = resolveClientIp(req);
 
     if (pathname === '/health' || pathname === '/mw-health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -619,9 +654,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === '/admin/groups') {
-        if (!isAdminAuthorized(req)) {
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+        if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
             return;
         }
 
@@ -722,9 +755,7 @@ const server = http.createServer(async (req, res) => {
     const debugTokenValue = adminDebugTokenMatch?.[1] || null;
 
     if (pathname === '/admin/node-stats') {
-        if (!isAdminAuthorized(req)) {
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+        if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
             return;
         }
         const quarantineSet = buildQuarantineSet();
@@ -743,9 +774,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === '/admin/quarantine') {
-        if (!isAdminAuthorized(req)) {
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+        if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
             return;
         }
 
@@ -814,9 +843,7 @@ const server = http.createServer(async (req, res) => {
 
     const adminQuarantineDeleteMatch = pathname.match(/^\/admin\/quarantine\/(.+)$/);
     if (adminQuarantineDeleteMatch) {
-        if (!isAdminAuthorized(req)) {
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+        if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
             return;
         }
         if (req.method !== 'DELETE') {
@@ -852,9 +879,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === '/admin/refresh-groups') {
-        if (!isAdminAuthorized(req)) {
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+        if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
             return;
         }
         if (!API_TOKEN) {
@@ -874,9 +899,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === '/admin/refresh-stats') {
-        if (!isAdminAuthorized(req)) {
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+        if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
             return;
         }
         if (!API_TOKEN) {
@@ -896,9 +919,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (pathname === '/admin/debug/stats') {
-        if (!isAdminAuthorized(req)) {
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+        if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
             return;
         }
         const cb = circuitBreaker.status();
@@ -916,9 +937,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (debugTokenValue) {
-        if (!isAdminAuthorized(req)) {
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'error', code: 'ADMIN_AUTH_REQUIRED', request_id: requestId }));
+        if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
             return;
         }
         const debugToken = debugTokenValue;
@@ -1321,6 +1340,8 @@ async function start() {
         console.log(`🗃️ Cache: ttl=${CACHE_TTL_SEC}s stale-if-error=${CACHE_STALE_IF_ERROR_SEC}s max_entries=${CACHE_MAX_ENTRIES}`);
         console.log(`🚦 Rate limit: ${RATE_LIMIT_PER_MINUTE}/min, burst=${RATE_LIMIT_BURST_10S}/10s`);
         console.log(`🎟️ Token rate limit: ${TOKEN_RATE_LIMIT_PER_MINUTE}/min, burst=${TOKEN_RATE_LIMIT_BURST_10S}/10s`);
+        console.log(`🔐 Admin rate limit: ${ADMIN_RATE_LIMIT_PER_MINUTE}/min, burst=${ADMIN_RATE_LIMIT_BURST_10S}/10s`);
+        console.log(`🌐 Trust X-Forwarded-For: ${TRUST_X_FORWARDED_FOR ? '✅' : '❌'}`);
         console.log(`⏱️ Upstream: timeout=${REQUEST_TIMEOUT_MS}ms redirects=${MAX_REDIRECTS}`);
         console.log(`🧱 Circuit breaker: fails=${CIRCUIT_BREAKER_FAILURES} open=${CIRCUIT_BREAKER_OPEN_SEC}s`);
         console.log(`🚫 Quarantine: ${QUARANTINE_NODES.length} nodes`);

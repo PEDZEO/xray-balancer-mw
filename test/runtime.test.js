@@ -24,6 +24,16 @@ test('token cache can return stale within configured window', async () => {
     assert.equal(cache.getStale('tok', 0), null);
 });
 
+test('stale reads do not extend stale window lifetime', async () => {
+    const cache = createTokenCache(1, 10);
+    cache.set('tok', '{"ok":true}', {});
+    await new Promise(r => setTimeout(r, 1100));
+
+    assert.ok(cache.getStale('tok', 2));
+    await new Promise(r => setTimeout(r, 1100));
+    assert.equal(cache.getStale('tok', 2), null);
+});
+
 test('token cache evicts oldest items when limit exceeded', () => {
     const cache = createTokenCache(30, 2);
     cache.set('a', 'A', {});
@@ -58,4 +68,23 @@ test('keyed limiter keeps bounded number of token buckets', () => {
 
     assert.equal(limiter.allow('t4', 1003), true);
     assert.equal(limiter.size(), 3);
+});
+
+test('keyed limiter performs cleanup only after cleanup interval', () => {
+    const limiter = createKeyedRateLimiter(100, 100, {
+        idleMs: 1000,
+        cleanupBatch: 100,
+        cleanupIntervalMs: 10000,
+        maxEntries: 10,
+    });
+
+    assert.equal(limiter.allow('t1', 0), true);
+    assert.equal(limiter.allow('t2', 1), true);
+    assert.equal(limiter.size(), 2);
+
+    assert.equal(limiter.allow('t3', 2000), true);
+    assert.equal(limiter.size(), 3);
+
+    assert.equal(limiter.allow('t4', 10001), true);
+    assert.equal(limiter.size(), 1);
 });

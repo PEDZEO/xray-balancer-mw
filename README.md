@@ -91,6 +91,13 @@ API_TOKEN=eyJhbGciOi...
 
 # Cookie для панели за nginx (egam.es). Пусто если не нужно
 PANEL_AUTH_COOKIE=
+
+# Доверять X-Forwarded-For для IP-лимитов (включай только за доверенным reverse proxy)
+TRUST_X_FORWARDED_FOR=false
+
+# Лимиты для /admin/* (защита от brute-force/abuse)
+ADMIN_RATE_LIMIT_PER_MINUTE=60
+ADMIN_RATE_LIMIT_BURST_10S=20
 ```
 
 > ⚠️ `.env` содержит секреты и **не попадает в git** (добавлен в `.gitignore`)
