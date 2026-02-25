@@ -5,8 +5,11 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      - CONFIG_RUNTIME_PATH=/app/runtime/config.runtime.json
     volumes:
       - ./config.json:/app/config.json:ro
+      - ./runtime:/app/runtime
     networks:
       - remnawave-network
 

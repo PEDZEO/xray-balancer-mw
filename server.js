@@ -19,9 +19,26 @@ const { createRequestGuard } = require('./lib/request-guard');
 
 // ─── Загрузка конфига ───
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
+const CONFIG_RUNTIME_PATH = process.env.CONFIG_RUNTIME_PATH || '';
+const MUTABLE_CONFIG_KEYS = [
+    'groups',
+    'fastest_group',
+    'fastest_group_name',
+    'fastest_exclude_groups',
+    'quarantine_nodes',
+];
 let config;
 try {
     config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    if (CONFIG_RUNTIME_PATH && fs.existsSync(CONFIG_RUNTIME_PATH)) {
+        const runtimePatchRaw = fs.readFileSync(CONFIG_RUNTIME_PATH, 'utf8');
+        if (runtimePatchRaw.trim()) {
+            const runtimePatch = JSON.parse(runtimePatchRaw);
+            if (runtimePatch && typeof runtimePatch === 'object' && !Array.isArray(runtimePatch)) {
+                config = { ...config, ...runtimePatch };
+            }
+        }
+    }
     validateConfig(config);
 } catch (err) {
     console.error(`❌ Ошибка чтения ${CONFIG_PATH}:`, err.message);
@@ -194,9 +211,19 @@ function isAdminAuthorized(req) {
 }
 
 function writeConfigFile(nextConfig) {
-    const tempPath = `${CONFIG_PATH}.tmp`;
-    fs.writeFileSync(tempPath, JSON.stringify(nextConfig, null, 2));
-    fs.renameSync(tempPath, CONFIG_PATH);
+    const targetPath = CONFIG_RUNTIME_PATH || CONFIG_PATH;
+    const payload = CONFIG_RUNTIME_PATH
+        ? Object.fromEntries(MUTABLE_CONFIG_KEYS.map((key) => [key, nextConfig[key]]).filter(([_, value]) => value !== undefined))
+        : nextConfig;
+
+    const targetDir = path.dirname(targetPath);
+    if (!fs.existsSync(targetDir)) {
+        fs.mkdirSync(targetDir, { recursive: true });
+    }
+
+    const tempPath = `${targetPath}.tmp`;
+    fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2));
+    fs.renameSync(tempPath, targetPath);
 }
 
 function persistConfigIfPossible(nextConfig, requestId) {
@@ -1289,6 +1316,7 @@ async function start() {
         console.log(`⏱️ Upstream: timeout=${REQUEST_TIMEOUT_MS}ms redirects=${MAX_REDIRECTS}`);
         console.log(`🧱 Circuit breaker: fails=${CIRCUIT_BREAKER_FAILURES} open=${CIRCUIT_BREAKER_OPEN_SEC}s`);
         console.log(`🚫 Quarantine: ${QUARANTINE_NODES.length} nodes`);
+        console.log(`💾 Runtime config: ${CONFIG_RUNTIME_PATH || CONFIG_PATH}`);
         console.log(`🛡️ Admin routes: ${ADMIN_TOKEN ? '🔒 enabled' : '⚠️ disabled (set ADMIN_TOKEN)'}`);
         console.log(`🔐 Panel cookie: ${PANEL_AUTH_COOKIE ? '✅' : '❌ (не нужен)'}`);
         console.log(`📡 Sub page: ${SUB_PAGE_URL || 'не задан'}`);

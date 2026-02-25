@@ -14,6 +14,13 @@ All endpoints below require `x-admin-token` header:
 - `/admin/quarantine` (`GET` list, `POST` add `{ "node": "name" }`)
 - `/admin/quarantine/{node}` (`DELETE` remove)
 
+## Runtime Persistence
+- Keep base `config.json` mounted read-only.
+- Persist admin UI changes (`groups`, `fastest_*`, `quarantine_nodes`) into `CONFIG_RUNTIME_PATH`.
+- Recommended compose mount:
+  - `CONFIG_RUNTIME_PATH=/app/runtime/config.runtime.json`
+  - `./runtime:/app/runtime`
+
 ## Token Rotation
 1. Generate a new token.
 2. Update `admin_token` in `config.json`.
