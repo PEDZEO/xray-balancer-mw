@@ -54,6 +54,25 @@ test('rate limiter blocks burst overflow', () => {
     assert.equal(limiter.allow(ip, 1002), false);
 });
 
+test('rate limiter cleanup cursor eventually reaches stale tail entries', () => {
+    const limiter = createRateLimiter(100, 100, {
+        idleMs: 1000,
+        cleanupBatch: 1,
+        cleanupIntervalMs: 1,
+    });
+
+    assert.equal(limiter.allow('hot', 0), true);
+    assert.equal(limiter.allow('stale-1', 0), true);
+    assert.equal(limiter.allow('stale-2', 0), true);
+    assert.equal(limiter.size(), 3);
+
+    assert.equal(limiter.allow('hot', 2000), true);
+    assert.equal(limiter.allow('hot', 2002), true);
+    assert.equal(limiter.allow('hot', 2004), true);
+
+    assert.equal(limiter.size(), 1);
+});
+
 test('keyed limiter keeps bounded number of token buckets', () => {
     const limiter = createKeyedRateLimiter(100, 100, {
         idleMs: 600000,

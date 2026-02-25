@@ -852,7 +852,14 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
-        const nodeRaw = decodeURIComponent(adminQuarantineDeleteMatch[1] || '').trim();
+        let nodeRaw = '';
+        try {
+            nodeRaw = decodeURIComponent(adminQuarantineDeleteMatch[1] || '').trim();
+        } catch {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'error', code: 'INVALID_PATH_ENCODING', request_id: requestId }));
+            return;
+        }
         const normalized = normalizeNodeName(nodeRaw);
         if (!normalized) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
