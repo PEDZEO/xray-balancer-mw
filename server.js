@@ -26,6 +26,20 @@ const MUTABLE_CONFIG_KEYS = [
     'fastest_group_name',
     'fastest_exclude_groups',
     'quarantine_nodes',
+    'auto_quarantine_enabled',
+    'auto_quarantine_failures',
+    'auto_quarantine_release_successes',
+    'auto_quarantine_max_nodes',
+    'auto_drain_enabled',
+    'auto_drain_failures',
+    'auto_drain_release_successes',
+    'auto_drain_load_threshold',
+    'auto_drain_score_penalty',
+    'balancer_load_weight',
+    'balancer_latency_weight',
+    'balancer_max_latency_ms',
+    'balancer_smoothing_alpha',
+    'balancer_hysteresis_delta',
 ];
 let config;
 try {
@@ -867,6 +881,20 @@ const server = http.createServer(async (req, res) => {
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
                 quarantine_nodes: QUARANTINE_NODES,
+                auto_quarantine_enabled: config.auto_quarantine_enabled === true,
+                auto_quarantine_failures: config.auto_quarantine_failures,
+                auto_quarantine_release_successes: config.auto_quarantine_release_successes,
+                auto_quarantine_max_nodes: config.auto_quarantine_max_nodes,
+                auto_drain_enabled: config.auto_drain_enabled === true,
+                auto_drain_failures: config.auto_drain_failures,
+                auto_drain_release_successes: config.auto_drain_release_successes,
+                auto_drain_load_threshold: config.auto_drain_load_threshold,
+                auto_drain_score_penalty: config.auto_drain_score_penalty,
+                balancer_load_weight: config.balancer_load_weight,
+                balancer_latency_weight: config.balancer_latency_weight,
+                balancer_max_latency_ms: config.balancer_max_latency_ms,
+                balancer_smoothing_alpha: config.balancer_smoothing_alpha,
+                balancer_hysteresis_delta: config.balancer_hysteresis_delta,
             }));
             return;
         }
@@ -889,6 +917,11 @@ const server = http.createServer(async (req, res) => {
             if (incomingExclude !== undefined) nextConfig.fastest_exclude_groups = incomingExclude;
             if (incomingFastest !== undefined) nextConfig.fastest_group = incomingFastest;
             if (incomingFastestName !== undefined) nextConfig.fastest_group_name = incomingFastestName;
+            for (const key of MUTABLE_CONFIG_KEYS) {
+                if (payload[key] !== undefined) {
+                    nextConfig[key] = payload[key];
+                }
+            }
 
             validateConfig(nextConfig);
             config = nextConfig;
@@ -914,6 +947,20 @@ const server = http.createServer(async (req, res) => {
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
                 quarantine_nodes: QUARANTINE_NODES,
+                auto_quarantine_enabled: config.auto_quarantine_enabled === true,
+                auto_quarantine_failures: config.auto_quarantine_failures,
+                auto_quarantine_release_successes: config.auto_quarantine_release_successes,
+                auto_quarantine_max_nodes: config.auto_quarantine_max_nodes,
+                auto_drain_enabled: config.auto_drain_enabled === true,
+                auto_drain_failures: config.auto_drain_failures,
+                auto_drain_release_successes: config.auto_drain_release_successes,
+                auto_drain_load_threshold: config.auto_drain_load_threshold,
+                auto_drain_score_penalty: config.auto_drain_score_penalty,
+                balancer_load_weight: config.balancer_load_weight,
+                balancer_latency_weight: config.balancer_latency_weight,
+                balancer_max_latency_ms: config.balancer_max_latency_ms,
+                balancer_smoothing_alpha: config.balancer_smoothing_alpha,
+                balancer_hysteresis_delta: config.balancer_hysteresis_delta,
                 persisted: persistResult.persisted,
                 persist_error: persistResult.error,
             }));
