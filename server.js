@@ -97,6 +97,32 @@ const AUTO_QUARANTINE_FAILURES = parseInt(process.env.AUTO_QUARANTINE_FAILURES, 
 const AUTO_QUARANTINE_RELEASE_SUCCESSES =
     parseInt(process.env.AUTO_QUARANTINE_RELEASE_SUCCESSES, 10) || config.auto_quarantine_release_successes || 2;
 const AUTO_QUARANTINE_MAX_NODES = parseInt(process.env.AUTO_QUARANTINE_MAX_NODES, 10) || config.auto_quarantine_max_nodes || 100;
+const AUTO_DRAIN_ENABLED = process.env.AUTO_DRAIN_ENABLED === 'true' || config.auto_drain_enabled === true;
+const AUTO_DRAIN_FAILURES = parseInt(process.env.AUTO_DRAIN_FAILURES, 10) || config.auto_drain_failures || 2;
+const AUTO_DRAIN_RELEASE_SUCCESSES = parseInt(process.env.AUTO_DRAIN_RELEASE_SUCCESSES, 10)
+    || config.auto_drain_release_successes
+    || 2;
+const AUTO_DRAIN_LOAD_THRESHOLD = Number.isFinite(parseFloat(process.env.AUTO_DRAIN_LOAD_THRESHOLD))
+    ? parseFloat(process.env.AUTO_DRAIN_LOAD_THRESHOLD)
+    : (Number.isFinite(config.auto_drain_load_threshold) ? config.auto_drain_load_threshold : 0.85);
+const AUTO_DRAIN_SCORE_PENALTY = Number.isFinite(parseFloat(process.env.AUTO_DRAIN_SCORE_PENALTY))
+    ? parseFloat(process.env.AUTO_DRAIN_SCORE_PENALTY)
+    : (Number.isFinite(config.auto_drain_score_penalty) ? config.auto_drain_score_penalty : 0.6);
+const BALANCER_LOAD_WEIGHT = Number.isFinite(parseFloat(process.env.BALANCER_LOAD_WEIGHT))
+    ? parseFloat(process.env.BALANCER_LOAD_WEIGHT)
+    : (Number.isFinite(config.balancer_load_weight) ? config.balancer_load_weight : 0.4);
+const BALANCER_LATENCY_WEIGHT = Number.isFinite(parseFloat(process.env.BALANCER_LATENCY_WEIGHT))
+    ? parseFloat(process.env.BALANCER_LATENCY_WEIGHT)
+    : (Number.isFinite(config.balancer_latency_weight) ? config.balancer_latency_weight : 0.6);
+const BALANCER_MAX_LATENCY_MS = parseInt(process.env.BALANCER_MAX_LATENCY_MS, 10)
+    || config.balancer_max_latency_ms
+    || 300;
+const BALANCER_SMOOTHING_ALPHA = Number.isFinite(parseFloat(process.env.BALANCER_SMOOTHING_ALPHA))
+    ? parseFloat(process.env.BALANCER_SMOOTHING_ALPHA)
+    : (Number.isFinite(config.balancer_smoothing_alpha) ? config.balancer_smoothing_alpha : 0.35);
+const BALANCER_HYSTERESIS_DELTA = Number.isFinite(parseFloat(process.env.BALANCER_HYSTERESIS_DELTA))
+    ? parseFloat(process.env.BALANCER_HYSTERESIS_DELTA)
+    : (Number.isFinite(config.balancer_hysteresis_delta) ? config.balancer_hysteresis_delta : 0.08);
 const READY_SUCCESS_WINDOW_SEC = pickRuntimeInt('READY_SUCCESS_WINDOW_SEC', 'ready_success_window_sec');
 const REQUEST_TIMEOUT_MS = pickRuntimeInt('REQUEST_TIMEOUT_MS', 'request_timeout_ms');
 const MAX_REDIRECTS = pickRuntimeInt('MAX_REDIRECTS', 'max_redirects');
@@ -163,6 +189,9 @@ const requestGuard = createRequestGuard({
     circuitBreaker,
     stats: runtimeStats,
 });
+const autoDrainState = new Map();
+const autoDrainNodes = new Set();
+const balancerRankState = new Map();
 
 // ─── Утилиты ───
 
@@ -330,9 +359,7 @@ function updateAutoQuarantineFromNodes(nodes) {
         const usersOnline = node.usersOnline || 0;
         const totalRamGb = parseRamGb(node.totalRam);
         const cpuCount = node.cpuCount || 1;
-        const ramLoad = totalRamGb > 0 ? usersOnline / totalRamGb : 999;
-        const cpuLoad = cpuCount > 0 ? usersOnline / cpuCount : 999;
-        const load = Math.max(ramLoad / MAX_USERS_PER_GB, cpuLoad / MAX_USERS_PER_CPU);
+        const { load } = computeNodeLoad(usersOnline, totalRamGb, cpuCount);
         const degraded = !isConnected || isDisabled || load > 1.0;
 
         const prev = autoQuarantineState.get(nodeName) || { fail: 0, ok: 0, auto: false };
@@ -422,6 +449,72 @@ function parseRamGb(ramStr) {
     return val;
 }
 
+function computeNodeLoad(usersOnline, totalRamGb, cpuCount) {
+    const ramLoad = totalRamGb > 0 ? usersOnline / totalRamGb : 999;
+    const cpuLoad = cpuCount > 0 ? usersOnline / cpuCount : 999;
+    const ramNorm = ramLoad / MAX_USERS_PER_GB;
+    const cpuNorm = cpuLoad / MAX_USERS_PER_CPU;
+    const load = Math.max(ramNorm, cpuNorm);
+    return { ramLoad, cpuLoad, load };
+}
+
+function updateAutoDrainFromNodes(nodes) {
+    if (!AUTO_DRAIN_ENABLED || !Array.isArray(nodes) || nodes.length === 0) return;
+
+    const activeNames = new Set();
+    for (const node of nodes) {
+        const nodeName = (node.name || '').toString().trim();
+        if (!nodeName) continue;
+        activeNames.add(nodeName);
+
+        const usersOnline = node.usersOnline || 0;
+        const totalRamGb = parseRamGb(node.totalRam);
+        const cpuCount = node.cpuCount || 1;
+        const isConnected = Boolean(node.isConnected);
+        const isDisabled = Boolean(node.isDisabled);
+        const { load } = computeNodeLoad(usersOnline, totalRamGb, cpuCount);
+        const degraded = !isConnected || isDisabled || load >= AUTO_DRAIN_LOAD_THRESHOLD;
+
+        const prev = autoDrainState.get(nodeName) || { fail: 0, ok: 0, drained: false };
+        if (degraded) {
+            prev.fail += 1;
+            prev.ok = 0;
+        } else {
+            prev.ok += 1;
+            prev.fail = 0;
+        }
+
+        const normalizedName = normalizeNodeName(nodeName);
+        if (!prev.drained && prev.fail >= AUTO_DRAIN_FAILURES) {
+            prev.drained = true;
+            if (normalizedName) autoDrainNodes.add(normalizedName);
+            logger.warn('auto_drain_added', {
+                node: nodeName,
+                load,
+                fail_count: prev.fail,
+                threshold: AUTO_DRAIN_LOAD_THRESHOLD,
+            });
+        } else if (prev.drained && prev.ok >= AUTO_DRAIN_RELEASE_SUCCESSES) {
+            prev.drained = false;
+            if (normalizedName) autoDrainNodes.delete(normalizedName);
+            logger.info('auto_drain_released', {
+                node: nodeName,
+                load,
+                success_count: prev.ok,
+            });
+        }
+
+        autoDrainState.set(nodeName, prev);
+    }
+
+    for (const nodeName of autoDrainState.keys()) {
+        if (!activeNames.has(nodeName)) {
+            autoDrainState.delete(nodeName);
+            autoDrainNodes.delete(normalizeNodeName(nodeName));
+        }
+    }
+}
+
 // ─── Node Stats — опрос панели ───
 
 async function fetchNodeStats() {
@@ -438,6 +531,7 @@ async function fetchNodeStats() {
         }
         const data = JSON.parse(response.body);
         const nodes = data.response || (Array.isArray(data) ? data : []);
+        updateAutoDrainFromNodes(nodes);
         updateAutoQuarantineFromNodes(nodes);
 
         const newCache = {};
@@ -449,15 +543,8 @@ async function fetchNodeStats() {
             const isConnected = node.isConnected || false;
             const isDisabled = node.isDisabled || false;
 
-            // Нагрузка по RAM и CPU отдельно
-            const ramLoad = totalRamGb > 0 ? usersOnline / totalRamGb : 999;
-            const cpuLoad = cpuCount > 0 ? usersOnline / cpuCount : 999;
-
-            // Нормализованная нагрузка: 0..1 = нормально, >1 = перегружен
-            // Берём ХУДШИЙ из двух показателей (bottleneck)
-            const ramNorm = ramLoad / MAX_USERS_PER_GB;
-            const cpuNorm = cpuLoad / MAX_USERS_PER_CPU;
-            const load = Math.round(Math.max(ramNorm, cpuNorm) * 100) / 100;
+            const { ramLoad, cpuLoad, load } = computeNodeLoad(usersOnline, totalRamGb, cpuCount);
+            const normalizedLoad = Math.round(load * 100) / 100;
 
             newCache[name] = {
                 usersOnline,
@@ -465,7 +552,7 @@ async function fetchNodeStats() {
                 cpuCount,
                 ramLoad: Math.round(ramLoad * 100) / 100,
                 cpuLoad: Math.round(cpuLoad * 100) / 100,
-                load,
+                load: normalizedLoad,
                 isConnected,
                 isDisabled,
                 isAlias: false,
@@ -758,6 +845,8 @@ const server = http.createServer(async (req, res) => {
             quarantine_nodes: QUARANTINE_NODES,
             quarantine_count: QUARANTINE_NODES.length,
             auto_quarantine_enabled: AUTO_QUARANTINE_ENABLED,
+            auto_drain_enabled: AUTO_DRAIN_ENABLED,
+            auto_drain_count: autoDrainNodes.size,
             sub_page: SUB_PAGE_URL || 'disabled',
         }));
         return;
@@ -1251,7 +1340,17 @@ const server = http.createServer(async (req, res) => {
         // ─── Фильтрация и сортировка по нагрузке ───
         if (NODE_STATS_ENABLED && Object.keys(nodeStatsCache).length > 0) {
             const before = allOutbounds.length;
-            allOutbounds = filterAndSortByLoad(allOutbounds, nodeStatsCache);
+            allOutbounds = filterAndSortByLoad(allOutbounds, nodeStatsCache, {
+                drainSet: autoDrainNodes,
+                rankState: balancerRankState,
+                keepOverloadedWhenDrained: true,
+                drainPenalty: AUTO_DRAIN_SCORE_PENALTY,
+                loadWeight: BALANCER_LOAD_WEIGHT,
+                latencyWeight: BALANCER_LATENCY_WEIGHT,
+                maxLatencyMs: BALANCER_MAX_LATENCY_MS,
+                smoothingAlpha: BALANCER_SMOOTHING_ALPHA,
+                hysteresisDelta: BALANCER_HYSTERESIS_DELTA,
+            });
             const after = allOutbounds.length;
             if (before !== after) {
                 logger.info('outbounds_filtered_by_load', { request_id: requestId, before, after });
@@ -1311,18 +1410,7 @@ const server = http.createServer(async (req, res) => {
             }
         }
 
-        // ─── Сортировка внутри групп по нагрузке (без повторной фильтрации) ───
-        if (NODE_STATS_ENABLED && Object.keys(nodeStatsCache).length > 0) {
-            for (const [groupName, obs] of Object.entries(grouped)) {
-                grouped[groupName] = obs.slice().sort((a, b) => {
-                    const sa = getNodeStats(nodeStatsCache, a.tag);
-                    const sb = getNodeStats(nodeStatsCache, b.tag);
-                    const la = sa ? sa.load : 0.5;
-                    const lb = sb ? sb.load : 0.5;
-                    return la - lb;
-                });
-            }
-        }
+        // Внутригрупповой порядок уже унаследован из allOutbounds после score-based сортировки.
 
         // ─── Конфиги ───
         const resultConfigs = [];
@@ -1461,6 +1549,12 @@ async function start() {
         console.log(`🌐 Trust X-Forwarded-For: ${TRUST_X_FORWARDED_FOR ? '✅' : '❌'}`);
         console.log(
             `🩺 Auto quarantine: ${AUTO_QUARANTINE_ENABLED ? `✅ (fails=${AUTO_QUARANTINE_FAILURES}, release=${AUTO_QUARANTINE_RELEASE_SUCCESSES}, max=${AUTO_QUARANTINE_MAX_NODES})` : '❌'}`
+        );
+        console.log(
+            `💧 Auto drain: ${AUTO_DRAIN_ENABLED ? `✅ (fails=${AUTO_DRAIN_FAILURES}, release=${AUTO_DRAIN_RELEASE_SUCCESSES}, threshold=${AUTO_DRAIN_LOAD_THRESHOLD}, penalty=${AUTO_DRAIN_SCORE_PENALTY})` : '❌'}`
+        );
+        console.log(
+            `📈 Score model: load_weight=${BALANCER_LOAD_WEIGHT} latency_weight=${BALANCER_LATENCY_WEIGHT} max_latency=${BALANCER_MAX_LATENCY_MS}ms alpha=${BALANCER_SMOOTHING_ALPHA} hysteresis=${BALANCER_HYSTERESIS_DELTA}`
         );
         console.log(`⏱️ Upstream: timeout=${REQUEST_TIMEOUT_MS}ms redirects=${MAX_REDIRECTS}`);
         console.log(`🧱 Circuit breaker: fails=${CIRCUIT_BREAKER_FAILURES} open=${CIRCUIT_BREAKER_OPEN_SEC}s`);
