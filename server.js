@@ -92,6 +92,11 @@ const TOKEN_LIMITER_CLEANUP_BATCH = parseInt(process.env.TOKEN_LIMITER_CLEANUP_B
 const TRUST_X_FORWARDED_FOR = process.env.TRUST_X_FORWARDED_FOR === 'true' || config.trust_x_forwarded_for === true;
 const ADMIN_RATE_LIMIT_PER_MINUTE = parseInt(process.env.ADMIN_RATE_LIMIT_PER_MINUTE, 10) || config.admin_rate_limit_per_minute || 60;
 const ADMIN_RATE_LIMIT_BURST_10S = parseInt(process.env.ADMIN_RATE_LIMIT_BURST_10S, 10) || config.admin_rate_limit_burst_10s || 20;
+const AUTO_QUARANTINE_ENABLED = process.env.AUTO_QUARANTINE_ENABLED === 'true' || config.auto_quarantine_enabled === true;
+const AUTO_QUARANTINE_FAILURES = parseInt(process.env.AUTO_QUARANTINE_FAILURES, 10) || config.auto_quarantine_failures || 3;
+const AUTO_QUARANTINE_RELEASE_SUCCESSES =
+    parseInt(process.env.AUTO_QUARANTINE_RELEASE_SUCCESSES, 10) || config.auto_quarantine_release_successes || 2;
+const AUTO_QUARANTINE_MAX_NODES = parseInt(process.env.AUTO_QUARANTINE_MAX_NODES, 10) || config.auto_quarantine_max_nodes || 100;
 const READY_SUCCESS_WINDOW_SEC = pickRuntimeInt('READY_SUCCESS_WINDOW_SEC', 'ready_success_window_sec');
 const REQUEST_TIMEOUT_MS = pickRuntimeInt('REQUEST_TIMEOUT_MS', 'request_timeout_ms');
 const MAX_REDIRECTS = pickRuntimeInt('MAX_REDIRECTS', 'max_redirects');
@@ -129,6 +134,7 @@ let lastUpstreamSuccessAt = 0;
 let lastUpstreamError = null;
 let lastNodeStatsRefreshAt = 0;
 let lastNodeStatsError = null;
+const autoQuarantineState = new Map();
 const subscriptionCache = createTokenCache(CACHE_TTL_SEC, CACHE_MAX_ENTRIES);
 const rateLimiter = createRateLimiter(RATE_LIMIT_PER_MINUTE, RATE_LIMIT_BURST_10S);
 const tokenRateLimiter = createKeyedRateLimiter(TOKEN_RATE_LIMIT_PER_MINUTE, TOKEN_RATE_LIMIT_BURST_10S, {
@@ -275,6 +281,108 @@ function persistConfigIfPossible(nextConfig, requestId) {
     }
 }
 
+function upsertQuarantineNode(nodeName, requestId) {
+    const normalized = normalizeNodeName(nodeName);
+    if (!normalized) return { changed: false, persisted: true, error: null };
+    const existing = new Set(QUARANTINE_NODES.map(normalizeNodeName));
+    if (existing.has(normalized)) return { changed: false, persisted: true, error: null };
+
+    if (QUARANTINE_NODES.length >= AUTO_QUARANTINE_MAX_NODES) {
+        return { changed: false, persisted: false, error: 'AUTO_QUARANTINE_MAX_NODES reached' };
+    }
+
+    QUARANTINE_NODES = [...QUARANTINE_NODES, nodeName];
+    const nextConfig = { ...config, quarantine_nodes: QUARANTINE_NODES };
+    validateConfig(nextConfig);
+    config = nextConfig;
+    const persistResult = persistConfigIfPossible(nextConfig, requestId);
+    return { changed: true, persisted: persistResult.persisted, error: persistResult.error };
+}
+
+function removeQuarantineNode(nodeName, requestId) {
+    const normalized = normalizeNodeName(nodeName);
+    if (!normalized) return { changed: false, persisted: true, error: null };
+    const nextNodes = QUARANTINE_NODES.filter((name) => normalizeNodeName(name) !== normalized);
+    if (nextNodes.length === QUARANTINE_NODES.length) return { changed: false, persisted: true, error: null };
+
+    QUARANTINE_NODES = nextNodes;
+    const nextConfig = { ...config, quarantine_nodes: QUARANTINE_NODES };
+    validateConfig(nextConfig);
+    config = nextConfig;
+    const persistResult = persistConfigIfPossible(nextConfig, requestId);
+    return { changed: true, persisted: persistResult.persisted, error: persistResult.error };
+}
+
+function updateAutoQuarantineFromNodes(nodes) {
+    if (!AUTO_QUARANTINE_ENABLED || !Array.isArray(nodes) || nodes.length === 0) return;
+
+    const requestId = `auto-quarantine-${Date.now()}`;
+    const activeNames = new Set();
+    const quarantinedSet = new Set(QUARANTINE_NODES.map(normalizeNodeName).filter(Boolean));
+
+    for (const node of nodes) {
+        const nodeName = (node.name || '').toString().trim();
+        if (!nodeName) continue;
+        activeNames.add(nodeName);
+
+        const isConnected = Boolean(node.isConnected);
+        const isDisabled = Boolean(node.isDisabled);
+        const usersOnline = node.usersOnline || 0;
+        const totalRamGb = parseRamGb(node.totalRam);
+        const cpuCount = node.cpuCount || 1;
+        const ramLoad = totalRamGb > 0 ? usersOnline / totalRamGb : 999;
+        const cpuLoad = cpuCount > 0 ? usersOnline / cpuCount : 999;
+        const load = Math.max(ramLoad / MAX_USERS_PER_GB, cpuLoad / MAX_USERS_PER_CPU);
+        const degraded = !isConnected || isDisabled || load > 1.0;
+
+        const prev = autoQuarantineState.get(nodeName) || { fail: 0, ok: 0, auto: false };
+        if (degraded) {
+            prev.fail += 1;
+            prev.ok = 0;
+        } else {
+            prev.ok += 1;
+            prev.fail = 0;
+        }
+
+        const normalizedNodeName = normalizeNodeName(nodeName);
+        const currentlyQuarantined = quarantinedSet.has(normalizedNodeName);
+        if (!currentlyQuarantined && prev.fail >= AUTO_QUARANTINE_FAILURES) {
+            const result = upsertQuarantineNode(nodeName, requestId);
+            if (result.changed) {
+                prev.auto = true;
+                quarantinedSet.add(normalizedNodeName);
+                logger.warn('auto_quarantine_added', {
+                    node: nodeName,
+                    fail_count: prev.fail,
+                    degraded,
+                    persisted: result.persisted,
+                    persist_error: result.error,
+                });
+            }
+        } else if (currentlyQuarantined && prev.auto && prev.ok >= AUTO_QUARANTINE_RELEASE_SUCCESSES) {
+            const result = removeQuarantineNode(nodeName, requestId);
+            if (result.changed) {
+                prev.auto = false;
+                quarantinedSet.delete(normalizedNodeName);
+                logger.info('auto_quarantine_released', {
+                    node: nodeName,
+                    success_count: prev.ok,
+                    persisted: result.persisted,
+                    persist_error: result.error,
+                });
+            }
+        }
+
+        autoQuarantineState.set(nodeName, prev);
+    }
+
+    for (const nodeName of autoQuarantineState.keys()) {
+        if (!activeNames.has(nodeName)) {
+            autoQuarantineState.delete(nodeName);
+        }
+    }
+}
+
 function readJsonBody(req, maxBytes = 512 * 1024) {
     return new Promise((resolve, reject) => {
         let raw = '';
@@ -330,6 +438,7 @@ async function fetchNodeStats() {
         }
         const data = JSON.parse(response.body);
         const nodes = data.response || (Array.isArray(data) ? data : []);
+        updateAutoQuarantineFromNodes(nodes);
 
         const newCache = {};
         for (const node of nodes) {
@@ -648,6 +757,7 @@ const server = http.createServer(async (req, res) => {
             cached_nodes: Object.keys(nodeStatsCache).length,
             quarantine_nodes: QUARANTINE_NODES,
             quarantine_count: QUARANTINE_NODES.length,
+            auto_quarantine_enabled: AUTO_QUARANTINE_ENABLED,
             sub_page: SUB_PAGE_URL || 'disabled',
         }));
         return;
@@ -1349,6 +1459,9 @@ async function start() {
         console.log(`🎟️ Token rate limit: ${TOKEN_RATE_LIMIT_PER_MINUTE}/min, burst=${TOKEN_RATE_LIMIT_BURST_10S}/10s`);
         console.log(`🔐 Admin rate limit: ${ADMIN_RATE_LIMIT_PER_MINUTE}/min, burst=${ADMIN_RATE_LIMIT_BURST_10S}/10s`);
         console.log(`🌐 Trust X-Forwarded-For: ${TRUST_X_FORWARDED_FOR ? '✅' : '❌'}`);
+        console.log(
+            `🩺 Auto quarantine: ${AUTO_QUARANTINE_ENABLED ? `✅ (fails=${AUTO_QUARANTINE_FAILURES}, release=${AUTO_QUARANTINE_RELEASE_SUCCESSES}, max=${AUTO_QUARANTINE_MAX_NODES})` : '❌'}`
+        );
         console.log(`⏱️ Upstream: timeout=${REQUEST_TIMEOUT_MS}ms redirects=${MAX_REDIRECTS}`);
         console.log(`🧱 Circuit breaker: fails=${CIRCUIT_BREAKER_FAILURES} open=${CIRCUIT_BREAKER_OPEN_SEC}s`);
         console.log(`🚫 Quarantine: ${QUARANTINE_NODES.length} nodes`);
