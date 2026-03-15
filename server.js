@@ -15,6 +15,7 @@ const { buildLogger } = require('./lib/log');
 const { resolveProfile } = require('./lib/profile');
 const { classifyUpstreamPayload } = require('./lib/upstream-contract');
 const { buildGroupConfig } = require('./lib/group-builder');
+const { createStickyStore } = require('./lib/sticky');
 const { createRequestGuard } = require('./lib/request-guard');
 
 // ─── Загрузка конфига ───
@@ -35,6 +36,9 @@ const MUTABLE_CONFIG_KEYS = [
     'auto_drain_release_successes',
     'auto_drain_load_threshold',
     'auto_drain_score_penalty',
+    'sticky_enabled',
+    'sticky_ttl_sec',
+    'sticky_max_entries',
     'balancer_load_weight',
     'balancer_latency_weight',
     'balancer_max_latency_ms',
@@ -122,6 +126,10 @@ const AUTO_DRAIN_LOAD_THRESHOLD = Number.isFinite(parseFloat(process.env.AUTO_DR
 const AUTO_DRAIN_SCORE_PENALTY = Number.isFinite(parseFloat(process.env.AUTO_DRAIN_SCORE_PENALTY))
     ? parseFloat(process.env.AUTO_DRAIN_SCORE_PENALTY)
     : (Number.isFinite(config.auto_drain_score_penalty) ? config.auto_drain_score_penalty : 0.6);
+const STICKY_ENABLED = process.env.STICKY_ENABLED === 'true'
+    || (process.env.STICKY_ENABLED !== 'false' && config.sticky_enabled === true);
+const STICKY_TTL_SEC = parseInt(process.env.STICKY_TTL_SEC, 10) || config.sticky_ttl_sec || 3600;
+const STICKY_MAX_ENTRIES = parseInt(process.env.STICKY_MAX_ENTRIES, 10) || config.sticky_max_entries || 10000;
 const BALANCER_LOAD_WEIGHT = Number.isFinite(parseFloat(process.env.BALANCER_LOAD_WEIGHT))
     ? parseFloat(process.env.BALANCER_LOAD_WEIGHT)
     : (Number.isFinite(config.balancer_load_weight) ? config.balancer_load_weight : 0.4);
@@ -195,6 +203,9 @@ const runtimeStats = {
     upstream_non_json_total: 0,
     fake_config_passthrough_total: 0,
     quarantine_filtered_total: 0,
+    sticky_assignments_total: 0,
+    sticky_hits_total: 0,
+    sticky_misses_total: 0,
 };
 const logger = buildLogger();
 const requestGuard = createRequestGuard({
@@ -206,6 +217,10 @@ const requestGuard = createRequestGuard({
 const autoDrainState = new Map();
 const autoDrainNodes = new Set();
 const balancerRankState = new Map();
+const stickyStore = createStickyStore({
+    ttlSec: STICKY_TTL_SEC,
+    maxEntries: STICKY_MAX_ENTRIES,
+});
 
 // ─── Утилиты ───
 
@@ -861,6 +876,8 @@ const server = http.createServer(async (req, res) => {
             auto_quarantine_enabled: AUTO_QUARANTINE_ENABLED,
             auto_drain_enabled: AUTO_DRAIN_ENABLED,
             auto_drain_count: autoDrainNodes.size,
+            sticky_enabled: STICKY_ENABLED,
+            sticky: stickyStore.summary(),
             sub_page: SUB_PAGE_URL || 'disabled',
         }));
         return;
@@ -890,6 +907,9 @@ const server = http.createServer(async (req, res) => {
                 auto_drain_release_successes: config.auto_drain_release_successes,
                 auto_drain_load_threshold: config.auto_drain_load_threshold,
                 auto_drain_score_penalty: config.auto_drain_score_penalty,
+                sticky_enabled: config.sticky_enabled === true,
+                sticky_ttl_sec: config.sticky_ttl_sec,
+                sticky_max_entries: config.sticky_max_entries,
                 balancer_load_weight: config.balancer_load_weight,
                 balancer_latency_weight: config.balancer_latency_weight,
                 balancer_max_latency_ms: config.balancer_max_latency_ms,
@@ -956,6 +976,9 @@ const server = http.createServer(async (req, res) => {
                 auto_drain_release_successes: config.auto_drain_release_successes,
                 auto_drain_load_threshold: config.auto_drain_load_threshold,
                 auto_drain_score_penalty: config.auto_drain_score_penalty,
+                sticky_enabled: config.sticky_enabled === true,
+                sticky_ttl_sec: config.sticky_ttl_sec,
+                sticky_max_entries: config.sticky_max_entries,
                 balancer_load_weight: config.balancer_load_weight,
                 balancer_latency_weight: config.balancer_latency_weight,
                 balancer_max_latency_ms: config.balancer_max_latency_ms,
@@ -1185,6 +1208,8 @@ const server = http.createServer(async (req, res) => {
             circuit_breaker: cb,
             quarantine_nodes: QUARANTINE_NODES,
             quarantine_count: QUARANTINE_NODES.length,
+            sticky_enabled: STICKY_ENABLED,
+            sticky: stickyStore.summary(),
         }));
         return;
     }
@@ -1239,6 +1264,10 @@ const server = http.createServer(async (req, res) => {
                 token_rate_limit_burst_10s: TOKEN_RATE_LIMIT_BURST_10S,
             },
             circuit_breaker: circuitBreaker.status(),
+            sticky: {
+                enabled: STICKY_ENABLED,
+                assigned_node: STICKY_ENABLED ? stickyStore.get(debugToken)?.nodeName || null : null,
+            },
         }));
         return;
     }
@@ -1475,14 +1504,39 @@ const server = http.createServer(async (req, res) => {
             : allOutbounds;
 
         if (fastestEnabled && fastestOutbounds.length > 1) {
+            let selectedFastestOutbounds = fastestOutbounds;
+            if (STICKY_ENABLED) {
+                const stickyChoice = stickyStore.choose(token, fastestOutbounds);
+                if (stickyChoice.selected) {
+                    selectedFastestOutbounds = [stickyChoice.selected];
+                    if (stickyChoice.changed) {
+                        runtimeStats.sticky_assignments_total += 1;
+                        logger.info('sticky_assigned', {
+                            request_id: requestId,
+                            token: redactTokenPath(`/${token}`).slice(1),
+                            node: stickyChoice.selected.tag,
+                        });
+                    } else {
+                        runtimeStats.sticky_hits_total += 1;
+                    }
+                } else {
+                    runtimeStats.sticky_misses_total += 1;
+                }
+            }
             const fastestGroupName = (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME);
-            const fastestConfig = buildGroupConfig(baseConfig, fastestGroupName, fastestOutbounds, {
+            const fastestConfig = buildGroupConfig(baseConfig, fastestGroupName, selectedFastestOutbounds, {
                 probeUrl: PROBE_URL,
                 probeInterval: PROBE_INTERVAL,
                 strategy: STRATEGY,
             });
             resultConfigs.push(fastestConfig);
-            logger.info('group_fastest', { request_id: requestId, count: fastestOutbounds.length, excluded_groups: FASTEST_EXCLUDE_GROUPS });
+            logger.info('group_fastest', {
+                request_id: requestId,
+                count: selectedFastestOutbounds.length,
+                source_count: fastestOutbounds.length,
+                sticky_enabled: STICKY_ENABLED,
+                excluded_groups: FASTEST_EXCLUDE_GROUPS,
+            });
         }
 
         // Группы по странам

@@ -20,8 +20,10 @@
 2. `request-guard` decides allow/deny/fallback.
 3. If allowed, fetch upstream with profile-based timeout/redirects.
 4. Classify upstream payload.
-5. Build grouped response (or passthrough).
-6. Update cache and runtime stats.
+5. Apply node filtering: load stats and quarantine.
+6. Apply sticky fastest selection for the current token when enabled.
+7. Build grouped response (or passthrough).
+8. Update cache and runtime stats.
 
 ## Operational Endpoints
 - Public: `/health`, `/ready`

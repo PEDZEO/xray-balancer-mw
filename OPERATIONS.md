@@ -35,6 +35,12 @@ Admin endpoints are also rate-limited (`admin_rate_limit_per_minute`, `admin_rat
 - Increase `request_timeout_ms` in config.
 - Ensure `profile_mode` is not too aggressive.
 
+### Users are flapping between nodes in fastest-group
+- Enable `sticky_enabled: true`.
+- Start with `sticky_ttl_sec: 1800` or `3600`.
+- Check `/admin/debug/token/{token}` to see `sticky.assigned_node`.
+- Check `/admin/debug/stats` for `sticky_assignments_total` and `sticky_hits_total`.
+
 ### Massive request bursts
 - Tighten `rate_limit_per_minute` and `token_rate_limit_per_minute`.
 - Check logs for `rate_limited` and `token_rate_limited` events.
