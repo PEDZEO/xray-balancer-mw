@@ -26,6 +26,8 @@ const MUTABLE_CONFIG_KEYS = [
     'fastest_group',
     'fastest_group_name',
     'fastest_exclude_groups',
+    'probe_interval',
+    'fastest_probe_url',
     'quarantine_nodes',
     'auto_quarantine_enabled',
     'auto_quarantine_failures',
@@ -37,6 +39,7 @@ const MUTABLE_CONFIG_KEYS = [
     'auto_drain_load_threshold',
     'auto_drain_score_penalty',
     'sticky_enabled',
+    'sticky_mode',
     'sticky_ttl_sec',
     'sticky_max_entries',
     'balancer_load_weight',
@@ -84,6 +87,7 @@ const STRATEGY = config.strategy || 'leastLoad';
 const PROBE_INTERVAL = config.probe_interval || '3m';
 const PROBE_URL = config.probe_url || 'https://www.gstatic.com/generate_204';
 const FASTEST_PROBE_URL = config.fastest_probe_url || PROBE_URL;
+const STICKY_MODE = config.sticky_mode || 'pin';
 const PROFILE_MODE = process.env.PROFILE_MODE || config.profile_mode || 'balanced';
 const PROFILE = resolveProfile(PROFILE_MODE);
 
@@ -878,6 +882,8 @@ const server = http.createServer(async (req, res) => {
             groups: Object.keys(GROUPS),
             auto_groups: AUTO_GROUPS,
             fastest_group: config.fastest_group !== false,
+            fastest_probe_url: FASTEST_PROBE_URL,
+            probe_interval: PROBE_INTERVAL,
             node_stats: NODE_STATS_ENABLED,
             panel_auth: PANEL_AUTH_COOKIE ? true : false,
             cached_nodes: Object.keys(nodeStatsCache).length,
@@ -887,6 +893,7 @@ const server = http.createServer(async (req, res) => {
             auto_drain_enabled: AUTO_DRAIN_ENABLED,
             auto_drain_count: autoDrainNodes.size,
             sticky_enabled: STICKY_ENABLED,
+            sticky_mode: STICKY_MODE,
             sticky: stickyStore.summary(),
             sub_page: SUB_PAGE_URL || 'disabled',
         }));
@@ -918,8 +925,11 @@ const server = http.createServer(async (req, res) => {
                 auto_drain_load_threshold: config.auto_drain_load_threshold,
                 auto_drain_score_penalty: config.auto_drain_score_penalty,
                 sticky_enabled: config.sticky_enabled === true,
+                sticky_mode: config.sticky_mode || 'pin',
                 sticky_ttl_sec: config.sticky_ttl_sec,
                 sticky_max_entries: config.sticky_max_entries,
+                probe_interval: config.probe_interval || PROBE_INTERVAL,
+                fastest_probe_url: config.fastest_probe_url || config.probe_url || PROBE_URL,
                 balancer_load_weight: config.balancer_load_weight,
                 balancer_latency_weight: config.balancer_latency_weight,
                 balancer_max_latency_ms: config.balancer_max_latency_ms,
@@ -987,8 +997,11 @@ const server = http.createServer(async (req, res) => {
                 auto_drain_load_threshold: config.auto_drain_load_threshold,
                 auto_drain_score_penalty: config.auto_drain_score_penalty,
                 sticky_enabled: config.sticky_enabled === true,
+                sticky_mode: config.sticky_mode || 'pin',
                 sticky_ttl_sec: config.sticky_ttl_sec,
                 sticky_max_entries: config.sticky_max_entries,
+                probe_interval: config.probe_interval || PROBE_INTERVAL,
+                fastest_probe_url: config.fastest_probe_url || config.probe_url || PROBE_URL,
                 balancer_load_weight: config.balancer_load_weight,
                 balancer_latency_weight: config.balancer_latency_weight,
                 balancer_max_latency_ms: config.balancer_max_latency_ms,
@@ -1516,15 +1529,20 @@ const server = http.createServer(async (req, res) => {
         if (fastestEnabled && fastestOutbounds.length > 1) {
             let selectedFastestOutbounds = fastestOutbounds;
             if (STICKY_ENABLED) {
-                const stickyChoice = stickyStore.choose(token, fastestOutbounds);
+                const stickyChoice = STICKY_MODE === 'prefer'
+                    ? stickyStore.prefer(token, fastestOutbounds)
+                    : stickyStore.choose(token, fastestOutbounds);
                 if (stickyChoice.selected) {
-                    selectedFastestOutbounds = [stickyChoice.selected];
+                    selectedFastestOutbounds = STICKY_MODE === 'prefer'
+                        ? stickyChoice.orderedOutbounds
+                        : [stickyChoice.selected];
                     if (stickyChoice.changed) {
                         runtimeStats.sticky_assignments_total += 1;
                         logger.info('sticky_assigned', {
                             request_id: requestId,
                             token: redactTokenPath(`/${token}`).slice(1),
                             node: stickyChoice.selected.tag,
+                            sticky_mode: STICKY_MODE,
                         });
                     } else {
                         runtimeStats.sticky_hits_total += 1;
@@ -1545,6 +1563,7 @@ const server = http.createServer(async (req, res) => {
                 count: selectedFastestOutbounds.length,
                 source_count: fastestOutbounds.length,
                 sticky_enabled: STICKY_ENABLED,
+                sticky_mode: STICKY_MODE,
                 excluded_groups: FASTEST_EXCLUDE_GROUPS,
             });
         }
@@ -1651,7 +1670,8 @@ async function start() {
         console.log(`🏁 Fastest group (${fastestLabel}): ${fastestEnabled ? '✅' : '❌'}`);
         console.log(`🎯 Стратегия: ${STRATEGY} (expected=1, baselines=1s, tolerance=0.8)`);
         console.log(`🧭 Profile: ${PROFILE.name}`);
-        console.log(`📡 Probe: ${PROBE_URL} каждые ${PROBE_INTERVAL}`);
+        console.log(`📡 Probe: groups=${PROBE_URL} fastest=${FASTEST_PROBE_URL} каждые ${PROBE_INTERVAL}`);
+        console.log(`🧷 Sticky: ${STICKY_ENABLED ? `✅ (${STICKY_MODE}, ttl=${STICKY_TTL_SEC}s)` : '❌'}`);
         console.log(`📊 Node stats: ${NODE_STATS_ENABLED ? `✅ (каждые ${NODE_STATS_INTERVAL/1000}с, макс ${MAX_USERS_PER_GB} u/GB, ${MAX_USERS_PER_CPU} u/CPU)` : '❌'}`);
         console.log(`🗃️ Cache: ttl=${CACHE_TTL_SEC}s stale-if-error=${CACHE_STALE_IF_ERROR_SEC}s max_entries=${CACHE_MAX_ENTRIES}`);
         console.log(`🚦 Rate limit: ${RATE_LIMIT_PER_MINUTE}/min, burst=${RATE_LIMIT_BURST_10S}/10s`);

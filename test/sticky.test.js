@@ -33,3 +33,16 @@ test('sticky store expires entries after ttl', () => {
     assert.equal(store.get('tok', 2000)?.nodeName, 'Germany-1');
     assert.equal(store.get('tok', 4001), null);
 });
+
+test('sticky store prefer keeps selected node first but preserves full pool', () => {
+    const store = createStickyStore({ ttlSec: 60 });
+    const outbounds = [{ tag: 'Germany-1' }, { tag: 'Germany-2' }, { tag: 'USA-1' }];
+
+    const first = store.prefer('tok', outbounds, 1000);
+    assert.deepEqual(first.orderedOutbounds.map((outbound) => outbound.tag), ['Germany-1', 'Germany-2', 'USA-1']);
+    assert.equal(first.changed, true);
+
+    const second = store.prefer('tok', [{ tag: 'Germany-2' }, { tag: 'USA-1' }, { tag: 'Germany-1' }], 2000);
+    assert.deepEqual(second.orderedOutbounds.map((outbound) => outbound.tag), ['Germany-1', 'Germany-2', 'USA-1']);
+    assert.equal(second.changed, false);
+});

@@ -36,6 +36,7 @@ test('validateConfig accepts runtime and fastest-exclude options', () => {
         fastest_probe_url: 'https://ya.ru',
         fastest_exclude_groups: ['🇷🇺 White List'],
         sticky_enabled: true,
+        sticky_mode: 'prefer',
         sticky_ttl_sec: 3600,
         sticky_max_entries: 10000,
         cache_ttl_sec: 300,
@@ -53,6 +54,10 @@ test('validateConfig accepts runtime and fastest-exclude options', () => {
 
 test('validateConfig rejects malformed fastest probe url', () => {
     assert.throws(() => validateConfig({ fastest_probe_url: 'ya.ru' }), /fastest_probe_url/);
+});
+
+test('validateConfig rejects invalid sticky mode', () => {
+    assert.throws(() => validateConfig({ sticky_mode: 'smart' }), /sticky_mode/);
 });
 
 test('validateConfig rejects too many groups and overly long patterns', () => {
