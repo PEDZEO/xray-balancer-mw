@@ -17,6 +17,7 @@ const { classifyUpstreamPayload } = require('./lib/upstream-contract');
 const { buildGroupConfig } = require('./lib/group-builder');
 const { createStickyStore } = require('./lib/sticky');
 const { createRequestGuard } = require('./lib/request-guard');
+const { readEffectiveRuntime } = require('./lib/runtime-config');
 
 // ─── Загрузка конфига ───
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
@@ -84,10 +85,7 @@ const AUTO_GROUPS = config.auto_groups === true;
 const AUTO_GROUPS_INTERVAL = (config.auto_groups_interval_sec || 300) * 1000;
 
 const STRATEGY = config.strategy || 'leastLoad';
-const PROBE_INTERVAL = config.probe_interval || '3m';
 const PROBE_URL = config.probe_url || 'https://www.gstatic.com/generate_204';
-const FASTEST_PROBE_URL = config.fastest_probe_url || PROBE_URL;
-const STICKY_MODE = config.sticky_mode || 'pin';
 const PROFILE_MODE = process.env.PROFILE_MODE || config.profile_mode || 'balanced';
 const PROFILE = resolveProfile(PROFILE_MODE);
 
@@ -115,53 +113,16 @@ const TOKEN_LIMITER_CLEANUP_BATCH = parseInt(process.env.TOKEN_LIMITER_CLEANUP_B
 const TRUST_X_FORWARDED_FOR = process.env.TRUST_X_FORWARDED_FOR === 'true' || config.trust_x_forwarded_for === true;
 const ADMIN_RATE_LIMIT_PER_MINUTE = parseInt(process.env.ADMIN_RATE_LIMIT_PER_MINUTE, 10) || config.admin_rate_limit_per_minute || 60;
 const ADMIN_RATE_LIMIT_BURST_10S = parseInt(process.env.ADMIN_RATE_LIMIT_BURST_10S, 10) || config.admin_rate_limit_burst_10s || 20;
-const AUTO_QUARANTINE_ENABLED = process.env.AUTO_QUARANTINE_ENABLED === 'true' || config.auto_quarantine_enabled === true;
-const AUTO_QUARANTINE_FAILURES = parseInt(process.env.AUTO_QUARANTINE_FAILURES, 10) || config.auto_quarantine_failures || 3;
-const AUTO_QUARANTINE_RELEASE_SUCCESSES =
-    parseInt(process.env.AUTO_QUARANTINE_RELEASE_SUCCESSES, 10) || config.auto_quarantine_release_successes || 2;
-const AUTO_QUARANTINE_MAX_NODES = parseInt(process.env.AUTO_QUARANTINE_MAX_NODES, 10) || config.auto_quarantine_max_nodes || 100;
-const AUTO_DRAIN_ENABLED = process.env.AUTO_DRAIN_ENABLED === 'true' || config.auto_drain_enabled === true;
-const AUTO_DRAIN_FAILURES = parseInt(process.env.AUTO_DRAIN_FAILURES, 10) || config.auto_drain_failures || 2;
-const AUTO_DRAIN_RELEASE_SUCCESSES = parseInt(process.env.AUTO_DRAIN_RELEASE_SUCCESSES, 10)
-    || config.auto_drain_release_successes
-    || 2;
-const AUTO_DRAIN_LOAD_THRESHOLD = Number.isFinite(parseFloat(process.env.AUTO_DRAIN_LOAD_THRESHOLD))
-    ? parseFloat(process.env.AUTO_DRAIN_LOAD_THRESHOLD)
-    : (Number.isFinite(config.auto_drain_load_threshold) ? config.auto_drain_load_threshold : 0.85);
-const AUTO_DRAIN_SCORE_PENALTY = Number.isFinite(parseFloat(process.env.AUTO_DRAIN_SCORE_PENALTY))
-    ? parseFloat(process.env.AUTO_DRAIN_SCORE_PENALTY)
-    : (Number.isFinite(config.auto_drain_score_penalty) ? config.auto_drain_score_penalty : 0.6);
-const STICKY_ENABLED = process.env.STICKY_ENABLED === 'true'
-    || (process.env.STICKY_ENABLED !== 'false' && config.sticky_enabled === true);
-const STICKY_TTL_SEC = parseInt(process.env.STICKY_TTL_SEC, 10) || config.sticky_ttl_sec || 3600;
-const STICKY_MAX_ENTRIES = parseInt(process.env.STICKY_MAX_ENTRIES, 10) || config.sticky_max_entries || 10000;
-const BALANCER_LOAD_WEIGHT = Number.isFinite(parseFloat(process.env.BALANCER_LOAD_WEIGHT))
-    ? parseFloat(process.env.BALANCER_LOAD_WEIGHT)
-    : (Number.isFinite(config.balancer_load_weight) ? config.balancer_load_weight : 0.4);
-const BALANCER_LATENCY_WEIGHT = Number.isFinite(parseFloat(process.env.BALANCER_LATENCY_WEIGHT))
-    ? parseFloat(process.env.BALANCER_LATENCY_WEIGHT)
-    : (Number.isFinite(config.balancer_latency_weight) ? config.balancer_latency_weight : 0.6);
-const BALANCER_MAX_LATENCY_MS = parseInt(process.env.BALANCER_MAX_LATENCY_MS, 10)
-    || config.balancer_max_latency_ms
-    || 300;
-const BALANCER_SMOOTHING_ALPHA = Number.isFinite(parseFloat(process.env.BALANCER_SMOOTHING_ALPHA))
-    ? parseFloat(process.env.BALANCER_SMOOTHING_ALPHA)
-    : (Number.isFinite(config.balancer_smoothing_alpha) ? config.balancer_smoothing_alpha : 0.35);
-const BALANCER_HYSTERESIS_DELTA = Number.isFinite(parseFloat(process.env.BALANCER_HYSTERESIS_DELTA))
-    ? parseFloat(process.env.BALANCER_HYSTERESIS_DELTA)
-    : (Number.isFinite(config.balancer_hysteresis_delta) ? config.balancer_hysteresis_delta : 0.08);
 const READY_SUCCESS_WINDOW_SEC = pickRuntimeInt('READY_SUCCESS_WINDOW_SEC', 'ready_success_window_sec');
 const REQUEST_TIMEOUT_MS = pickRuntimeInt('REQUEST_TIMEOUT_MS', 'request_timeout_ms');
 const MAX_REDIRECTS = pickRuntimeInt('MAX_REDIRECTS', 'max_redirects');
 const CIRCUIT_BREAKER_FAILURES = pickRuntimeInt('CIRCUIT_BREAKER_FAILURES', 'circuit_breaker_failures');
 const CIRCUIT_BREAKER_OPEN_SEC = pickRuntimeInt('CIRCUIT_BREAKER_OPEN_SEC', 'circuit_breaker_open_sec');
-let FASTEST_EXCLUDE_GROUPS = Array.isArray(config.fastest_exclude_groups) ? config.fastest_exclude_groups : [];
+let FASTEST_EXCLUDE_GROUPS = [];
 const DEFAULT_FASTEST_GROUP_NAME = '🏁 🇪🇺 Самые быстрые';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || config.admin_token || '';
 const WARMUP_TOKENS = Array.isArray(config.warmup_tokens) ? config.warmup_tokens : [];
-let QUARANTINE_NODES = Array.isArray(config.quarantine_nodes)
-    ? config.quarantine_nodes.filter((name) => typeof name === 'string' && name.trim().length > 0)
-    : [];
+let QUARANTINE_NODES = [];
 
 const MAX_RESPONSE_SIZE = 10 * 1024 * 1024;
 
@@ -222,10 +183,41 @@ const requestGuard = createRequestGuard({
 const autoDrainState = new Map();
 const autoDrainNodes = new Set();
 const balancerRankState = new Map();
-const stickyStore = createStickyStore({
-    ttlSec: STICKY_TTL_SEC,
-    maxEntries: STICKY_MAX_ENTRIES,
-});
+let stickyStore = null;
+let stickyStoreConfig = null;
+
+function getRuntimeConfig() {
+    return readEffectiveRuntime(config, process.env);
+}
+
+function ensureStickyStore() {
+    const runtime = getRuntimeConfig();
+    const nextConfig = {
+        ttlSec: runtime.stickyTtlSec,
+        maxEntries: runtime.stickyMaxEntries,
+    };
+
+    if (!stickyStore
+        || !stickyStoreConfig
+        || stickyStoreConfig.ttlSec !== nextConfig.ttlSec
+        || stickyStoreConfig.maxEntries !== nextConfig.maxEntries) {
+        stickyStore = createStickyStore(nextConfig);
+        stickyStoreConfig = nextConfig;
+    }
+
+    return stickyStore;
+}
+
+function applyMutableRuntimeConfig(nextConfig) {
+    config = nextConfig;
+    GROUPS = nextConfig.groups || {};
+    const runtime = getRuntimeConfig();
+    FASTEST_EXCLUDE_GROUPS = runtime.fastestExcludeGroups;
+    QUARANTINE_NODES = runtime.quarantineNodes;
+    ensureStickyStore();
+}
+
+applyMutableRuntimeConfig(config);
 
 // ─── Утилиты ───
 
@@ -345,19 +337,20 @@ function persistConfigIfPossible(nextConfig, requestId) {
 }
 
 function upsertQuarantineNode(nodeName, requestId) {
+    const runtime = getRuntimeConfig();
     const normalized = normalizeNodeName(nodeName);
     if (!normalized) return { changed: false, persisted: true, error: null };
     const existing = new Set(QUARANTINE_NODES.map(normalizeNodeName));
     if (existing.has(normalized)) return { changed: false, persisted: true, error: null };
 
-    if (QUARANTINE_NODES.length >= AUTO_QUARANTINE_MAX_NODES) {
-        return { changed: false, persisted: false, error: 'AUTO_QUARANTINE_MAX_NODES reached' };
+    if (QUARANTINE_NODES.length >= runtime.autoQuarantineMaxNodes) {
+        return { changed: false, persisted: false, error: 'auto_quarantine_max_nodes reached' };
     }
 
     QUARANTINE_NODES = [...QUARANTINE_NODES, nodeName];
     const nextConfig = { ...config, quarantine_nodes: QUARANTINE_NODES };
     validateConfig(nextConfig);
-    config = nextConfig;
+    applyMutableRuntimeConfig(nextConfig);
     const persistResult = persistConfigIfPossible(nextConfig, requestId);
     return { changed: true, persisted: persistResult.persisted, error: persistResult.error };
 }
@@ -371,13 +364,14 @@ function removeQuarantineNode(nodeName, requestId) {
     QUARANTINE_NODES = nextNodes;
     const nextConfig = { ...config, quarantine_nodes: QUARANTINE_NODES };
     validateConfig(nextConfig);
-    config = nextConfig;
+    applyMutableRuntimeConfig(nextConfig);
     const persistResult = persistConfigIfPossible(nextConfig, requestId);
     return { changed: true, persisted: persistResult.persisted, error: persistResult.error };
 }
 
 function updateAutoQuarantineFromNodes(nodes) {
-    if (!AUTO_QUARANTINE_ENABLED || !Array.isArray(nodes) || nodes.length === 0) return;
+    const runtime = getRuntimeConfig();
+    if (!runtime.autoQuarantineEnabled || !Array.isArray(nodes) || nodes.length === 0) return;
 
     const requestId = `auto-quarantine-${Date.now()}`;
     const activeNames = new Set();
@@ -407,7 +401,7 @@ function updateAutoQuarantineFromNodes(nodes) {
 
         const normalizedNodeName = normalizeNodeName(nodeName);
         const currentlyQuarantined = quarantinedSet.has(normalizedNodeName);
-        if (!currentlyQuarantined && prev.fail >= AUTO_QUARANTINE_FAILURES) {
+        if (!currentlyQuarantined && prev.fail >= runtime.autoQuarantineFailures) {
             const result = upsertQuarantineNode(nodeName, requestId);
             if (result.changed) {
                 prev.auto = true;
@@ -420,7 +414,7 @@ function updateAutoQuarantineFromNodes(nodes) {
                     persist_error: result.error,
                 });
             }
-        } else if (currentlyQuarantined && prev.auto && prev.ok >= AUTO_QUARANTINE_RELEASE_SUCCESSES) {
+        } else if (currentlyQuarantined && prev.auto && prev.ok >= runtime.autoQuarantineReleaseSuccesses) {
             const result = removeQuarantineNode(nodeName, requestId);
             if (result.changed) {
                 prev.auto = false;
@@ -493,7 +487,8 @@ function computeNodeLoad(usersOnline, totalRamGb, cpuCount) {
 }
 
 function updateAutoDrainFromNodes(nodes) {
-    if (!AUTO_DRAIN_ENABLED || !Array.isArray(nodes) || nodes.length === 0) return;
+    const runtime = getRuntimeConfig();
+    if (!runtime.autoDrainEnabled || !Array.isArray(nodes) || nodes.length === 0) return;
 
     const activeNames = new Set();
     for (const node of nodes) {
@@ -507,7 +502,7 @@ function updateAutoDrainFromNodes(nodes) {
         const isConnected = Boolean(node.isConnected);
         const isDisabled = Boolean(node.isDisabled);
         const { load } = computeNodeLoad(usersOnline, totalRamGb, cpuCount);
-        const degraded = !isConnected || isDisabled || load >= AUTO_DRAIN_LOAD_THRESHOLD;
+        const degraded = !isConnected || isDisabled || load >= runtime.autoDrainLoadThreshold;
 
         const prev = autoDrainState.get(nodeName) || { fail: 0, ok: 0, drained: false };
         if (degraded) {
@@ -519,16 +514,16 @@ function updateAutoDrainFromNodes(nodes) {
         }
 
         const normalizedName = normalizeNodeName(nodeName);
-        if (!prev.drained && prev.fail >= AUTO_DRAIN_FAILURES) {
+        if (!prev.drained && prev.fail >= runtime.autoDrainFailures) {
             prev.drained = true;
             if (normalizedName) autoDrainNodes.add(normalizedName);
             logger.warn('auto_drain_added', {
                 node: nodeName,
                 load,
                 fail_count: prev.fail,
-                threshold: AUTO_DRAIN_LOAD_THRESHOLD,
+                threshold: runtime.autoDrainLoadThreshold,
             });
-        } else if (prev.drained && prev.ok >= AUTO_DRAIN_RELEASE_SUCCESSES) {
+        } else if (prev.drained && prev.ok >= runtime.autoDrainReleaseSuccesses) {
             prev.drained = false;
             if (normalizedName) autoDrainNodes.delete(normalizedName);
             logger.info('auto_drain_released', {
@@ -875,6 +870,8 @@ const server = http.createServer(async (req, res) => {
     const clientIp = resolveClientIp(req);
 
     if (pathname === '/health' || pathname === '/mw-health') {
+        const runtime = getRuntimeConfig();
+        const currentStickyStore = ensureStickyStore();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
             status: 'ok',
@@ -882,19 +879,19 @@ const server = http.createServer(async (req, res) => {
             groups: Object.keys(GROUPS),
             auto_groups: AUTO_GROUPS,
             fastest_group: config.fastest_group !== false,
-            fastest_probe_url: FASTEST_PROBE_URL,
-            probe_interval: PROBE_INTERVAL,
+            fastest_probe_url: runtime.fastestProbeUrl,
+            probe_interval: runtime.probeInterval,
             node_stats: NODE_STATS_ENABLED,
             panel_auth: PANEL_AUTH_COOKIE ? true : false,
             cached_nodes: Object.keys(nodeStatsCache).length,
             quarantine_nodes: QUARANTINE_NODES,
             quarantine_count: QUARANTINE_NODES.length,
-            auto_quarantine_enabled: AUTO_QUARANTINE_ENABLED,
-            auto_drain_enabled: AUTO_DRAIN_ENABLED,
+            auto_quarantine_enabled: runtime.autoQuarantineEnabled,
+            auto_drain_enabled: runtime.autoDrainEnabled,
             auto_drain_count: autoDrainNodes.size,
-            sticky_enabled: STICKY_ENABLED,
-            sticky_mode: STICKY_MODE,
-            sticky: stickyStore.summary(),
+            sticky_enabled: runtime.stickyEnabled,
+            sticky_mode: runtime.stickyMode,
+            sticky: currentStickyStore.summary(),
             sub_page: SUB_PAGE_URL || 'disabled',
         }));
         return;
@@ -906,6 +903,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method === 'GET') {
+            const runtime = getRuntimeConfig();
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
                 status: 'ok',
@@ -915,26 +913,26 @@ const server = http.createServer(async (req, res) => {
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
                 quarantine_nodes: QUARANTINE_NODES,
-                auto_quarantine_enabled: config.auto_quarantine_enabled === true,
-                auto_quarantine_failures: config.auto_quarantine_failures,
-                auto_quarantine_release_successes: config.auto_quarantine_release_successes,
-                auto_quarantine_max_nodes: config.auto_quarantine_max_nodes,
-                auto_drain_enabled: config.auto_drain_enabled === true,
-                auto_drain_failures: config.auto_drain_failures,
-                auto_drain_release_successes: config.auto_drain_release_successes,
-                auto_drain_load_threshold: config.auto_drain_load_threshold,
-                auto_drain_score_penalty: config.auto_drain_score_penalty,
-                sticky_enabled: config.sticky_enabled === true,
-                sticky_mode: config.sticky_mode || 'pin',
-                sticky_ttl_sec: config.sticky_ttl_sec,
-                sticky_max_entries: config.sticky_max_entries,
-                probe_interval: config.probe_interval || PROBE_INTERVAL,
-                fastest_probe_url: config.fastest_probe_url || config.probe_url || PROBE_URL,
-                balancer_load_weight: config.balancer_load_weight,
-                balancer_latency_weight: config.balancer_latency_weight,
-                balancer_max_latency_ms: config.balancer_max_latency_ms,
-                balancer_smoothing_alpha: config.balancer_smoothing_alpha,
-                balancer_hysteresis_delta: config.balancer_hysteresis_delta,
+                auto_quarantine_enabled: runtime.autoQuarantineEnabled,
+                auto_quarantine_failures: runtime.autoQuarantineFailures,
+                auto_quarantine_release_successes: runtime.autoQuarantineReleaseSuccesses,
+                auto_quarantine_max_nodes: runtime.autoQuarantineMaxNodes,
+                auto_drain_enabled: runtime.autoDrainEnabled,
+                auto_drain_failures: runtime.autoDrainFailures,
+                auto_drain_release_successes: runtime.autoDrainReleaseSuccesses,
+                auto_drain_load_threshold: runtime.autoDrainLoadThreshold,
+                auto_drain_score_penalty: runtime.autoDrainScorePenalty,
+                sticky_enabled: runtime.stickyEnabled,
+                sticky_mode: runtime.stickyMode,
+                sticky_ttl_sec: runtime.stickyTtlSec,
+                sticky_max_entries: runtime.stickyMaxEntries,
+                probe_interval: runtime.probeInterval,
+                fastest_probe_url: runtime.fastestProbeUrl,
+                balancer_load_weight: runtime.balancerLoadWeight,
+                balancer_latency_weight: runtime.balancerLatencyWeight,
+                balancer_max_latency_ms: runtime.balancerMaxLatencyMs,
+                balancer_smoothing_alpha: runtime.balancerSmoothingAlpha,
+                balancer_hysteresis_delta: runtime.balancerHysteresisDelta,
             }));
             return;
         }
@@ -964,9 +962,8 @@ const server = http.createServer(async (req, res) => {
             }
 
             validateConfig(nextConfig);
-            config = nextConfig;
-            GROUPS = nextConfig.groups || {};
-            FASTEST_EXCLUDE_GROUPS = Array.isArray(nextConfig.fastest_exclude_groups) ? nextConfig.fastest_exclude_groups : [];
+            applyMutableRuntimeConfig(nextConfig);
+            const runtime = getRuntimeConfig();
             const persistResult = persistConfigIfPossible(nextConfig, requestId);
 
             logger.info('admin_groups_updated', {
@@ -987,26 +984,26 @@ const server = http.createServer(async (req, res) => {
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
                 quarantine_nodes: QUARANTINE_NODES,
-                auto_quarantine_enabled: config.auto_quarantine_enabled === true,
-                auto_quarantine_failures: config.auto_quarantine_failures,
-                auto_quarantine_release_successes: config.auto_quarantine_release_successes,
-                auto_quarantine_max_nodes: config.auto_quarantine_max_nodes,
-                auto_drain_enabled: config.auto_drain_enabled === true,
-                auto_drain_failures: config.auto_drain_failures,
-                auto_drain_release_successes: config.auto_drain_release_successes,
-                auto_drain_load_threshold: config.auto_drain_load_threshold,
-                auto_drain_score_penalty: config.auto_drain_score_penalty,
-                sticky_enabled: config.sticky_enabled === true,
-                sticky_mode: config.sticky_mode || 'pin',
-                sticky_ttl_sec: config.sticky_ttl_sec,
-                sticky_max_entries: config.sticky_max_entries,
-                probe_interval: config.probe_interval || PROBE_INTERVAL,
-                fastest_probe_url: config.fastest_probe_url || config.probe_url || PROBE_URL,
-                balancer_load_weight: config.balancer_load_weight,
-                balancer_latency_weight: config.balancer_latency_weight,
-                balancer_max_latency_ms: config.balancer_max_latency_ms,
-                balancer_smoothing_alpha: config.balancer_smoothing_alpha,
-                balancer_hysteresis_delta: config.balancer_hysteresis_delta,
+                auto_quarantine_enabled: runtime.autoQuarantineEnabled,
+                auto_quarantine_failures: runtime.autoQuarantineFailures,
+                auto_quarantine_release_successes: runtime.autoQuarantineReleaseSuccesses,
+                auto_quarantine_max_nodes: runtime.autoQuarantineMaxNodes,
+                auto_drain_enabled: runtime.autoDrainEnabled,
+                auto_drain_failures: runtime.autoDrainFailures,
+                auto_drain_release_successes: runtime.autoDrainReleaseSuccesses,
+                auto_drain_load_threshold: runtime.autoDrainLoadThreshold,
+                auto_drain_score_penalty: runtime.autoDrainScorePenalty,
+                sticky_enabled: runtime.stickyEnabled,
+                sticky_mode: runtime.stickyMode,
+                sticky_ttl_sec: runtime.stickyTtlSec,
+                sticky_max_entries: runtime.stickyMaxEntries,
+                probe_interval: runtime.probeInterval,
+                fastest_probe_url: runtime.fastestProbeUrl,
+                balancer_load_weight: runtime.balancerLoadWeight,
+                balancer_latency_weight: runtime.balancerLatencyWeight,
+                balancer_max_latency_ms: runtime.balancerMaxLatencyMs,
+                balancer_smoothing_alpha: runtime.balancerSmoothingAlpha,
+                balancer_hysteresis_delta: runtime.balancerHysteresisDelta,
                 persisted: persistResult.persisted,
                 persist_error: persistResult.error,
             }));
@@ -1101,7 +1098,7 @@ const server = http.createServer(async (req, res) => {
                 QUARANTINE_NODES = [...QUARANTINE_NODES, nodeRaw];
                 const nextConfig = { ...config, quarantine_nodes: QUARANTINE_NODES };
                 validateConfig(nextConfig);
-                config = nextConfig;
+                applyMutableRuntimeConfig(nextConfig);
                 const persistResult = persistConfigIfPossible(nextConfig, requestId);
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
@@ -1162,7 +1159,7 @@ const server = http.createServer(async (req, res) => {
         QUARANTINE_NODES = QUARANTINE_NODES.filter((name) => normalizeNodeName(name) !== normalized);
         const nextConfig = { ...config, quarantine_nodes: QUARANTINE_NODES };
         validateConfig(nextConfig);
-        config = nextConfig;
+        applyMutableRuntimeConfig(nextConfig);
         const persistResult = persistConfigIfPossible(nextConfig, requestId);
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1221,6 +1218,8 @@ const server = http.createServer(async (req, res) => {
         if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
             return;
         }
+        const runtime = getRuntimeConfig();
+        const currentStickyStore = ensureStickyStore();
         const cb = circuitBreaker.status();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -1231,8 +1230,8 @@ const server = http.createServer(async (req, res) => {
             circuit_breaker: cb,
             quarantine_nodes: QUARANTINE_NODES,
             quarantine_count: QUARANTINE_NODES.length,
-            sticky_enabled: STICKY_ENABLED,
-            sticky: stickyStore.summary(),
+            sticky_enabled: runtime.stickyEnabled,
+            sticky: currentStickyStore.summary(),
         }));
         return;
     }
@@ -1261,6 +1260,8 @@ const server = http.createServer(async (req, res) => {
             upstreamError = err.message;
         }
 
+        const runtime = getRuntimeConfig();
+        const currentStickyStore = ensureStickyStore();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
             status: 'ok',
@@ -1288,8 +1289,8 @@ const server = http.createServer(async (req, res) => {
             },
             circuit_breaker: circuitBreaker.status(),
             sticky: {
-                enabled: STICKY_ENABLED,
-                assigned_node: STICKY_ENABLED ? stickyStore.get(debugToken)?.nodeName || null : null,
+                enabled: runtime.stickyEnabled,
+                assigned_node: runtime.stickyEnabled ? currentStickyStore.get(debugToken)?.nodeName || null : null,
             },
         }));
         return;
@@ -1439,16 +1440,17 @@ const server = http.createServer(async (req, res) => {
         // ─── Фильтрация и сортировка по нагрузке ───
         if (NODE_STATS_ENABLED && Object.keys(nodeStatsCache).length > 0) {
             const before = allOutbounds.length;
+            const runtime = getRuntimeConfig();
             allOutbounds = filterAndSortByLoad(allOutbounds, nodeStatsCache, {
                 drainSet: autoDrainNodes,
                 rankState: balancerRankState,
                 keepOverloadedWhenDrained: true,
-                drainPenalty: AUTO_DRAIN_SCORE_PENALTY,
-                loadWeight: BALANCER_LOAD_WEIGHT,
-                latencyWeight: BALANCER_LATENCY_WEIGHT,
-                maxLatencyMs: BALANCER_MAX_LATENCY_MS,
-                smoothingAlpha: BALANCER_SMOOTHING_ALPHA,
-                hysteresisDelta: BALANCER_HYSTERESIS_DELTA,
+                drainPenalty: runtime.autoDrainScorePenalty,
+                loadWeight: runtime.balancerLoadWeight,
+                latencyWeight: runtime.balancerLatencyWeight,
+                maxLatencyMs: runtime.balancerMaxLatencyMs,
+                smoothingAlpha: runtime.balancerSmoothingAlpha,
+                hysteresisDelta: runtime.balancerHysteresisDelta,
             });
             const after = allOutbounds.length;
             if (before !== after) {
@@ -1527,13 +1529,15 @@ const server = http.createServer(async (req, res) => {
             : allOutbounds;
 
         if (fastestEnabled && fastestOutbounds.length > 1) {
+            const runtime = getRuntimeConfig();
+            const currentStickyStore = ensureStickyStore();
             let selectedFastestOutbounds = fastestOutbounds;
-            if (STICKY_ENABLED) {
-                const stickyChoice = STICKY_MODE === 'prefer'
-                    ? stickyStore.prefer(token, fastestOutbounds)
-                    : stickyStore.choose(token, fastestOutbounds);
+            if (runtime.stickyEnabled) {
+                const stickyChoice = runtime.stickyMode === 'prefer'
+                    ? currentStickyStore.prefer(token, fastestOutbounds)
+                    : currentStickyStore.choose(token, fastestOutbounds);
                 if (stickyChoice.selected) {
-                    selectedFastestOutbounds = STICKY_MODE === 'prefer'
+                    selectedFastestOutbounds = runtime.stickyMode === 'prefer'
                         ? stickyChoice.orderedOutbounds
                         : [stickyChoice.selected];
                     if (stickyChoice.changed) {
@@ -1542,7 +1546,7 @@ const server = http.createServer(async (req, res) => {
                             request_id: requestId,
                             token: redactTokenPath(`/${token}`).slice(1),
                             node: stickyChoice.selected.tag,
-                            sticky_mode: STICKY_MODE,
+                            sticky_mode: runtime.stickyMode,
                         });
                     } else {
                         runtimeStats.sticky_hits_total += 1;
@@ -1553,8 +1557,8 @@ const server = http.createServer(async (req, res) => {
             }
             const fastestGroupName = (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME);
             const fastestConfig = buildGroupConfig(baseConfig, fastestGroupName, selectedFastestOutbounds, {
-                probeUrl: FASTEST_PROBE_URL,
-                probeInterval: PROBE_INTERVAL,
+                probeUrl: runtime.fastestProbeUrl,
+                probeInterval: runtime.probeInterval,
                 strategy: STRATEGY,
             });
             resultConfigs.push(fastestConfig);
@@ -1562,8 +1566,8 @@ const server = http.createServer(async (req, res) => {
                 request_id: requestId,
                 count: selectedFastestOutbounds.length,
                 source_count: fastestOutbounds.length,
-                sticky_enabled: STICKY_ENABLED,
-                sticky_mode: STICKY_MODE,
+                sticky_enabled: runtime.stickyEnabled,
+                sticky_mode: runtime.stickyMode,
                 excluded_groups: FASTEST_EXCLUDE_GROUPS,
             });
         }
@@ -1573,9 +1577,10 @@ const server = http.createServer(async (req, res) => {
         for (const groupName of responseGroupOrder) {
             const outbounds = grouped[groupName] || [];
             if (outbounds.length === 0) continue;
+            const runtime = getRuntimeConfig();
             const groupConfig = buildGroupConfig(baseConfig, groupName, outbounds, {
                 probeUrl: PROBE_URL,
-                probeInterval: PROBE_INTERVAL,
+                probeInterval: runtime.probeInterval,
                 strategy: STRATEGY,
             });
             resultConfigs.push(groupConfig);
@@ -1664,14 +1669,16 @@ async function start() {
     const fastestEnabled = config.fastest_group !== false;
 
     server.listen(PORT, () => {
+        const runtime = getRuntimeConfig();
+        ensureStickyStore();
         console.log(`\n🚀 Xray Balancer Middleware — порт ${PORT}`);
         console.log(`📋 Группы: ${Object.entries(GROUPS).map(([k, v]) => `${k} [${v.join(',')}]`).join(' | ')}`);
         const fastestLabel = config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME;
         console.log(`🏁 Fastest group (${fastestLabel}): ${fastestEnabled ? '✅' : '❌'}`);
         console.log(`🎯 Стратегия: ${STRATEGY} (expected=1, baselines=1s, tolerance=0.8)`);
         console.log(`🧭 Profile: ${PROFILE.name}`);
-        console.log(`📡 Probe: groups=${PROBE_URL} fastest=${FASTEST_PROBE_URL} каждые ${PROBE_INTERVAL}`);
-        console.log(`🧷 Sticky: ${STICKY_ENABLED ? `✅ (${STICKY_MODE}, ttl=${STICKY_TTL_SEC}s)` : '❌'}`);
+        console.log(`📡 Probe: groups=${PROBE_URL} fastest=${runtime.fastestProbeUrl} каждые ${runtime.probeInterval}`);
+        console.log(`🧷 Sticky: ${runtime.stickyEnabled ? `✅ (${runtime.stickyMode}, ttl=${runtime.stickyTtlSec}s)` : '❌'}`);
         console.log(`📊 Node stats: ${NODE_STATS_ENABLED ? `✅ (каждые ${NODE_STATS_INTERVAL/1000}с, макс ${MAX_USERS_PER_GB} u/GB, ${MAX_USERS_PER_CPU} u/CPU)` : '❌'}`);
         console.log(`🗃️ Cache: ttl=${CACHE_TTL_SEC}s stale-if-error=${CACHE_STALE_IF_ERROR_SEC}s max_entries=${CACHE_MAX_ENTRIES}`);
         console.log(`🚦 Rate limit: ${RATE_LIMIT_PER_MINUTE}/min, burst=${RATE_LIMIT_BURST_10S}/10s`);
@@ -1679,13 +1686,13 @@ async function start() {
         console.log(`🔐 Admin rate limit: ${ADMIN_RATE_LIMIT_PER_MINUTE}/min, burst=${ADMIN_RATE_LIMIT_BURST_10S}/10s`);
         console.log(`🌐 Trust X-Forwarded-For: ${TRUST_X_FORWARDED_FOR ? '✅' : '❌'}`);
         console.log(
-            `🩺 Auto quarantine: ${AUTO_QUARANTINE_ENABLED ? `✅ (fails=${AUTO_QUARANTINE_FAILURES}, release=${AUTO_QUARANTINE_RELEASE_SUCCESSES}, max=${AUTO_QUARANTINE_MAX_NODES})` : '❌'}`
+            `🩺 Auto quarantine: ${runtime.autoQuarantineEnabled ? `✅ (fails=${runtime.autoQuarantineFailures}, release=${runtime.autoQuarantineReleaseSuccesses}, max=${runtime.autoQuarantineMaxNodes})` : '❌'}`
         );
         console.log(
-            `💧 Auto drain: ${AUTO_DRAIN_ENABLED ? `✅ (fails=${AUTO_DRAIN_FAILURES}, release=${AUTO_DRAIN_RELEASE_SUCCESSES}, threshold=${AUTO_DRAIN_LOAD_THRESHOLD}, penalty=${AUTO_DRAIN_SCORE_PENALTY})` : '❌'}`
+            `💧 Auto drain: ${runtime.autoDrainEnabled ? `✅ (fails=${runtime.autoDrainFailures}, release=${runtime.autoDrainReleaseSuccesses}, threshold=${runtime.autoDrainLoadThreshold}, penalty=${runtime.autoDrainScorePenalty})` : '❌'}`
         );
         console.log(
-            `📈 Score model: load_weight=${BALANCER_LOAD_WEIGHT} latency_weight=${BALANCER_LATENCY_WEIGHT} max_latency=${BALANCER_MAX_LATENCY_MS}ms alpha=${BALANCER_SMOOTHING_ALPHA} hysteresis=${BALANCER_HYSTERESIS_DELTA}`
+            `📈 Score model: load_weight=${runtime.balancerLoadWeight} latency_weight=${runtime.balancerLatencyWeight} max_latency=${runtime.balancerMaxLatencyMs}ms alpha=${runtime.balancerSmoothingAlpha} hysteresis=${runtime.balancerHysteresisDelta}`
         );
         console.log(`⏱️ Upstream: timeout=${REQUEST_TIMEOUT_MS}ms redirects=${MAX_REDIRECTS}`);
         console.log(`🧱 Circuit breaker: fails=${CIRCUIT_BREAKER_FAILURES} open=${CIRCUIT_BREAKER_OPEN_SEC}s`);
