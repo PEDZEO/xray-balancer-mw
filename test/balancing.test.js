@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { matchGroup, isFakeConfig, filterAndSortByLoad } = require('../lib/balancing');
+const { matchGroup, isFakeConfig, filterAndSortByLoad, getNodeStats } = require('../lib/balancing');
 
 test('matchGroup prefers the longest matching pattern', () => {
     const groups = {
@@ -53,4 +53,34 @@ test('filterAndSortByLoad drops overloaded/offline nodes and sorts remaining', (
 
     const result = filterAndSortByLoad(outbounds, cache);
     assert.deepEqual(result.map(x => x.tag), ['C-node', 'A-node']);
+});
+
+test('getNodeStats resolves host remark outbounds by server address', () => {
+    const cache = {
+        DEplay: { load: 0.1, isConnected: true, isDisabled: false, sourceNode: 'DEplay' },
+        'de.pedze.ru': { load: 0.1, isConnected: true, isDisabled: false, sourceNode: 'DEplay' },
+    };
+    const outbound = {
+        tag: 'Германия v2  🇩🇪',
+        settings: {
+            vnext: [{ address: 'de.pedze.ru', port: 443 }],
+        },
+    };
+
+    const result = getNodeStats(cache, outbound);
+    assert.equal(result?.sourceNode, 'DEplay');
+});
+
+test('filterAndSortByLoad uses outbound addresses for host remark sorting', () => {
+    const outbounds = [
+        { tag: 'Германия 🇩🇪', settings: { vnext: [{ address: 'noda.pedze.ru', port: 443 }] } },
+        { tag: 'Германия v2  🇩🇪', settings: { vnext: [{ address: 'de.pedze.ru', port: 443 }] } },
+    ];
+    const cache = {
+        'noda.pedze.ru': { load: 0.9, isConnected: true, isDisabled: false, sourceNode: 'Pedze' },
+        'de.pedze.ru': { load: 0.1, isConnected: true, isDisabled: false, sourceNode: 'DEplay' },
+    };
+
+    const result = filterAndSortByLoad(outbounds, cache);
+    assert.deepEqual(result.map((item) => item.tag), ['Германия v2  🇩🇪', 'Германия 🇩🇪']);
 });

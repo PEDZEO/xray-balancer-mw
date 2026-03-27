@@ -566,6 +566,7 @@ async function fetchNodeStats() {
         const newCache = {};
         for (const node of nodes) {
             const name = node.name || '';
+            const address = typeof node.address === 'string' ? node.address.trim() : '';
             const usersOnline = node.usersOnline || 0;
             const totalRamGb = parseRamGb(node.totalRam);
             const cpuCount = node.cpuCount || 1;
@@ -587,6 +588,14 @@ async function fetchNodeStats() {
                 isAlias: false,
                 sourceNode: name,
             };
+
+            if (address && address !== name) {
+                newCache[address] = {
+                    ...newCache[name],
+                    isAlias: true,
+                    sourceNode: name,
+                };
+            }
 
             // Также кэшируем по тегам inbound'ов (для матчинга с outbound тегами)
             if (node.configProfile && node.configProfile.activeInbounds) {
@@ -1554,7 +1563,7 @@ const server = http.createServer(async (req, res) => {
             // Логируем порядок серверов если есть стата
             if (NODE_STATS_ENABLED && Object.keys(nodeStatsCache).length > 0) {
                 const order = outbounds.map(ob => {
-                    const s = getNodeStats(nodeStatsCache, ob.tag);
+                    const s = getNodeStats(nodeStatsCache, ob);
                     return s ? `${ob.tag}(${s.usersOnline}u/${s.totalRamGb}G/${s.cpuCount}C)` : ob.tag;
                 }).join(', ');
                 logger.info('group_built', { request_id: requestId, group: groupName, count: outbounds.length, order });
