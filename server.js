@@ -83,6 +83,7 @@ const AUTO_GROUPS_INTERVAL = (config.auto_groups_interval_sec || 300) * 1000;
 const STRATEGY = config.strategy || 'leastLoad';
 const PROBE_INTERVAL = config.probe_interval || '3m';
 const PROBE_URL = config.probe_url || 'https://www.gstatic.com/generate_204';
+const FASTEST_PROBE_URL = config.fastest_probe_url || PROBE_URL;
 const PROFILE_MODE = process.env.PROFILE_MODE || config.profile_mode || 'balanced';
 const PROFILE = resolveProfile(PROFILE_MODE);
 
@@ -1534,7 +1535,7 @@ const server = http.createServer(async (req, res) => {
             }
             const fastestGroupName = (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME);
             const fastestConfig = buildGroupConfig(baseConfig, fastestGroupName, selectedFastestOutbounds, {
-                probeUrl: PROBE_URL,
+                probeUrl: FASTEST_PROBE_URL,
                 probeInterval: PROBE_INTERVAL,
                 strategy: STRATEGY,
             });

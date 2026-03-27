@@ -33,6 +33,7 @@ test('validateConfig accepts runtime and fastest-exclude options', () => {
     const cfg = {
         profile_mode: 'stable',
         admin_token: 'supersecret',
+        fastest_probe_url: 'https://ya.ru',
         fastest_exclude_groups: ['🇷🇺 White List'],
         sticky_enabled: true,
         sticky_ttl_sec: 3600,
@@ -48,6 +49,10 @@ test('validateConfig accepts runtime and fastest-exclude options', () => {
     };
 
     assert.deepEqual(validateConfig(cfg), cfg);
+});
+
+test('validateConfig rejects malformed fastest probe url', () => {
+    assert.throws(() => validateConfig({ fastest_probe_url: 'ya.ru' }), /fastest_probe_url/);
 });
 
 test('validateConfig rejects too many groups and overly long patterns', () => {
