@@ -15,7 +15,7 @@ const { buildLogger } = require('./lib/log');
 const { resolveProfile } = require('./lib/profile');
 const { classifyUpstreamPayload } = require('./lib/upstream-contract');
 const { buildGroupConfig } = require('./lib/group-builder');
-const { createStickyStore } = require('./lib/sticky');
+const { buildStickyTokenKey, createStickyStore } = require('./lib/sticky');
 const { createRequestGuard } = require('./lib/request-guard');
 const { readEffectiveRuntime } = require('./lib/runtime-config');
 
@@ -218,6 +218,43 @@ function applyMutableRuntimeConfig(nextConfig) {
 }
 
 applyMutableRuntimeConfig(config);
+
+function applyStickySelection(token, scope, outbounds, runtime, currentStickyStore) {
+    if (!runtime.stickyEnabled || !Array.isArray(outbounds) || outbounds.length === 0) {
+        return {
+            selectedOutbounds: outbounds,
+            selected: null,
+            changed: false,
+            used: false,
+            stickyKey: null,
+        };
+    }
+
+    const stickyKey = buildStickyTokenKey(token, scope);
+    const stickyChoice = runtime.stickyMode === 'prefer'
+        ? currentStickyStore.prefer(stickyKey, outbounds)
+        : currentStickyStore.choose(stickyKey, outbounds);
+
+    if (!stickyChoice.selected) {
+        return {
+            selectedOutbounds: outbounds,
+            selected: null,
+            changed: false,
+            used: true,
+            stickyKey,
+        };
+    }
+
+    return {
+        selectedOutbounds: runtime.stickyMode === 'prefer'
+            ? stickyChoice.orderedOutbounds
+            : [stickyChoice.selected],
+        selected: stickyChoice.selected,
+        changed: stickyChoice.changed,
+        used: true,
+        stickyKey,
+    };
+}
 
 // ─── Утилиты ───
 
@@ -1290,7 +1327,15 @@ const server = http.createServer(async (req, res) => {
             circuit_breaker: circuitBreaker.status(),
             sticky: {
                 enabled: runtime.stickyEnabled,
-                assigned_node: runtime.stickyEnabled ? currentStickyStore.get(debugToken)?.nodeName || null : null,
+                assigned_nodes: runtime.stickyEnabled
+                    ? Object.fromEntries([
+                        ['fastest', currentStickyStore.get(buildStickyTokenKey(debugToken, 'fastest'))?.nodeName || null],
+                        ...Object.keys(GROUPS).map((groupName) => [
+                            groupName,
+                            currentStickyStore.get(buildStickyTokenKey(debugToken, `group:${groupName}`))?.nodeName || null,
+                        ]),
+                    ])
+                    : {},
             },
         }));
         return;
@@ -1533,19 +1578,16 @@ const server = http.createServer(async (req, res) => {
             const currentStickyStore = ensureStickyStore();
             let selectedFastestOutbounds = fastestOutbounds;
             if (runtime.stickyEnabled) {
-                const stickyChoice = runtime.stickyMode === 'prefer'
-                    ? currentStickyStore.prefer(token, fastestOutbounds)
-                    : currentStickyStore.choose(token, fastestOutbounds);
-                if (stickyChoice.selected) {
-                    selectedFastestOutbounds = runtime.stickyMode === 'prefer'
-                        ? stickyChoice.orderedOutbounds
-                        : [stickyChoice.selected];
-                    if (stickyChoice.changed) {
+                const stickySelection = applyStickySelection(token, 'fastest', fastestOutbounds, runtime, currentStickyStore);
+                if (stickySelection.selected) {
+                    selectedFastestOutbounds = stickySelection.selectedOutbounds;
+                    if (stickySelection.changed) {
                         runtimeStats.sticky_assignments_total += 1;
                         logger.info('sticky_assigned', {
                             request_id: requestId,
                             token: redactTokenPath(`/${token}`).slice(1),
-                            node: stickyChoice.selected.tag,
+                            scope: 'fastest',
+                            node: stickySelection.selected.tag,
                             sticky_mode: runtime.stickyMode,
                         });
                     } else {
@@ -1575,10 +1617,40 @@ const server = http.createServer(async (req, res) => {
         // Группы по странам
         const responseGroupOrder = [...configuredGroupOrder, ...Object.keys(grouped).filter((name) => !configuredGroupOrder.includes(name))];
         for (const groupName of responseGroupOrder) {
-            const outbounds = grouped[groupName] || [];
-            if (outbounds.length === 0) continue;
             const runtime = getRuntimeConfig();
-            const groupConfig = buildGroupConfig(baseConfig, groupName, outbounds, {
+            const currentStickyStore = ensureStickyStore();
+            const groupOutbounds = grouped[groupName] || [];
+            if (groupOutbounds.length === 0) continue;
+
+            let selectedGroupOutbounds = groupOutbounds;
+            if (runtime.stickyEnabled && groupOutbounds.length > 1) {
+                const stickySelection = applyStickySelection(
+                    token,
+                    `group:${groupName}`,
+                    groupOutbounds,
+                    runtime,
+                    currentStickyStore
+                );
+                if (stickySelection.selected) {
+                    selectedGroupOutbounds = stickySelection.selectedOutbounds;
+                    if (stickySelection.changed) {
+                        runtimeStats.sticky_assignments_total += 1;
+                        logger.info('sticky_assigned', {
+                            request_id: requestId,
+                            token: redactTokenPath(`/${token}`).slice(1),
+                            scope: `group:${groupName}`,
+                            node: stickySelection.selected.tag,
+                            sticky_mode: runtime.stickyMode,
+                        });
+                    } else {
+                        runtimeStats.sticky_hits_total += 1;
+                    }
+                } else {
+                    runtimeStats.sticky_misses_total += 1;
+                }
+            }
+
+            const groupConfig = buildGroupConfig(baseConfig, groupName, selectedGroupOutbounds, {
                 probeUrl: PROBE_URL,
                 probeInterval: runtime.probeInterval,
                 strategy: STRATEGY,
@@ -1587,13 +1659,26 @@ const server = http.createServer(async (req, res) => {
 
             // Логируем порядок серверов если есть стата
             if (NODE_STATS_ENABLED && Object.keys(nodeStatsCache).length > 0) {
-                const order = outbounds.map(ob => {
+                const order = selectedGroupOutbounds.map(ob => {
                     const s = getNodeStats(nodeStatsCache, ob);
                     return s ? `${ob.tag}(${s.usersOnline}u/${s.totalRamGb}G/${s.cpuCount}C)` : ob.tag;
                 }).join(', ');
-                logger.info('group_built', { request_id: requestId, group: groupName, count: outbounds.length, order });
+                logger.info('group_built', {
+                    request_id: requestId,
+                    group: groupName,
+                    count: selectedGroupOutbounds.length,
+                    order,
+                    sticky_enabled: runtime.stickyEnabled,
+                    sticky_mode: runtime.stickyMode,
+                });
             } else {
-                logger.info('group_built', { request_id: requestId, group: groupName, count: outbounds.length });
+                logger.info('group_built', {
+                    request_id: requestId,
+                    group: groupName,
+                    count: selectedGroupOutbounds.length,
+                    sticky_enabled: runtime.stickyEnabled,
+                    sticky_mode: runtime.stickyMode,
+                });
             }
         }
 

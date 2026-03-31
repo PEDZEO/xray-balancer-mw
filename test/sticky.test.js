@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createStickyStore } = require('../lib/sticky');
+const { buildStickyTokenKey, createStickyStore } = require('../lib/sticky');
 
 test('sticky store reuses selected node while ttl is active', () => {
     const store = createStickyStore({ ttlSec: 60 });
@@ -45,4 +45,24 @@ test('sticky store prefer keeps selected node first but preserves full pool', ()
     const second = store.prefer('tok', [{ tag: 'Germany-2' }, { tag: 'USA-1' }, { tag: 'Germany-1' }], 2000);
     assert.deepEqual(second.orderedOutbounds.map((outbound) => outbound.tag), ['Germany-1', 'Germany-2', 'USA-1']);
     assert.equal(second.changed, false);
+});
+
+test('sticky scope keys keep per-group assignments isolated for the same token', () => {
+    const store = createStickyStore({ ttlSec: 60 });
+    const token = 'tok';
+    const fastestKey = buildStickyTokenKey(token, 'fastest');
+    const germanyKey = buildStickyTokenKey(token, 'group:🇩🇪 Германия');
+
+    const fastest = store.prefer(fastestKey, [{ tag: 'Fast-DE-1' }, { tag: 'Fast-US-1' }], 1000);
+    const germany = store.prefer(germanyKey, [{ tag: 'Germany-1' }, { tag: 'Germany-2' }], 1000);
+
+    assert.equal(fastest.selected.tag, 'Fast-DE-1');
+    assert.equal(germany.selected.tag, 'Germany-1');
+
+    const nextFastest = store.prefer(fastestKey, [{ tag: 'Fast-US-1' }, { tag: 'Fast-DE-1' }], 2000);
+    const nextGermany = store.prefer(germanyKey, [{ tag: 'Germany-2' }, { tag: 'Germany-1' }], 2000);
+
+    assert.equal(nextFastest.selected.tag, 'Fast-DE-1');
+    assert.equal(nextGermany.selected.tag, 'Germany-1');
+    assert.notEqual(fastestKey, germanyKey);
 });
