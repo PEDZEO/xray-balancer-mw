@@ -13,6 +13,7 @@ test('readEffectiveRuntime returns config-driven mutable settings', () => {
         quarantine_nodes: [' Pedze ', '', 42, 'DEplay'],
         sticky_enabled: true,
         sticky_mode: 'prefer',
+        sticky_new_connections_only: true,
         sticky_ttl_sec: 60,
         sticky_max_entries: 500,
         auto_quarantine_enabled: true,
@@ -37,6 +38,7 @@ test('readEffectiveRuntime returns config-driven mutable settings', () => {
     assert.deepEqual(runtime.quarantineNodes, ['Pedze', 'DEplay']);
     assert.equal(runtime.stickyEnabled, true);
     assert.equal(runtime.stickyMode, 'prefer');
+    assert.equal(runtime.stickyNewConnectionsOnly, true);
     assert.equal(runtime.stickyTtlSec, 60);
     assert.equal(runtime.stickyMaxEntries, 500);
     assert.equal(runtime.autoQuarantineEnabled, true);
@@ -60,6 +62,7 @@ test('readEffectiveRuntime honors env overrides for mutable settings', () => {
         probe_url: 'https://www.gstatic.com/generate_204',
         sticky_enabled: true,
         sticky_mode: 'prefer',
+        sticky_new_connections_only: false,
         sticky_ttl_sec: 60,
         sticky_max_entries: 500,
         auto_quarantine_enabled: false,
@@ -70,6 +73,7 @@ test('readEffectiveRuntime honors env overrides for mutable settings', () => {
         balancer_max_latency_ms: 250,
     }, {
         STICKY_ENABLED: 'false',
+        STICKY_NEW_CONNECTIONS_ONLY: 'true',
         STICKY_TTL_SEC: '120',
         STICKY_MAX_ENTRIES: '750',
         AUTO_QUARANTINE_ENABLED: 'true',
@@ -83,6 +87,7 @@ test('readEffectiveRuntime honors env overrides for mutable settings', () => {
     assert.equal(runtime.fastestProbeUrl, 'https://www.gstatic.com/generate_204');
     assert.equal(runtime.stickyEnabled, false);
     assert.equal(runtime.stickyMode, 'prefer');
+    assert.equal(runtime.stickyNewConnectionsOnly, true);
     assert.equal(runtime.stickyTtlSec, 120);
     assert.equal(runtime.stickyMaxEntries, 750);
     assert.equal(runtime.autoQuarantineEnabled, true);

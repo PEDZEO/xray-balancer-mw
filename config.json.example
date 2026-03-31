@@ -39,6 +39,7 @@
     "auto_drain_score_penalty": 0.6,
     "sticky_enabled": true,
     "sticky_mode": "prefer",
+    "sticky_new_connections_only": true,
     "sticky_ttl_sec": 300,
     "sticky_max_entries": 10000,
     "balancer_load_weight": 0.4,

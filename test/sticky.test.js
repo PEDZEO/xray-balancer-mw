@@ -34,6 +34,19 @@ test('sticky store expires entries after ttl', () => {
     assert.equal(store.get('tok', 4001), null);
 });
 
+test('sticky store can refresh ttl for active assignments', () => {
+    const store = createStickyStore({ ttlSec: 2 });
+    store.assign('tok', 'Germany-1', 1000);
+
+    const hit = store.choose('tok', [{ tag: 'Germany-1' }, { tag: 'Germany-2' }], 2500, {
+        refreshTtlOnHit: true,
+    });
+
+    assert.equal(hit.selected.tag, 'Germany-1');
+    assert.equal(hit.changed, false);
+    assert.equal(store.get('tok', 4001)?.nodeName, 'Germany-1');
+});
+
 test('sticky store prefer keeps selected node first but preserves full pool', () => {
     const store = createStickyStore({ ttlSec: 60 });
     const outbounds = [{ tag: 'Germany-1' }, { tag: 'Germany-2' }, { tag: 'USA-1' }];

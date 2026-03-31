@@ -46,6 +46,7 @@
     "auto_drain_score_penalty": { "type": "number", "minimum": 0 },
     "sticky_enabled": { "type": "boolean" },
     "sticky_mode": { "type": "string", "enum": ["pin", "prefer"] },
+    "sticky_new_connections_only": { "type": "boolean" },
     "sticky_ttl_sec": { "type": "integer", "minimum": 1 },
     "sticky_max_entries": { "type": "integer", "minimum": 1 },
     "balancer_load_weight": { "type": "number", "minimum": 0 },

@@ -41,6 +41,7 @@ const MUTABLE_CONFIG_KEYS = [
     'auto_drain_score_penalty',
     'sticky_enabled',
     'sticky_mode',
+    'sticky_new_connections_only',
     'sticky_ttl_sec',
     'sticky_max_entries',
     'balancer_load_weight',
@@ -195,12 +196,14 @@ function ensureStickyStore() {
     const nextConfig = {
         ttlSec: runtime.stickyTtlSec,
         maxEntries: runtime.stickyMaxEntries,
+        refreshTtlOnHit: runtime.stickyNewConnectionsOnly,
     };
 
     if (!stickyStore
         || !stickyStoreConfig
         || stickyStoreConfig.ttlSec !== nextConfig.ttlSec
-        || stickyStoreConfig.maxEntries !== nextConfig.maxEntries) {
+        || stickyStoreConfig.maxEntries !== nextConfig.maxEntries
+        || stickyStoreConfig.refreshTtlOnHit !== nextConfig.refreshTtlOnHit) {
         stickyStore = createStickyStore(nextConfig);
         stickyStoreConfig = nextConfig;
     }
@@ -231,9 +234,12 @@ function applyStickySelection(token, scope, outbounds, runtime, currentStickySto
     }
 
     const stickyKey = buildStickyTokenKey(token, scope);
+    const stickyOptions = {
+        refreshTtlOnHit: runtime.stickyNewConnectionsOnly,
+    };
     const stickyChoice = runtime.stickyMode === 'prefer'
-        ? currentStickyStore.prefer(stickyKey, outbounds)
-        : currentStickyStore.choose(stickyKey, outbounds);
+        ? currentStickyStore.prefer(stickyKey, outbounds, Date.now(), stickyOptions)
+        : currentStickyStore.choose(stickyKey, outbounds, Date.now(), stickyOptions);
 
     if (!stickyChoice.selected) {
         return {
@@ -928,6 +934,7 @@ const server = http.createServer(async (req, res) => {
             auto_drain_count: autoDrainNodes.size,
             sticky_enabled: runtime.stickyEnabled,
             sticky_mode: runtime.stickyMode,
+            sticky_new_connections_only: runtime.stickyNewConnectionsOnly,
             sticky: currentStickyStore.summary(),
             sub_page: SUB_PAGE_URL || 'disabled',
         }));
@@ -961,6 +968,7 @@ const server = http.createServer(async (req, res) => {
                 auto_drain_score_penalty: runtime.autoDrainScorePenalty,
                 sticky_enabled: runtime.stickyEnabled,
                 sticky_mode: runtime.stickyMode,
+                sticky_new_connections_only: runtime.stickyNewConnectionsOnly,
                 sticky_ttl_sec: runtime.stickyTtlSec,
                 sticky_max_entries: runtime.stickyMaxEntries,
                 probe_interval: runtime.probeInterval,
@@ -1032,6 +1040,7 @@ const server = http.createServer(async (req, res) => {
                 auto_drain_score_penalty: runtime.autoDrainScorePenalty,
                 sticky_enabled: runtime.stickyEnabled,
                 sticky_mode: runtime.stickyMode,
+                sticky_new_connections_only: runtime.stickyNewConnectionsOnly,
                 sticky_ttl_sec: runtime.stickyTtlSec,
                 sticky_max_entries: runtime.stickyMaxEntries,
                 probe_interval: runtime.probeInterval,
