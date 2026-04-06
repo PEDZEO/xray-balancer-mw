@@ -896,15 +896,15 @@ function buildGroupNameSet(names) {
     return new Set((Array.isArray(names) ? names : []).map(normalizeNodeName).filter(Boolean));
 }
 
-function isNodeQuarantined(tag, quarantineSet) {
-    const normalizedTag = normalizeNodeName(tag);
-    if (!normalizedTag || quarantineSet.size === 0) return false;
-    if (quarantineSet.has(normalizedTag)) return true;
+function isNodeQuarantined(tag, quarantineSet, sourceNode = null) {
+    if (quarantineSet.size === 0) return false;
 
-    for (const entry of quarantineSet) {
-        if (entry.length < 3) continue;
-        if (normalizedTag.includes(entry) || entry.includes(normalizedTag)) return true;
-    }
+    const normalizedTag = normalizeNodeName(tag);
+    const normalizedSourceNode = normalizeNodeName(sourceNode);
+
+    if (normalizedTag && quarantineSet.has(normalizedTag)) return true;
+    if (normalizedSourceNode && quarantineSet.has(normalizedSourceNode)) return true;
+
     return false;
 }
 
@@ -1143,7 +1143,7 @@ const server = http.createServer(async (req, res) => {
                 name,
                 {
                     ...stats,
-                    quarantined: isNodeQuarantined(name, quarantineSet),
+                    quarantined: isNodeQuarantined(name, quarantineSet, stats?.sourceNode),
                 },
             ]),
         );
@@ -1572,7 +1572,10 @@ const server = http.createServer(async (req, res) => {
         const quarantineSet = buildQuarantineSet();
         if (quarantineSet.size > 0) {
             const before = allOutbounds.length;
-            allOutbounds = allOutbounds.filter((ob) => !isNodeQuarantined(ob.tag, quarantineSet));
+            allOutbounds = allOutbounds.filter((ob) => {
+                const stats = getNodeStats(nodeStatsCache, ob);
+                return !isNodeQuarantined(ob.tag, quarantineSet, stats?.sourceNode);
+            });
             const removed = before - allOutbounds.length;
             if (removed > 0) {
                 runtimeStats.quarantine_filtered_total += removed;
