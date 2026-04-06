@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const { validateConfig } = require('./lib/config');
 const { redactTokenPath, sanitizeClientMetadata } = require('./lib/security');
 const {
+    filterHiddenOutbounds,
     filterAndSortByLoad,
     getNodeStats,
     matchGroup,
@@ -27,6 +28,8 @@ const MUTABLE_CONFIG_KEYS = [
     'fastest_group',
     'fastest_group_name',
     'fastest_exclude_groups',
+    'hidden_groups',
+    'hidden_nodes',
     'probe_interval',
     'fastest_probe_url',
     'quarantine_nodes',
@@ -120,6 +123,8 @@ const MAX_REDIRECTS = pickRuntimeInt('MAX_REDIRECTS', 'max_redirects');
 const CIRCUIT_BREAKER_FAILURES = pickRuntimeInt('CIRCUIT_BREAKER_FAILURES', 'circuit_breaker_failures');
 const CIRCUIT_BREAKER_OPEN_SEC = pickRuntimeInt('CIRCUIT_BREAKER_OPEN_SEC', 'circuit_breaker_open_sec');
 let FASTEST_EXCLUDE_GROUPS = [];
+let HIDDEN_GROUPS = [];
+let HIDDEN_NODES = [];
 const DEFAULT_FASTEST_GROUP_NAME = '🏁 🇪🇺 Самые быстрые';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || config.admin_token || '';
 const WARMUP_TOKENS = Array.isArray(config.warmup_tokens) ? config.warmup_tokens : [];
@@ -216,6 +221,8 @@ function applyMutableRuntimeConfig(nextConfig) {
     GROUPS = nextConfig.groups || {};
     const runtime = getRuntimeConfig();
     FASTEST_EXCLUDE_GROUPS = runtime.fastestExcludeGroups;
+    HIDDEN_GROUPS = runtime.hiddenGroups;
+    HIDDEN_NODES = runtime.hiddenNodes;
     QUARANTINE_NODES = runtime.quarantineNodes;
     ensureStickyStore();
 }
@@ -956,6 +963,8 @@ const server = http.createServer(async (req, res) => {
                 fastest_group: config.fastest_group !== false,
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
+                hidden_groups: HIDDEN_GROUPS,
+                hidden_nodes: HIDDEN_NODES,
                 quarantine_nodes: QUARANTINE_NODES,
                 auto_quarantine_enabled: runtime.autoQuarantineEnabled,
                 auto_quarantine_failures: runtime.autoQuarantineFailures,
@@ -992,12 +1001,16 @@ const server = http.createServer(async (req, res) => {
             const payload = await readJsonBody(req);
             const incomingGroups = payload.groups;
             const incomingExclude = payload.fastest_exclude_groups;
+            const incomingHiddenGroups = payload.hidden_groups;
+            const incomingHiddenNodes = payload.hidden_nodes;
             const incomingFastest = payload.fastest_group;
             const incomingFastestName = payload.fastest_group_name;
 
             const nextConfig = { ...config };
             if (incomingGroups !== undefined) nextConfig.groups = incomingGroups;
             if (incomingExclude !== undefined) nextConfig.fastest_exclude_groups = incomingExclude;
+            if (incomingHiddenGroups !== undefined) nextConfig.hidden_groups = incomingHiddenGroups;
+            if (incomingHiddenNodes !== undefined) nextConfig.hidden_nodes = incomingHiddenNodes;
             if (incomingFastest !== undefined) nextConfig.fastest_group = incomingFastest;
             if (incomingFastestName !== undefined) nextConfig.fastest_group_name = incomingFastestName;
             for (const key of MUTABLE_CONFIG_KEYS) {
@@ -1028,6 +1041,8 @@ const server = http.createServer(async (req, res) => {
                 fastest_group: config.fastest_group !== false,
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
+                hidden_groups: HIDDEN_GROUPS,
+                hidden_nodes: HIDDEN_NODES,
                 quarantine_nodes: QUARANTINE_NODES,
                 auto_quarantine_enabled: runtime.autoQuarantineEnabled,
                 auto_quarantine_failures: runtime.autoQuarantineFailures,
@@ -1526,6 +1541,19 @@ const server = http.createServer(async (req, res) => {
                     quarantine_count: QUARANTINE_NODES.length,
                 });
             }
+        }
+
+        const beforeHiddenFilter = allOutbounds.length;
+        allOutbounds = filterHiddenOutbounds(allOutbounds, GROUPS, HIDDEN_GROUPS, HIDDEN_NODES);
+        const hiddenRemoved = beforeHiddenFilter - allOutbounds.length;
+        if (hiddenRemoved > 0) {
+            logger.info('outbounds_hidden_by_config', {
+                request_id: requestId,
+                before: beforeHiddenFilter,
+                after: allOutbounds.length,
+                hidden_groups: HIDDEN_GROUPS,
+                hidden_nodes_count: HIDDEN_NODES.length,
+            });
         }
 
         if (allOutbounds.length === 0) {

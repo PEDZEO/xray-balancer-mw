@@ -17,6 +17,14 @@
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
     },
+    "hidden_groups": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "hidden_nodes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
     "auto_groups": { "type": "boolean" },
     "auto_groups_interval_sec": { "type": "integer", "minimum": 1 },
     "node_stats": { "type": "boolean" },

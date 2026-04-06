@@ -11,6 +11,8 @@
     "fastest_group": true,
     "fastest_group_name": "🏁 🇪🇺 Самые быстрые",
     "fastest_exclude_groups": [],
+    "hidden_groups": [],
+    "hidden_nodes": [],
     "auto_groups": false,
     "auto_groups_interval_sec": 300,
 

@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { matchGroup, isFakeConfig, filterAndSortByLoad, getNodeStats } = require('../lib/balancing');
+const { matchGroup, isFakeConfig, filterAndSortByLoad, filterHiddenOutbounds, getNodeStats } = require('../lib/balancing');
 
 test('matchGroup prefers the longest matching pattern', () => {
     const groups = {
@@ -83,4 +83,19 @@ test('filterAndSortByLoad uses outbound addresses for host remark sorting', () =
 
     const result = filterAndSortByLoad(outbounds, cache);
     assert.deepEqual(result.map((item) => item.tag), ['Германия v2  🇩🇪', 'Германия 🇩🇪']);
+});
+
+test('filterHiddenOutbounds removes nodes hidden directly or via hidden group', () => {
+    const groups = {
+        '🇩🇪 Germany': ['German'],
+        '🇺🇸 USA': ['USA'],
+    };
+    const outbounds = [
+        { tag: 'German-1', protocol: 'vless' },
+        { tag: 'USA-1', protocol: 'vless' },
+        { tag: 'Finland-1', protocol: 'vless' },
+    ];
+
+    const result = filterHiddenOutbounds(outbounds, groups, ['🇺🇸 USA'], ['German-1']);
+    assert.deepEqual(result.map((item) => item.tag), ['Finland-1']);
 });

@@ -28,3 +28,24 @@ test('buildGroupConfig output matches snapshot fixture', () => {
     const expected = JSON.parse(fs.readFileSync(snapPath, 'utf8'));
     assert.deepEqual(out, expected);
 });
+
+test('buildGroupConfig does not inherit per-server description fields from base config', () => {
+    const base = {
+        remarks: 'base',
+        description: 'node-specific description',
+        serverDescription: 'node-specific server description',
+        server_description: 'node specific snake case description',
+        extraField: { x: 1 },
+    };
+
+    const out = buildGroupConfig(base, '🇪🇺 Europe', [{ tag: 'Germany-1', protocol: 'vless' }], {
+        probeUrl: 'https://example.com/ping',
+        probeInterval: '3m',
+        strategy: 'leastLoad',
+    });
+
+    assert.equal(out.description, undefined);
+    assert.equal(out.serverDescription, undefined);
+    assert.equal(out.server_description, undefined);
+    assert.deepEqual(out.extraField, { x: 1 });
+});
