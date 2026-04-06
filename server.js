@@ -28,6 +28,8 @@ const MUTABLE_CONFIG_KEYS = [
     'fastest_group',
     'fastest_group_name',
     'fastest_exclude_groups',
+    'fastest_fallback',
+    'node_stats_exclude',
     'hidden_groups',
     'hidden_nodes',
     'probe_interval',
@@ -123,6 +125,8 @@ const MAX_REDIRECTS = pickRuntimeInt('MAX_REDIRECTS', 'max_redirects');
 const CIRCUIT_BREAKER_FAILURES = pickRuntimeInt('CIRCUIT_BREAKER_FAILURES', 'circuit_breaker_failures');
 const CIRCUIT_BREAKER_OPEN_SEC = pickRuntimeInt('CIRCUIT_BREAKER_OPEN_SEC', 'circuit_breaker_open_sec');
 let FASTEST_EXCLUDE_GROUPS = [];
+let FASTEST_FALLBACK_GROUPS = [];
+let NODE_STATS_EXCLUDE_GROUPS = [];
 let HIDDEN_GROUPS = [];
 let HIDDEN_NODES = [];
 const DEFAULT_FASTEST_GROUP_NAME = '🏁 🇪🇺 Самые быстрые';
@@ -221,6 +225,8 @@ function applyMutableRuntimeConfig(nextConfig) {
     GROUPS = nextConfig.groups || {};
     const runtime = getRuntimeConfig();
     FASTEST_EXCLUDE_GROUPS = runtime.fastestExcludeGroups;
+    FASTEST_FALLBACK_GROUPS = runtime.fastestFallbackGroups;
+    NODE_STATS_EXCLUDE_GROUPS = runtime.nodeStatsExcludeGroups;
     HIDDEN_GROUPS = runtime.hiddenGroups;
     HIDDEN_NODES = runtime.hiddenNodes;
     QUARANTINE_NODES = runtime.quarantineNodes;
@@ -882,6 +888,10 @@ function buildQuarantineSet() {
     return new Set(QUARANTINE_NODES.map(normalizeNodeName).filter(Boolean));
 }
 
+function buildGroupNameSet(names) {
+    return new Set((Array.isArray(names) ? names : []).map(normalizeNodeName).filter(Boolean));
+}
+
 function isNodeQuarantined(tag, quarantineSet) {
     const normalizedTag = normalizeNodeName(tag);
     if (!normalizedTag || quarantineSet.size === 0) return false;
@@ -930,6 +940,8 @@ const server = http.createServer(async (req, res) => {
             auto_groups: AUTO_GROUPS,
             fastest_group: config.fastest_group !== false,
             fastest_probe_url: runtime.fastestProbeUrl,
+            fastest_fallback: FASTEST_FALLBACK_GROUPS,
+            node_stats_exclude: NODE_STATS_EXCLUDE_GROUPS,
             probe_interval: runtime.probeInterval,
             node_stats: NODE_STATS_ENABLED,
             panel_auth: PANEL_AUTH_COOKIE ? true : false,
@@ -963,6 +975,8 @@ const server = http.createServer(async (req, res) => {
                 fastest_group: config.fastest_group !== false,
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
+                fastest_fallback: FASTEST_FALLBACK_GROUPS,
+                node_stats_exclude: NODE_STATS_EXCLUDE_GROUPS,
                 hidden_groups: HIDDEN_GROUPS,
                 hidden_nodes: HIDDEN_NODES,
                 quarantine_nodes: QUARANTINE_NODES,
@@ -1001,6 +1015,8 @@ const server = http.createServer(async (req, res) => {
             const payload = await readJsonBody(req);
             const incomingGroups = payload.groups;
             const incomingExclude = payload.fastest_exclude_groups;
+            const incomingFastestFallback = payload.fastest_fallback;
+            const incomingNodeStatsExclude = payload.node_stats_exclude;
             const incomingHiddenGroups = payload.hidden_groups;
             const incomingHiddenNodes = payload.hidden_nodes;
             const incomingFastest = payload.fastest_group;
@@ -1009,6 +1025,8 @@ const server = http.createServer(async (req, res) => {
             const nextConfig = { ...config };
             if (incomingGroups !== undefined) nextConfig.groups = incomingGroups;
             if (incomingExclude !== undefined) nextConfig.fastest_exclude_groups = incomingExclude;
+            if (incomingFastestFallback !== undefined) nextConfig.fastest_fallback = incomingFastestFallback;
+            if (incomingNodeStatsExclude !== undefined) nextConfig.node_stats_exclude = incomingNodeStatsExclude;
             if (incomingHiddenGroups !== undefined) nextConfig.hidden_groups = incomingHiddenGroups;
             if (incomingHiddenNodes !== undefined) nextConfig.hidden_nodes = incomingHiddenNodes;
             if (incomingFastest !== undefined) nextConfig.fastest_group = incomingFastest;
@@ -1041,6 +1059,8 @@ const server = http.createServer(async (req, res) => {
                 fastest_group: config.fastest_group !== false,
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
+                fastest_fallback: FASTEST_FALLBACK_GROUPS,
+                node_stats_exclude: NODE_STATS_EXCLUDE_GROUPS,
                 hidden_groups: HIDDEN_GROUPS,
                 hidden_nodes: HIDDEN_NODES,
                 quarantine_nodes: QUARANTINE_NODES,
@@ -1510,7 +1530,19 @@ const server = http.createServer(async (req, res) => {
         if (NODE_STATS_ENABLED && Object.keys(nodeStatsCache).length > 0) {
             const before = allOutbounds.length;
             const runtime = getRuntimeConfig();
-            allOutbounds = filterAndSortByLoad(allOutbounds, nodeStatsCache, {
+            const excludedGroupSet = buildGroupNameSet(NODE_STATS_EXCLUDE_GROUPS);
+            const statsEligible = [];
+            const statsExcluded = [];
+            for (const outbound of allOutbounds) {
+                const groupName = matchGroup(GROUPS, outbound.tag);
+                if (groupName && excludedGroupSet.has(normalizeNodeName(groupName))) {
+                    statsExcluded.push(outbound);
+                } else {
+                    statsEligible.push(outbound);
+                }
+            }
+
+            const sortedEligible = filterAndSortByLoad(statsEligible, nodeStatsCache, {
                 drainSet: autoDrainNodes,
                 rankState: balancerRankState,
                 keepOverloadedWhenDrained: true,
@@ -1521,6 +1553,7 @@ const server = http.createServer(async (req, res) => {
                 smoothingAlpha: runtime.balancerSmoothingAlpha,
                 hysteresisDelta: runtime.balancerHysteresisDelta,
             });
+            allOutbounds = [...sortedEligible, ...statsExcluded];
             const after = allOutbounds.length;
             if (before !== after) {
                 logger.info('outbounds_filtered_by_load', { request_id: requestId, before, after });
@@ -1601,21 +1634,26 @@ const server = http.createServer(async (req, res) => {
         // ⚡ Fastest
         const fastestEnabled = config.fastest_group !== false;
         const excludedTags = new Set();
+        const fallbackTags = new Set();
+        const fallbackGroupSet = buildGroupNameSet(FASTEST_FALLBACK_GROUPS);
         for (const [groupName, outbounds] of Object.entries(grouped)) {
             if (FASTEST_EXCLUDE_GROUPS.includes(groupName)) {
                 for (const outbound of outbounds) excludedTags.add(outbound.tag);
             }
+            if (fallbackGroupSet.has(normalizeNodeName(groupName))) {
+                for (const outbound of outbounds) fallbackTags.add(outbound.tag);
+            }
         }
-        const fastestOutbounds = excludedTags.size > 0
-            ? allOutbounds.filter(outbound => !excludedTags.has(outbound.tag))
-            : allOutbounds;
+        const fastestOutbounds = allOutbounds.filter((outbound) => !excludedTags.has(outbound.tag) && !fallbackTags.has(outbound.tag));
+        const fastestFallbackOutbounds = allOutbounds.filter((outbound) => fallbackTags.has(outbound.tag));
+        const fastestSourceOutbounds = fastestOutbounds.length > 0 ? fastestOutbounds : fastestFallbackOutbounds;
 
-        if (fastestEnabled && fastestOutbounds.length > 1) {
+        if (fastestEnabled && fastestSourceOutbounds.length > 0) {
             const runtime = getRuntimeConfig();
             const currentStickyStore = ensureStickyStore();
-            let selectedFastestOutbounds = fastestOutbounds;
-            if (runtime.stickyEnabled) {
-                const stickySelection = applyStickySelection(token, 'fastest', fastestOutbounds, runtime, currentStickyStore);
+            let selectedFastestOutbounds = fastestSourceOutbounds;
+            if (runtime.stickyEnabled && fastestSourceOutbounds.length > 1) {
+                const stickySelection = applyStickySelection(token, 'fastest', fastestSourceOutbounds, runtime, currentStickyStore);
                 if (stickySelection.selected) {
                     selectedFastestOutbounds = stickySelection.selectedOutbounds;
                     if (stickySelection.changed) {
@@ -1636,6 +1674,8 @@ const server = http.createServer(async (req, res) => {
             }
             const fastestGroupName = (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME);
             const fastestConfig = buildGroupConfig(baseConfig, fastestGroupName, selectedFastestOutbounds, {
+                fallbackOutbounds: fastestOutbounds.length > 0 ? fastestFallbackOutbounds : [],
+                groupIndex: resultConfigs.length,
                 probeUrl: runtime.fastestProbeUrl,
                 probeInterval: runtime.probeInterval,
                 strategy: STRATEGY,
@@ -1644,10 +1684,11 @@ const server = http.createServer(async (req, res) => {
             logger.info('group_fastest', {
                 request_id: requestId,
                 count: selectedFastestOutbounds.length,
-                source_count: fastestOutbounds.length,
+                source_count: fastestSourceOutbounds.length,
                 sticky_enabled: runtime.stickyEnabled,
                 sticky_mode: runtime.stickyMode,
                 excluded_groups: FASTEST_EXCLUDE_GROUPS,
+                fallback_groups: FASTEST_FALLBACK_GROUPS,
             });
         }
 
@@ -1688,6 +1729,7 @@ const server = http.createServer(async (req, res) => {
             }
 
             const groupConfig = buildGroupConfig(baseConfig, groupName, selectedGroupOutbounds, {
+                groupIndex: resultConfigs.length,
                 probeUrl: PROBE_URL,
                 probeInterval: runtime.probeInterval,
                 strategy: STRATEGY,
@@ -1797,11 +1839,13 @@ async function start() {
         console.log(`📋 Группы: ${Object.entries(GROUPS).map(([k, v]) => `${k} [${v.join(',')}]`).join(' | ')}`);
         const fastestLabel = config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME;
         console.log(`🏁 Fastest group (${fastestLabel}): ${fastestEnabled ? '✅' : '❌'}`);
+        console.log(`🪂 Fastest fallback groups: ${FASTEST_FALLBACK_GROUPS.length > 0 ? FASTEST_FALLBACK_GROUPS.join(', ') : 'none'}`);
         console.log(`🎯 Стратегия: ${STRATEGY} (expected=1, baselines=1s, tolerance=0.8)`);
         console.log(`🧭 Profile: ${PROFILE.name}`);
         console.log(`📡 Probe: groups=${PROBE_URL} fastest=${runtime.fastestProbeUrl} каждые ${runtime.probeInterval}`);
         console.log(`🧷 Sticky: ${runtime.stickyEnabled ? `✅ (${runtime.stickyMode}, ttl=${runtime.stickyTtlSec}s)` : '❌'}`);
         console.log(`📊 Node stats: ${NODE_STATS_ENABLED ? `✅ (каждые ${NODE_STATS_INTERVAL/1000}с, макс ${MAX_USERS_PER_GB} u/GB, ${MAX_USERS_PER_CPU} u/CPU)` : '❌'}`);
+        console.log(`📊 Node stats exclude: ${NODE_STATS_EXCLUDE_GROUPS.length > 0 ? NODE_STATS_EXCLUDE_GROUPS.join(', ') : 'none'}`);
         console.log(`🗃️ Cache: ttl=${CACHE_TTL_SEC}s stale-if-error=${CACHE_STALE_IF_ERROR_SEC}s max_entries=${CACHE_MAX_ENTRIES}`);
         console.log(`🚦 Rate limit: ${RATE_LIMIT_PER_MINUTE}/min, burst=${RATE_LIMIT_BURST_10S}/10s`);
         console.log(`🎟️ Token rate limit: ${TOKEN_RATE_LIMIT_PER_MINUTE}/min, burst=${TOKEN_RATE_LIMIT_BURST_10S}/10s`);

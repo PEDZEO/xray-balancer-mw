@@ -29,6 +29,34 @@ test('buildGroupConfig output matches snapshot fixture', () => {
     assert.deepEqual(out, expected);
 });
 
+test('buildGroupConfig adds fallback balancer, proxy outbound and unique inbound ports', () => {
+    const base = {
+        inbounds: [
+            { tag: 'socks', port: 10808, protocol: 'socks' },
+            { tag: 'http', port: 10809, protocol: 'http' },
+        ],
+    };
+
+    const out = buildGroupConfig(base, '🏁 Fastest', [{ tag: 'Main-1', protocol: 'vless' }], {
+        fallbackOutbounds: [
+            { tag: 'LTE-1', protocol: 'vless' },
+            { tag: 'LTE-2', protocol: 'vless' },
+        ],
+        groupIndex: 2,
+        probeUrl: 'https://example.com/ping',
+        probeInterval: '1m',
+        strategy: 'leastLoad',
+    });
+
+    assert.deepEqual(out.inbounds.map((inbound) => inbound.port), [10812, 10813]);
+    assert.equal(out.outbounds[0].tag, 'proxy');
+    assert.deepEqual(out.burstObservatory.subjectSelector, ['Main-1', 'LTE-1', 'LTE-2']);
+    assert.equal(out.burstObservatory.pingConfig.sampling, 1);
+    assert.equal(out.burstObservatory.pingConfig.timeout, '3s');
+    assert.equal(out.routing.balancers[0].fallbackTag, '_Fastest-fallback-balancer');
+    assert.deepEqual(out.routing.balancers[1].selector, ['LTE-1', 'LTE-2']);
+});
+
 test('buildGroupConfig does not inherit per-server description fields from base config', () => {
     const base = {
         remarks: 'base',

@@ -16,6 +16,10 @@
   ],
   "outbounds": [
     {
+      "tag": "proxy",
+      "protocol": "vless"
+    },
+    {
       "tag": "Germany-1",
       "protocol": "vless"
     },
@@ -40,9 +44,8 @@
     "pingConfig": {
       "destination": "https://example.com/ping",
       "interval": "3m",
-      "sampling": 3,
-      "timeout": "2s",
-      "httpMethod": "GET"
+      "sampling": 1,
+      "timeout": "3s"
     }
   },
   "routing": {

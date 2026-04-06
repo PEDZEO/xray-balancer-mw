@@ -35,6 +35,8 @@ test('validateConfig accepts runtime and fastest-exclude options', () => {
         admin_token: 'supersecret',
         fastest_probe_url: 'https://ya.ru',
         fastest_exclude_groups: ['🇷🇺 White List'],
+        fastest_fallback: ['🇪🇺 LTE'],
+        node_stats_exclude: ['🇷🇺 White List'],
         hidden_groups: ['🇺🇸 USA'],
         hidden_nodes: ['Germany-99'],
         sticky_enabled: true,
@@ -61,6 +63,8 @@ test('validateConfig rejects malformed fastest probe url', () => {
 test('validateConfig rejects malformed hidden lists', () => {
     assert.throws(() => validateConfig({ hidden_groups: [''] }), /hidden_groups/);
     assert.throws(() => validateConfig({ hidden_nodes: [42] }), /hidden_nodes/);
+    assert.throws(() => validateConfig({ fastest_fallback: [''] }), /fastest_fallback/);
+    assert.throws(() => validateConfig({ node_stats_exclude: [42] }), /node_stats_exclude/);
 });
 
 test('validateConfig rejects invalid sticky mode', () => {

@@ -17,6 +17,14 @@
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
     },
+    "fastest_fallback": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "node_stats_exclude": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
     "hidden_groups": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 }

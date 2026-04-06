@@ -73,6 +73,8 @@ cp config.json.example config.json
   "fastest_group": true,
   "fastest_group_name": "🏁 Самые быстрые",
   "fastest_exclude_groups": [],
+  "fastest_fallback": [],
+  "node_stats_exclude": [],
   "hidden_groups": [],
   "hidden_nodes": [],
   "node_stats": true,
@@ -129,6 +131,22 @@ https://sub.example.com {
 ```json
 {
   "hidden_groups": ["🇺🇸 USA"]
+}
+```
+
+### Использовать группу как fallback для fastest-group
+
+```json
+{
+  "fastest_fallback": ["🇪🇺 Europe LTE"]
+}
+```
+
+### Не фильтровать группу через node_stats
+
+```json
+{
+  "node_stats_exclude": ["🇪🇺 Europe LTE"]
 }
 ```
 
