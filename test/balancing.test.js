@@ -2,7 +2,14 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { matchGroup, isFakeConfig, filterAndSortByLoad, filterHiddenOutbounds, getNodeStats } = require('../lib/balancing');
+const {
+    computePublishedGroupEntries,
+    matchGroup,
+    isFakeConfig,
+    filterAndSortByLoad,
+    filterHiddenOutbounds,
+    getNodeStats,
+} = require('../lib/balancing');
 
 test('matchGroup prefers the longest matching pattern', () => {
     const groups = {
@@ -98,4 +105,31 @@ test('filterHiddenOutbounds removes nodes hidden directly or via hidden group', 
 
     const result = filterHiddenOutbounds(outbounds, groups, ['🇺🇸 USA'], ['German-1']);
     assert.deepEqual(result.map((item) => item.tag), ['Finland-1']);
+});
+
+test('computePublishedGroupEntries expands selected groups into separate node entries', () => {
+    const grouped = {
+        '🇩🇪 Germany': [
+            { tag: '🇩🇪 Germany 1' },
+            { tag: '🇩🇪 Germany 2' },
+        ],
+        '🇫🇮 Finland': [
+            { tag: '🇫🇮 Finland 1' },
+        ],
+    };
+
+    const result = computePublishedGroupEntries(grouped, ['🇩🇪 Germany', '🇫🇮 Finland'], ['🇩🇪 Germany']);
+    assert.deepEqual(
+        result.map((entry) => ({
+            kind: entry.kind,
+            groupName: entry.groupName,
+            configName: entry.configName,
+            count: entry.outbounds.length,
+        })),
+        [
+            { kind: 'node', groupName: '🇩🇪 Germany', configName: '🇩🇪 Germany 1', count: 1 },
+            { kind: 'node', groupName: '🇩🇪 Germany', configName: '🇩🇪 Germany 2', count: 1 },
+            { kind: 'group', groupName: '🇫🇮 Finland', configName: '🇫🇮 Finland', count: 1 },
+        ],
+    );
 });

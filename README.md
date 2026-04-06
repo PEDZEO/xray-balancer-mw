@@ -75,6 +75,7 @@ cp config.json.example config.json
   "fastest_exclude_groups": [],
   "fastest_fallback": [],
   "node_stats_exclude": [],
+  "expand_groups_to_nodes": [],
   "hidden_groups": [],
   "hidden_nodes": [],
   "node_stats": true,
@@ -147,6 +148,14 @@ https://sub.example.com {
 ```json
 {
   "node_stats_exclude": ["🇪🇺 Europe LTE"]
+}
+```
+
+### Показывать серверы группы отдельно
+
+```json
+{
+  "expand_groups_to_nodes": ["🇩🇪 Germany"]
 }
 ```
 

@@ -12,6 +12,7 @@ test('readEffectiveRuntime returns config-driven mutable settings', () => {
         fastest_exclude_groups: ['🇷🇺 White List'],
         fastest_fallback: [' 🇪🇺 LTE ', '', 42],
         node_stats_exclude: [' 🇷🇺 White List ', '', 7],
+        expand_groups_to_nodes: [' 🇩🇪 Germany ', '', 7],
         hidden_groups: [' 🇺🇸 USA ', '', 42],
         hidden_nodes: [' Germany-9 ', '', 7],
         quarantine_nodes: [' Pedze ', '', 42, 'DEplay'],
@@ -41,6 +42,7 @@ test('readEffectiveRuntime returns config-driven mutable settings', () => {
     assert.deepEqual(runtime.fastestExcludeGroups, ['🇷🇺 White List']);
     assert.deepEqual(runtime.fastestFallbackGroups, ['🇪🇺 LTE']);
     assert.deepEqual(runtime.nodeStatsExcludeGroups, ['🇷🇺 White List']);
+    assert.deepEqual(runtime.expandGroupsToNodes, ['🇩🇪 Germany']);
     assert.deepEqual(runtime.hiddenGroups, ['🇺🇸 USA']);
     assert.deepEqual(runtime.hiddenNodes, ['Germany-9']);
     assert.deepEqual(runtime.quarantineNodes, ['Pedze', 'DEplay']);

@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const { validateConfig } = require('./lib/config');
 const { redactTokenPath, sanitizeClientMetadata } = require('./lib/security');
 const {
+    computePublishedGroupEntries,
     filterHiddenOutbounds,
     filterAndSortByLoad,
     getNodeStats,
@@ -30,6 +31,7 @@ const MUTABLE_CONFIG_KEYS = [
     'fastest_exclude_groups',
     'fastest_fallback',
     'node_stats_exclude',
+    'expand_groups_to_nodes',
     'hidden_groups',
     'hidden_nodes',
     'probe_interval',
@@ -127,6 +129,7 @@ const CIRCUIT_BREAKER_OPEN_SEC = pickRuntimeInt('CIRCUIT_BREAKER_OPEN_SEC', 'cir
 let FASTEST_EXCLUDE_GROUPS = [];
 let FASTEST_FALLBACK_GROUPS = [];
 let NODE_STATS_EXCLUDE_GROUPS = [];
+let EXPAND_GROUPS_TO_NODES = [];
 let HIDDEN_GROUPS = [];
 let HIDDEN_NODES = [];
 const DEFAULT_FASTEST_GROUP_NAME = '🏁 🇪🇺 Самые быстрые';
@@ -227,6 +230,7 @@ function applyMutableRuntimeConfig(nextConfig) {
     FASTEST_EXCLUDE_GROUPS = runtime.fastestExcludeGroups;
     FASTEST_FALLBACK_GROUPS = runtime.fastestFallbackGroups;
     NODE_STATS_EXCLUDE_GROUPS = runtime.nodeStatsExcludeGroups;
+    EXPAND_GROUPS_TO_NODES = runtime.expandGroupsToNodes;
     HIDDEN_GROUPS = runtime.hiddenGroups;
     HIDDEN_NODES = runtime.hiddenNodes;
     QUARANTINE_NODES = runtime.quarantineNodes;
@@ -942,6 +946,7 @@ const server = http.createServer(async (req, res) => {
             fastest_probe_url: runtime.fastestProbeUrl,
             fastest_fallback: FASTEST_FALLBACK_GROUPS,
             node_stats_exclude: NODE_STATS_EXCLUDE_GROUPS,
+            expand_groups_to_nodes: EXPAND_GROUPS_TO_NODES,
             probe_interval: runtime.probeInterval,
             node_stats: NODE_STATS_ENABLED,
             panel_auth: PANEL_AUTH_COOKIE ? true : false,
@@ -977,6 +982,7 @@ const server = http.createServer(async (req, res) => {
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
                 fastest_fallback: FASTEST_FALLBACK_GROUPS,
                 node_stats_exclude: NODE_STATS_EXCLUDE_GROUPS,
+                expand_groups_to_nodes: EXPAND_GROUPS_TO_NODES,
                 hidden_groups: HIDDEN_GROUPS,
                 hidden_nodes: HIDDEN_NODES,
                 quarantine_nodes: QUARANTINE_NODES,
@@ -1017,6 +1023,7 @@ const server = http.createServer(async (req, res) => {
             const incomingExclude = payload.fastest_exclude_groups;
             const incomingFastestFallback = payload.fastest_fallback;
             const incomingNodeStatsExclude = payload.node_stats_exclude;
+            const incomingExpandGroupsToNodes = payload.expand_groups_to_nodes;
             const incomingHiddenGroups = payload.hidden_groups;
             const incomingHiddenNodes = payload.hidden_nodes;
             const incomingFastest = payload.fastest_group;
@@ -1027,6 +1034,7 @@ const server = http.createServer(async (req, res) => {
             if (incomingExclude !== undefined) nextConfig.fastest_exclude_groups = incomingExclude;
             if (incomingFastestFallback !== undefined) nextConfig.fastest_fallback = incomingFastestFallback;
             if (incomingNodeStatsExclude !== undefined) nextConfig.node_stats_exclude = incomingNodeStatsExclude;
+            if (incomingExpandGroupsToNodes !== undefined) nextConfig.expand_groups_to_nodes = incomingExpandGroupsToNodes;
             if (incomingHiddenGroups !== undefined) nextConfig.hidden_groups = incomingHiddenGroups;
             if (incomingHiddenNodes !== undefined) nextConfig.hidden_nodes = incomingHiddenNodes;
             if (incomingFastest !== undefined) nextConfig.fastest_group = incomingFastest;
@@ -1061,6 +1069,7 @@ const server = http.createServer(async (req, res) => {
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
                 fastest_fallback: FASTEST_FALLBACK_GROUPS,
                 node_stats_exclude: NODE_STATS_EXCLUDE_GROUPS,
+                expand_groups_to_nodes: EXPAND_GROUPS_TO_NODES,
                 hidden_groups: HIDDEN_GROUPS,
                 hidden_nodes: HIDDEN_NODES,
                 quarantine_nodes: QUARANTINE_NODES,
@@ -1693,15 +1702,21 @@ const server = http.createServer(async (req, res) => {
         }
 
         // Группы по странам
-        const responseGroupOrder = [...configuredGroupOrder, ...Object.keys(grouped).filter((name) => !configuredGroupOrder.includes(name))];
-        for (const groupName of responseGroupOrder) {
+        const publishedGroupEntries = computePublishedGroupEntries(
+            grouped,
+            configuredGroupOrder,
+            EXPAND_GROUPS_TO_NODES
+        );
+        for (const entry of publishedGroupEntries) {
             const runtime = getRuntimeConfig();
             const currentStickyStore = ensureStickyStore();
-            const groupOutbounds = grouped[groupName] || [];
+            const groupName = entry.groupName;
+            const configName = entry.configName;
+            const groupOutbounds = entry.outbounds || [];
             if (groupOutbounds.length === 0) continue;
 
             let selectedGroupOutbounds = groupOutbounds;
-            if (runtime.stickyEnabled && groupOutbounds.length > 1) {
+            if (entry.kind !== 'node' && runtime.stickyEnabled && groupOutbounds.length > 1) {
                 const stickySelection = applyStickySelection(
                     token,
                     `group:${groupName}`,
@@ -1728,7 +1743,7 @@ const server = http.createServer(async (req, res) => {
                 }
             }
 
-            const groupConfig = buildGroupConfig(baseConfig, groupName, selectedGroupOutbounds, {
+            const groupConfig = buildGroupConfig(baseConfig, configName, selectedGroupOutbounds, {
                 groupIndex: resultConfigs.length,
                 probeUrl: PROBE_URL,
                 probeInterval: runtime.probeInterval,
@@ -1745,6 +1760,8 @@ const server = http.createServer(async (req, res) => {
                 logger.info('group_built', {
                     request_id: requestId,
                     group: groupName,
+                    published_as: entry.kind,
+                    config_name: configName,
                     count: selectedGroupOutbounds.length,
                     order,
                     sticky_enabled: runtime.stickyEnabled,
@@ -1754,6 +1771,8 @@ const server = http.createServer(async (req, res) => {
                 logger.info('group_built', {
                     request_id: requestId,
                     group: groupName,
+                    published_as: entry.kind,
+                    config_name: configName,
                     count: selectedGroupOutbounds.length,
                     sticky_enabled: runtime.stickyEnabled,
                     sticky_mode: runtime.stickyMode,

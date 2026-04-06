@@ -37,6 +37,7 @@ test('validateConfig accepts runtime and fastest-exclude options', () => {
         fastest_exclude_groups: ['🇷🇺 White List'],
         fastest_fallback: ['🇪🇺 LTE'],
         node_stats_exclude: ['🇷🇺 White List'],
+        expand_groups_to_nodes: ['🇩🇪 Germany'],
         hidden_groups: ['🇺🇸 USA'],
         hidden_nodes: ['Germany-99'],
         sticky_enabled: true,
@@ -65,6 +66,7 @@ test('validateConfig rejects malformed hidden lists', () => {
     assert.throws(() => validateConfig({ hidden_nodes: [42] }), /hidden_nodes/);
     assert.throws(() => validateConfig({ fastest_fallback: [''] }), /fastest_fallback/);
     assert.throws(() => validateConfig({ node_stats_exclude: [42] }), /node_stats_exclude/);
+    assert.throws(() => validateConfig({ expand_groups_to_nodes: [''] }), /expand_groups_to_nodes/);
 });
 
 test('validateConfig rejects invalid sticky mode', () => {
