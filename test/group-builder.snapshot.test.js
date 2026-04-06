@@ -29,7 +29,7 @@ test('buildGroupConfig output matches snapshot fixture', () => {
     assert.deepEqual(out, expected);
 });
 
-test('buildGroupConfig adds fallback balancer, proxy outbound and unique inbound ports', () => {
+test('buildGroupConfig adds fallback balancer and keeps base inbound ports', () => {
     const base = {
         inbounds: [
             { tag: 'socks', port: 10808, protocol: 'socks' },
@@ -42,13 +42,12 @@ test('buildGroupConfig adds fallback balancer, proxy outbound and unique inbound
             { tag: 'LTE-1', protocol: 'vless' },
             { tag: 'LTE-2', protocol: 'vless' },
         ],
-        groupIndex: 2,
         probeUrl: 'https://example.com/ping',
         probeInterval: '1m',
         strategy: 'leastLoad',
     });
 
-    assert.deepEqual(out.inbounds.map((inbound) => inbound.port), [10812, 10813]);
+    assert.deepEqual(out.inbounds.map((inbound) => inbound.port), [10808, 10809]);
     assert.equal(out.outbounds[0].tag, 'proxy');
     assert.deepEqual(out.burstObservatory.subjectSelector, ['Main-1', 'LTE-1', 'LTE-2']);
     assert.equal(out.burstObservatory.pingConfig.sampling, 1);

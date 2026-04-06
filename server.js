@@ -1687,7 +1687,6 @@ const server = http.createServer(async (req, res) => {
             const fastestGroupName = (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME);
             const fastestConfig = buildGroupConfig(baseConfig, fastestGroupName, selectedFastestOutbounds, {
                 fallbackOutbounds: fastestOutbounds.length > 0 ? fastestFallbackOutbounds : [],
-                groupIndex: resultConfigs.length,
                 probeUrl: runtime.fastestProbeUrl,
                 probeInterval: runtime.probeInterval,
                 strategy: STRATEGY,
@@ -1747,7 +1746,6 @@ const server = http.createServer(async (req, res) => {
             }
 
             const groupConfig = buildGroupConfig(baseConfig, configName, selectedGroupOutbounds, {
-                groupIndex: resultConfigs.length,
                 probeUrl: PROBE_URL,
                 probeInterval: runtime.probeInterval,
                 strategy: STRATEGY,
