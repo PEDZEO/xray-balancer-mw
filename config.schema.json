@@ -44,6 +44,7 @@
     "auto_groups_interval_sec": { "type": "integer", "minimum": 1 },
     "node_stats": { "type": "boolean" },
     "node_stats_interval_sec": { "type": "integer", "minimum": 1 },
+    "node_stats_stale_sec": { "type": "integer", "minimum": 1 },
     "max_users_per_gb": { "type": "integer", "minimum": 1 },
     "max_users_per_cpu": { "type": "integer", "minimum": 1 },
     "cache_ttl_sec": { "type": "integer", "minimum": 1 },

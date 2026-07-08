@@ -38,6 +38,17 @@ function wait(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitFor(predicate, timeoutMs = 3000, intervalMs = 50) {
+    const deadline = Date.now() + timeoutMs;
+    let lastValue = null;
+    while (Date.now() < deadline) {
+        lastValue = await predicate();
+        if (lastValue) return lastValue;
+        await wait(intervalMs);
+    }
+    throw new Error(`condition not met before timeout; last value: ${JSON.stringify(lastValue)}`);
+}
+
 async function waitForHealth(port, childState, getOutput) {
     const deadline = Date.now() + 5000;
     let lastError = null;
@@ -420,4 +431,245 @@ test('background refresh loop skips overlapping auto-groups runs', async (t) => 
     assert.equal(response.status, 200);
     assert.ok(body.runtime_stats.background_overlap_skipped_total >= 1);
     assert.equal(maxInFlight, 1);
+});
+
+test('startup health is not blocked by slow initial auto-groups refresh', async (t) => {
+    let hostRequests = 0;
+    const panel = http.createServer(async (req, res) => {
+        if (req.url !== '/api/hosts/') {
+            res.writeHead(404, { 'Content-Type': 'text/plain' });
+            res.end('not found');
+            return;
+        }
+
+        hostRequests += 1;
+        await wait(1500);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            response: [
+                { remark: 'Germany Berlin 1', isDisabled: false },
+            ],
+        }));
+    });
+    const panelPort = await listenOnRandomPort(panel);
+    t.after(() => closeServer(panel));
+
+    const started = Date.now();
+    const balancer = await startBalancer(
+        t,
+        {
+            remnawave_url: `http://127.0.0.1:${panelPort}`,
+            auto_groups: true,
+            auto_groups_interval_sec: 30,
+            request_timeout_ms: 3000,
+        },
+        { API_TOKEN: 'integration-api-token' }
+    );
+    const elapsed = Date.now() - started;
+
+    assert.ok(elapsed < 1200, `startup took ${elapsed}ms`);
+    await waitFor(() => hostRequests >= 1, 1000);
+
+    const health = await fetch(`${balancer.baseUrl}/health`);
+    assert.equal(health.status, 200);
+});
+
+test('stale node stats do not influence subscription ordering', async (t) => {
+    const upstream = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([
+            {
+                remarks: 'valid',
+                outbounds: [
+                    {
+                        protocol: 'vless',
+                        tag: 'Germany-A',
+                        settings: { vnext: [{ address: 'a.example.com', port: 443 }] },
+                    },
+                    {
+                        protocol: 'vless',
+                        tag: 'Germany-B',
+                        settings: { vnext: [{ address: 'b.example.com', port: 443 }] },
+                    },
+                ],
+            },
+        ]));
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+
+    const panel = http.createServer((req, res) => {
+        if (req.url !== '/api/nodes/') {
+            res.writeHead(404, { 'Content-Type': 'text/plain' });
+            res.end('not found');
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            response: [
+                {
+                    name: 'Germany-A',
+                    address: 'a.example.com',
+                    usersOnline: 20,
+                    totalRam: '1GB',
+                    cpuCount: 1,
+                    isConnected: true,
+                    isDisabled: false,
+                },
+                {
+                    name: 'Germany-B',
+                    address: 'b.example.com',
+                    usersOnline: 0,
+                    totalRam: '1GB',
+                    cpuCount: 1,
+                    isConnected: true,
+                    isDisabled: false,
+                },
+            ],
+        }));
+    });
+    const panelPort = await listenOnRandomPort(panel);
+    t.after(() => closeServer(panel));
+
+    const balancer = await startBalancer(
+        t,
+        {
+            upstreamPort,
+            remnawave_url: `http://127.0.0.1:${panelPort}`,
+            node_stats: true,
+            node_stats_interval_sec: 30,
+            node_stats_stale_sec: 1,
+            request_timeout_ms: 1000,
+        },
+        {
+            API_TOKEN: 'integration-api-token',
+            NODE_STATS: 'true',
+        }
+    );
+
+    await waitFor(async () => {
+        const response = await fetch(`${balancer.baseUrl}/admin/debug/stats`, {
+            headers: { 'X-Admin-Token': 'integration-admin-token' },
+        });
+        const body = await response.json();
+        return body.cached_nodes >= 2 && body.node_stats_fresh ? body : null;
+    }, 3000);
+
+    await wait(1200);
+    const debug = await fetch(`${balancer.baseUrl}/admin/debug/stats`, {
+        headers: { 'X-Admin-Token': 'integration-admin-token' },
+    });
+    const debugBody = await debug.json();
+    assert.equal(debug.status, 200);
+    assert.equal(debugBody.node_stats_fresh, false);
+
+    const response = await fetch(`${balancer.baseUrl}/stale-token`, {
+        headers: { 'User-Agent': 'Happ/1.0' },
+    });
+    const body = await response.text();
+
+    assert.equal(response.status, 200);
+    assert.ok(body.indexOf('Germany-A') !== -1);
+    assert.ok(body.indexOf('Germany-B') !== -1);
+    assert.ok(body.indexOf('Germany-A') < body.indexOf('Germany-B'));
+});
+
+test('concurrent admin stats refreshes share one upstream request', async (t) => {
+    let nodeRequests = 0;
+    const panel = http.createServer(async (req, res) => {
+        if (req.url !== '/api/nodes/') {
+            res.writeHead(404, { 'Content-Type': 'text/plain' });
+            res.end('not found');
+            return;
+        }
+
+        nodeRequests += 1;
+        await wait(150);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            response: [
+                {
+                    name: 'Germany-A',
+                    address: 'a.example.com',
+                    usersOnline: 0,
+                    totalRam: '1GB',
+                    cpuCount: 1,
+                    isConnected: true,
+                    isDisabled: false,
+                },
+            ],
+        }));
+    });
+    const panelPort = await listenOnRandomPort(panel);
+    t.after(() => closeServer(panel));
+
+    const balancer = await startBalancer(
+        t,
+        {
+            remnawave_url: `http://127.0.0.1:${panelPort}`,
+            request_timeout_ms: 1000,
+        },
+        { API_TOKEN: 'integration-api-token' }
+    );
+
+    const headers = { 'X-Admin-Token': 'integration-admin-token' };
+    const [first, second] = await Promise.all([
+        fetch(`${balancer.baseUrl}/admin/refresh-stats`, { headers }),
+        fetch(`${balancer.baseUrl}/admin/refresh-stats`, { headers }),
+    ]);
+    const [firstBody, secondBody] = await Promise.all([first.json(), second.json()]);
+
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.equal(firstBody.status, 'ok');
+    assert.equal(secondBody.status, 'ok');
+    assert.equal(nodeRequests, 1);
+});
+
+test('invalid NODE_STATS_STALE_SEC env falls back to positive default', async (t) => {
+    const balancer = await startBalancer(
+        t,
+        { node_stats_interval_sec: 10 },
+        { NODE_STATS_STALE_SEC: '-1' }
+    );
+
+    const response = await fetch(`${balancer.baseUrl}/admin/debug/stats`, {
+        headers: { 'X-Admin-Token': 'integration-admin-token' },
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(body.node_stats_stale_sec, 300);
+});
+
+test('parallel quarantine updates are serialized without losing nodes', async (t) => {
+    const balancer = await startBalancer(t);
+    const headers = {
+        'Content-Type': 'application/json',
+        'X-Admin-Token': 'integration-admin-token',
+    };
+
+    const [first, second] = await Promise.all([
+        fetch(`${balancer.baseUrl}/admin/quarantine`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ node: 'Node-A' }),
+        }),
+        fetch(`${balancer.baseUrl}/admin/quarantine`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ node: 'Node-B' }),
+        }),
+    ]);
+
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+
+    const response = await fetch(`${balancer.baseUrl}/admin/quarantine`, {
+        headers: { 'X-Admin-Token': 'integration-admin-token' },
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.deepEqual([...body.quarantine_nodes].sort(), ['Node-A', 'Node-B']);
 });

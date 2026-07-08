@@ -21,6 +21,7 @@
 
     "node_stats": false,
     "node_stats_interval_sec": 120,
+    "node_stats_stale_sec": 360,
     "max_users_per_gb": 20,
     "max_users_per_cpu": 40,
     "cache_ttl_sec": 300,
