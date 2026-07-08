@@ -165,6 +165,7 @@ let lastNodeStatsRefreshAt = 0;
 let lastNodeStatsError = null;
 const autoQuarantineState = new Map();
 const subscriptionCache = createTokenCache(CACHE_TTL_SEC, CACHE_MAX_ENTRIES);
+const inFlightUpstreamFetches = new Map();
 const rateLimiter = createRateLimiter(RATE_LIMIT_PER_MINUTE, RATE_LIMIT_BURST_10S);
 const tokenRateLimiter = createKeyedRateLimiter(TOKEN_RATE_LIMIT_PER_MINUTE, TOKEN_RATE_LIMIT_BURST_10S, {
     maxEntries: TOKEN_LIMITER_MAX_ENTRIES,
@@ -176,8 +177,11 @@ const runtimeStats = {
     started_at: Date.now(),
     requests_total: 0,
     request_failures: 0,
+    cache_hits_total: 0,
     cache_fallback_total: 0,
     cache_fallback_stale_total: 0,
+    upstream_singleflight_joined_total: 0,
+    background_overlap_skipped_total: 0,
     circuit_open_total: 0,
     rate_limited_ip_total: 0,
     rate_limited_token_total: 0,
@@ -290,8 +294,20 @@ function isSocketHangupError(err) {
     return /socket hang up|ECONNRESET|EPIPE|EOF/i.test(msg) || /ECONNRESET|EPIPE/i.test(code);
 }
 
-function fetchUrl(targetUrl, headers = {}, maxRedirects = MAX_REDIRECTS) {
+function createTimeoutError() {
+    const err = new Error('Timeout');
+    err.code = 'ETIMEDOUT';
+    return err;
+}
+
+function fetchUrl(targetUrl, headers = {}, maxRedirects = MAX_REDIRECTS, deadlineAt = Date.now() + REQUEST_TIMEOUT_MS) {
     return new Promise((resolve, reject) => {
+        const remainingMs = deadlineAt - Date.now();
+        if (remainingMs <= 0) {
+            reject(createTimeoutError());
+            return;
+        }
+
         const parsed = new URL(targetUrl);
         const mod = parsed.protocol === 'https:' ? https : http;
         const opts = {
@@ -301,34 +317,99 @@ function fetchUrl(targetUrl, headers = {}, maxRedirects = MAX_REDIRECTS) {
             method: 'GET',
             headers: { ...headers },
         };
-        const req = mod.request(opts, (res) => {
+
+        let settled = false;
+        let deadlineTimer = null;
+        let req = null;
+        const finish = (fn, value) => {
+            if (settled) return;
+            settled = true;
+            if (deadlineTimer) clearTimeout(deadlineTimer);
+            fn(value);
+        };
+        const succeed = (value) => finish(resolve, value);
+        const fail = (err) => finish(reject, err);
+
+        req = mod.request(opts, (res) => {
+            res.on('error', fail);
             if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307) && res.headers.location) {
+                res.resume();
                 if (maxRedirects <= 0) {
-                    return reject(new Error('Too many redirects'));
+                    fail(new Error('Too many redirects'));
+                    return;
                 }
                 const redirectUrl = new URL(res.headers.location, targetUrl);
                 if (redirectUrl.protocol !== parsed.protocol || redirectUrl.host !== parsed.host) {
-                    return reject(new Error('Unsafe redirect blocked'));
+                    fail(new Error('Unsafe redirect blocked'));
+                    return;
                 }
-                return fetchUrl(redirectUrl.href, headers, maxRedirects - 1).then(resolve).catch(reject);
+                fetchUrl(redirectUrl.href, headers, maxRedirects - 1, deadlineAt).then(succeed).catch(fail);
+                return;
             }
 
             let data = '';
             let size = 0;
             res.on('data', (chunk) => {
+                if (settled) return;
                 size += chunk.length;
                 if (size > MAX_RESPONSE_SIZE) {
-                    req.destroy();
-                    return reject(new Error('Response too large'));
+                    const err = new Error('Response too large');
+                    req.destroy(err);
+                    fail(err);
+                    return;
                 }
                 data += chunk;
             });
-            res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
+            res.on('end', () => succeed({ status: res.statusCode, headers: res.headers, body: data }));
         });
-        req.on('error', reject);
-        req.setTimeout(REQUEST_TIMEOUT_MS, () => { req.destroy(); reject(new Error('Timeout')); });
+        req.on('error', fail);
+        req.setTimeout(remainingMs, () => {
+            const err = createTimeoutError();
+            req.destroy(err);
+            fail(err);
+        });
+        deadlineTimer = setTimeout(() => {
+            const err = createTimeoutError();
+            if (req) req.destroy(err);
+            fail(err);
+        }, remainingMs);
+        if (typeof deadlineTimer.unref === 'function') deadlineTimer.unref();
         req.end();
     });
+}
+
+async function fetchUrlWithSocketRetry(targetUrl, headers, requestId) {
+    try {
+        return await fetchUrl(targetUrl, headers);
+    } catch (err) {
+        if (!isSocketHangupError(err)) {
+            throw err;
+        }
+        logger.warn('upstream_retry_after_socket_hangup', { request_id: requestId, message: err.message });
+        return fetchUrl(targetUrl, headers);
+    }
+}
+
+async function fetchUpstreamSingleFlight(token, targetUrl, headers, requestId) {
+    const existing = inFlightUpstreamFetches.get(token);
+    if (existing) {
+        runtimeStats.upstream_singleflight_joined_total += 1;
+        logger.info('upstream_singleflight_joined', {
+            request_id: requestId,
+            token: redactTokenPath(`/${token}`).slice(1),
+        });
+        return existing;
+    }
+
+    const promise = fetchUrlWithSocketRetry(targetUrl, headers, requestId);
+    inFlightUpstreamFetches.set(token, promise);
+    try {
+        return await promise;
+    } finally {
+        if (inFlightUpstreamFetches.get(token) === promise) {
+            inFlightUpstreamFetches.delete(token);
+        }
+    }
 }
 
 function timingSafeEqualString(a, b) {
@@ -1017,6 +1098,27 @@ async function warmupToken(token) {
     }
 }
 
+function setNonOverlappingInterval(taskName, task, intervalMs) {
+    let running = false;
+    const timer = setInterval(async () => {
+        if (running) {
+            runtimeStats.background_overlap_skipped_total += 1;
+            logger.warn('background_task_overlap_skipped', { task: taskName });
+            return;
+        }
+
+        running = true;
+        try {
+            await task();
+        } catch (err) {
+            logger.error('background_task_failed', { task: taskName, message: err.message });
+        } finally {
+            running = false;
+        }
+    }, intervalMs);
+    return timer;
+}
+
 const server = http.createServer(async (req, res) => {
     const requestId = normalizeRequestId(req.headers['x-request-id'], crypto.randomUUID());
     let parsedUrl;
@@ -1550,6 +1652,15 @@ const server = http.createServer(async (req, res) => {
     }
     logger.info('request_start', { request_id: requestId, method: req.method, path: safePath, ip: clientIp });
 
+    const cachedSubscription = subscriptionCache.get(token);
+    if (cachedSubscription) {
+        runtimeStats.cache_hits_total += 1;
+        logger.info('cache_hit', { request_id: requestId, token: redactTokenPath(`/${token}`).slice(1) });
+        res.writeHead(200, forwardResponseHeaders(cachedSubscription.headers, 'application/json; charset=utf-8'));
+        res.end(cachedSubscription.body);
+        return;
+    }
+
     try {
         // Пробрасываем ВСЕ заголовки от клиента, кроме тех что ломают проксирование
         const forwardHeaders = {};
@@ -1580,16 +1691,7 @@ const server = http.createServer(async (req, res) => {
             os: clientMeta.os,
         });
 
-        let upstream;
-        try {
-            upstream = await fetchUrl(targetUrl, forwardHeaders);
-        } catch (err) {
-            if (!isSocketHangupError(err)) {
-                throw err;
-            }
-            logger.warn('upstream_retry_after_socket_hangup', { request_id: requestId, message: err.message });
-            upstream = await fetchUrl(targetUrl, forwardHeaders);
-        }
+        const upstream = await fetchUpstreamSingleFlight(token, targetUrl, forwardHeaders, requestId);
         logger.info('upstream_response', {
             request_id: requestId,
             status: upstream.status,
@@ -1972,12 +2074,12 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 async function start() {
     if (AUTO_GROUPS && API_TOKEN) {
         await refreshGroups();
-        setInterval(() => refreshGroups(), AUTO_GROUPS_INTERVAL);
+        setNonOverlappingInterval('refresh_groups', () => refreshGroups(), AUTO_GROUPS_INTERVAL);
     }
 
     if (NODE_STATS_ENABLED && API_TOKEN) {
         await fetchNodeStats();
-        setInterval(() => fetchNodeStats(), NODE_STATS_INTERVAL);
+        setNonOverlappingInterval('fetch_node_stats', () => fetchNodeStats(), NODE_STATS_INTERVAL);
     }
 
     if (WARMUP_TOKENS.length > 0) {
