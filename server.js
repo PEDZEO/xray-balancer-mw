@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { validateConfig } = require('./lib/config');
-const { redactTokenPath, sanitizeClientMetadata } = require('./lib/security');
+const { normalizeRequestId, redactTokenPath, sanitizeClientMetadata } = require('./lib/security');
 const {
     computePublishedGroupEntries,
     filterHiddenOutbounds,
@@ -37,6 +37,7 @@ const MUTABLE_CONFIG_KEYS = [
     'probe_interval',
     'fastest_probe_url',
     'quarantine_nodes',
+    'auto_quarantine_nodes',
     'auto_quarantine_enabled',
     'auto_quarantine_failures',
     'auto_quarantine_release_successes',
@@ -136,6 +137,7 @@ const DEFAULT_FASTEST_GROUP_NAME = '🏁 🇪🇺 Самые быстрые';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || config.admin_token || '';
 const WARMUP_TOKENS = Array.isArray(config.warmup_tokens) ? config.warmup_tokens : [];
 let QUARANTINE_NODES = [];
+let AUTO_QUARANTINE_NODES = [];
 
 const MAX_RESPONSE_SIZE = 10 * 1024 * 1024;
 
@@ -234,6 +236,7 @@ function applyMutableRuntimeConfig(nextConfig) {
     HIDDEN_GROUPS = runtime.hiddenGroups;
     HIDDEN_NODES = runtime.hiddenNodes;
     QUARANTINE_NODES = runtime.quarantineNodes;
+    AUTO_QUARANTINE_NODES = runtime.autoQuarantineNodes;
     ensureStickyStore();
 }
 
@@ -383,6 +386,7 @@ function writeConfigFile(nextConfig) {
 }
 
 function persistConfigIfPossible(nextConfig, requestId) {
+    const targetPath = CONFIG_RUNTIME_PATH || CONFIG_PATH;
     try {
         writeConfigFile(nextConfig);
         return { persisted: true, error: null };
@@ -390,13 +394,29 @@ function persistConfigIfPossible(nextConfig, requestId) {
         logger.warn('config_persist_skipped', {
             request_id: requestId,
             error: err.message,
-            config_path: CONFIG_PATH,
+            config_path: targetPath,
         });
         return { persisted: false, error: err.message };
     }
 }
 
-function upsertQuarantineNode(nodeName, requestId) {
+function checkConfigPersistenceWritable() {
+    const targetPath = CONFIG_RUNTIME_PATH || CONFIG_PATH;
+    const targetDir = path.dirname(targetPath);
+    const probePath = path.join(targetDir, `.write-test-${process.pid}-${Date.now()}`);
+    try {
+        if (!fs.existsSync(targetDir)) {
+            fs.mkdirSync(targetDir, { recursive: true });
+        }
+        fs.writeFileSync(probePath, 'ok');
+        fs.unlinkSync(probePath);
+        return { ok: true, path: targetPath, error: null };
+    } catch (err) {
+        return { ok: false, path: targetPath, error: err.message };
+    }
+}
+
+function upsertQuarantineNode(nodeName, requestId, opts = {}) {
     const runtime = getRuntimeConfig();
     const normalized = normalizeNodeName(nodeName);
     if (!normalized) return { changed: false, persisted: true, error: null };
@@ -407,11 +427,24 @@ function upsertQuarantineNode(nodeName, requestId) {
         return { changed: false, persisted: false, error: 'auto_quarantine_max_nodes reached' };
     }
 
-    QUARANTINE_NODES = [...QUARANTINE_NODES, nodeName];
-    const nextConfig = { ...config, quarantine_nodes: QUARANTINE_NODES };
+    const autoExisting = new Set(AUTO_QUARANTINE_NODES.map(normalizeNodeName));
+    const nextAutoNodes = opts.auto === true && !autoExisting.has(normalized)
+        ? [...AUTO_QUARANTINE_NODES, nodeName]
+        : AUTO_QUARANTINE_NODES;
+    const nextNodes = [...QUARANTINE_NODES, nodeName];
+    const nextConfig = {
+        ...config,
+        quarantine_nodes: nextNodes,
+        auto_quarantine_nodes: nextAutoNodes,
+    };
     validateConfig(nextConfig);
-    applyMutableRuntimeConfig(nextConfig);
     const persistResult = persistConfigIfPossible(nextConfig, requestId);
+    if (!persistResult.persisted) {
+        return { changed: false, persisted: false, error: persistResult.error };
+    }
+    QUARANTINE_NODES = nextNodes;
+    AUTO_QUARANTINE_NODES = nextAutoNodes;
+    applyMutableRuntimeConfig(nextConfig);
     return { changed: true, persisted: persistResult.persisted, error: persistResult.error };
 }
 
@@ -419,13 +452,22 @@ function removeQuarantineNode(nodeName, requestId) {
     const normalized = normalizeNodeName(nodeName);
     if (!normalized) return { changed: false, persisted: true, error: null };
     const nextNodes = QUARANTINE_NODES.filter((name) => normalizeNodeName(name) !== normalized);
+    const nextAutoNodes = AUTO_QUARANTINE_NODES.filter((name) => normalizeNodeName(name) !== normalized);
     if (nextNodes.length === QUARANTINE_NODES.length) return { changed: false, persisted: true, error: null };
 
-    QUARANTINE_NODES = nextNodes;
-    const nextConfig = { ...config, quarantine_nodes: QUARANTINE_NODES };
+    const nextConfig = {
+        ...config,
+        quarantine_nodes: nextNodes,
+        auto_quarantine_nodes: nextAutoNodes,
+    };
     validateConfig(nextConfig);
-    applyMutableRuntimeConfig(nextConfig);
     const persistResult = persistConfigIfPossible(nextConfig, requestId);
+    if (!persistResult.persisted) {
+        return { changed: false, persisted: false, error: persistResult.error };
+    }
+    QUARANTINE_NODES = nextNodes;
+    AUTO_QUARANTINE_NODES = nextAutoNodes;
+    applyMutableRuntimeConfig(nextConfig);
     return { changed: true, persisted: persistResult.persisted, error: persistResult.error };
 }
 
@@ -436,6 +478,7 @@ function updateAutoQuarantineFromNodes(nodes) {
     const requestId = `auto-quarantine-${Date.now()}`;
     const activeNames = new Set();
     const quarantinedSet = new Set(QUARANTINE_NODES.map(normalizeNodeName).filter(Boolean));
+    const autoManagedSet = new Set(AUTO_QUARANTINE_NODES.map(normalizeNodeName).filter(Boolean));
 
     for (const node of nodes) {
         const nodeName = (node.name || '').toString().trim();
@@ -450,7 +493,12 @@ function updateAutoQuarantineFromNodes(nodes) {
         const { load } = computeNodeLoad(usersOnline, totalRamGb, cpuCount);
         const degraded = !isConnected || isDisabled || load > 1.0;
 
-        const prev = autoQuarantineState.get(nodeName) || { fail: 0, ok: 0, auto: false };
+        const normalizedNodeName = normalizeNodeName(nodeName);
+        const prev = autoQuarantineState.get(nodeName) || {
+            fail: 0,
+            ok: 0,
+            auto: autoManagedSet.has(normalizedNodeName),
+        };
         if (degraded) {
             prev.fail += 1;
             prev.ok = 0;
@@ -459,13 +507,13 @@ function updateAutoQuarantineFromNodes(nodes) {
             prev.fail = 0;
         }
 
-        const normalizedNodeName = normalizeNodeName(nodeName);
         const currentlyQuarantined = quarantinedSet.has(normalizedNodeName);
         if (!currentlyQuarantined && prev.fail >= runtime.autoQuarantineFailures) {
-            const result = upsertQuarantineNode(nodeName, requestId);
+            const result = upsertQuarantineNode(nodeName, requestId, { auto: true });
             if (result.changed) {
                 prev.auto = true;
                 quarantinedSet.add(normalizedNodeName);
+                autoManagedSet.add(normalizedNodeName);
                 logger.warn('auto_quarantine_added', {
                     node: nodeName,
                     fail_count: prev.fail,
@@ -474,11 +522,12 @@ function updateAutoQuarantineFromNodes(nodes) {
                     persist_error: result.error,
                 });
             }
-        } else if (currentlyQuarantined && prev.auto && prev.ok >= runtime.autoQuarantineReleaseSuccesses) {
+        } else if (currentlyQuarantined && (prev.auto || autoManagedSet.has(normalizedNodeName)) && prev.ok >= runtime.autoQuarantineReleaseSuccesses) {
             const result = removeQuarantineNode(nodeName, requestId);
             if (result.changed) {
                 prev.auto = false;
                 quarantinedSet.delete(normalizedNodeName);
+                autoManagedSet.delete(normalizedNodeName);
                 logger.info('auto_quarantine_released', {
                     node: nodeName,
                     success_count: prev.ok,
@@ -781,13 +830,24 @@ function buildGroupsFromHosts(hosts) {
     return groups;
 }
 
-async function refreshGroups() {
+async function refreshGroups(opts = {}) {
     const hostsResult = await fetchHostsFromApi();
     if (!hostsResult.ok || !hostsResult.hosts) return { ok: false, error: hostsResult.error || 'Failed to fetch hosts' };
     const hosts = hostsResult.hosts;
     const newGroups = buildGroupsFromHosts(hosts);
     if (Object.keys(newGroups).length === 0) return { ok: false, error: 'No groups detected from enabled hosts' };
-    GROUPS = { ...newGroups, ...(config.groups || {}) };
+    const mergedGroups = { ...newGroups, ...(config.groups || {}) };
+    if (opts.persist === true) {
+        const nextConfig = { ...config, groups: mergedGroups };
+        validateConfig(nextConfig);
+        const persistResult = persistConfigIfPossible(nextConfig, opts.requestId || 'refresh-groups');
+        if (!persistResult.persisted) {
+            return { ok: false, error: persistResult.error || 'Failed to persist refreshed groups' };
+        }
+        applyMutableRuntimeConfig(nextConfig);
+    } else {
+        GROUPS = mergedGroups;
+    }
     console.log(`[auto-groups] Обновлены: ${Object.entries(GROUPS).map(([k, v]) => `${k} [${v}]`).join(' | ')}`);
     return { ok: true, groups: GROUPS };
 }
@@ -835,6 +895,8 @@ function collectAllProxyOutbounds(configArray) {
 
 // Заголовки запроса которые НЕ пробрасываем на upstream
 const SKIP_REQUEST_HEADERS = new Set([
+    'authorization',
+    'cookie',
     'accept-encoding',      // Чтобы upstream не сжимал ответ
     'host',                 // Перезаписываем сами
     'connection',           // Hop-by-hop
@@ -842,12 +904,15 @@ const SKIP_REQUEST_HEADERS = new Set([
     'transfer-encoding',    // Hop-by-hop
     'te',                   // Hop-by-hop
     'upgrade',              // Hop-by-hop
+    'x-admin-token',
     'proxy-authorization',  // Не нужен для upstream
     'proxy-connection',     // Hop-by-hop
 ]);
 
 // Заголовки ответа которые НЕ пробрасываем клиенту
 const SKIP_RESPONSE_HEADERS = new Set([
+    'set-cookie',
+    'set-cookie2',
     'connection',
     'keep-alive',
     'transfer-encoding',
@@ -865,7 +930,18 @@ const SKIP_RESPONSE_HEADERS = new Set([
 function forwardResponseHeaders(upstreamHeaders, contentType) {
     const result = { 'Content-Type': contentType || 'application/json; charset=utf-8' };
     for (const [key, val] of Object.entries(upstreamHeaders)) {
-        if (!SKIP_RESPONSE_HEADERS.has(key) && key !== 'content-type') {
+        const normalizedKey = key.toLowerCase();
+        if (!SKIP_RESPONSE_HEADERS.has(normalizedKey) && normalizedKey !== 'content-type') {
+            result[key] = val;
+        }
+    }
+    return result;
+}
+
+function sanitizeHeadersForCache(upstreamHeaders = {}) {
+    const result = {};
+    for (const [key, val] of Object.entries(upstreamHeaders)) {
+        if (!SKIP_RESPONSE_HEADERS.has(key.toLowerCase())) {
             result[key] = val;
         }
     }
@@ -878,6 +954,14 @@ function getCachedFallback(token) {
     const stale = subscriptionCache.getStale(token, CACHE_STALE_IF_ERROR_SEC);
     if (stale) return { kind: 'stale', item: stale };
     return null;
+}
+
+function isServiceFailureStatus(status) {
+    return status >= 500;
+}
+
+function canFallbackForStatus(status) {
+    return status >= 500 || status === 408 || status === 429;
 }
 
 function toIsoTimestamp(ms) {
@@ -917,7 +1001,7 @@ async function warmupToken(token) {
         if (upstream.status !== 200) return false;
         const classified = classifyUpstreamPayload(upstream.body);
         if (classified.type === 'xray_json') {
-            subscriptionCache.set(token, upstream.body, upstream.headers);
+            subscriptionCache.set(token, upstream.body, sanitizeHeadersForCache(upstream.headers));
             lastUpstreamSuccessAt = Date.now();
             return true;
         }
@@ -928,39 +1012,23 @@ async function warmupToken(token) {
 }
 
 const server = http.createServer(async (req, res) => {
-    const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    const requestId = normalizeRequestId(req.headers['x-request-id'], crypto.randomUUID());
+    let parsedUrl;
+    try {
+        parsedUrl = new URL(req.url || '/', 'http://localhost');
+    } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'error', code: 'BAD_REQUEST', request_id: requestId }));
+        return;
+    }
     const pathname = parsedUrl.pathname;
-    const requestId = req.headers['x-request-id'] || crypto.randomUUID();
     const clientIp = resolveClientIp(req);
 
     if (pathname === '/health' || pathname === '/mw-health') {
-        const runtime = getRuntimeConfig();
-        const currentStickyStore = ensureStickyStore();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
             status: 'ok',
             request_id: requestId,
-            groups: Object.keys(GROUPS),
-            auto_groups: AUTO_GROUPS,
-            fastest_group: config.fastest_group !== false,
-            fastest_probe_url: runtime.fastestProbeUrl,
-            fastest_fallback: FASTEST_FALLBACK_GROUPS,
-            node_stats_exclude: NODE_STATS_EXCLUDE_GROUPS,
-            expand_groups_to_nodes: EXPAND_GROUPS_TO_NODES,
-            probe_interval: runtime.probeInterval,
-            node_stats: NODE_STATS_ENABLED,
-            panel_auth: PANEL_AUTH_COOKIE ? true : false,
-            cached_nodes: Object.keys(nodeStatsCache).length,
-            quarantine_nodes: QUARANTINE_NODES,
-            quarantine_count: QUARANTINE_NODES.length,
-            auto_quarantine_enabled: runtime.autoQuarantineEnabled,
-            auto_drain_enabled: runtime.autoDrainEnabled,
-            auto_drain_count: autoDrainNodes.size,
-            sticky_enabled: runtime.stickyEnabled,
-            sticky_mode: runtime.stickyMode,
-            sticky_new_connections_only: runtime.stickyNewConnectionsOnly,
-            sticky: currentStickyStore.summary(),
-            sub_page: SUB_PAGE_URL || 'disabled',
         }));
         return;
     }
@@ -986,6 +1054,7 @@ const server = http.createServer(async (req, res) => {
                 hidden_groups: HIDDEN_GROUPS,
                 hidden_nodes: HIDDEN_NODES,
                 quarantine_nodes: QUARANTINE_NODES,
+                auto_quarantine_nodes: AUTO_QUARANTINE_NODES,
                 auto_quarantine_enabled: runtime.autoQuarantineEnabled,
                 auto_quarantine_failures: runtime.autoQuarantineFailures,
                 auto_quarantine_release_successes: runtime.autoQuarantineReleaseSuccesses,
@@ -1046,9 +1115,19 @@ const server = http.createServer(async (req, res) => {
             }
 
             validateConfig(nextConfig);
+            const persistResult = persistConfigIfPossible(nextConfig, requestId);
+            if (!persistResult.persisted) {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    status: 'error',
+                    code: 'CONFIG_PERSIST_FAILED',
+                    request_id: requestId,
+                    message: persistResult.error,
+                }));
+                return;
+            }
             applyMutableRuntimeConfig(nextConfig);
             const runtime = getRuntimeConfig();
-            const persistResult = persistConfigIfPossible(nextConfig, requestId);
 
             logger.info('admin_groups_updated', {
                 request_id: requestId,
@@ -1073,6 +1152,7 @@ const server = http.createServer(async (req, res) => {
                 hidden_groups: HIDDEN_GROUPS,
                 hidden_nodes: HIDDEN_NODES,
                 quarantine_nodes: QUARANTINE_NODES,
+                auto_quarantine_nodes: AUTO_QUARANTINE_NODES,
                 auto_quarantine_enabled: runtime.autoQuarantineEnabled,
                 auto_quarantine_failures: runtime.autoQuarantineFailures,
                 auto_quarantine_release_successes: runtime.autoQuarantineReleaseSuccesses,
@@ -1112,20 +1192,10 @@ const server = http.createServer(async (req, res) => {
         const hasRecentUpstream = lastUpstreamSuccessAt > 0 && (Date.now() - lastUpstreamSuccessAt) <= healthyWindowMs;
         const hasCache = subscriptionCache.hasFreshAny();
         const ready = hasRecentUpstream || hasCache;
-        const cb = circuitBreaker.status();
         res.writeHead(ready ? 200 : 503, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
             status: ready ? 'ready' : 'not_ready',
             request_id: requestId,
-            has_recent_upstream: hasRecentUpstream,
-            has_cache: hasCache,
-            cache_ttl_sec: CACHE_TTL_SEC,
-            circuit_open: cb.open,
-            last_upstream_success_at: toIsoTimestamp(lastUpstreamSuccessAt),
-            last_upstream_error: lastUpstreamError,
-            last_node_stats_refresh_at: toIsoTimestamp(lastNodeStatsRefreshAt),
-            last_node_stats_error: lastNodeStatsError,
-            token_limiter_size: tokenRateLimiter.size(),
         }));
         return;
     }
@@ -1163,6 +1233,7 @@ const server = http.createServer(async (req, res) => {
                 status: 'ok',
                 request_id: requestId,
                 quarantine_nodes: QUARANTINE_NODES,
+                auto_quarantine_nodes: AUTO_QUARANTINE_NODES,
                 quarantine_count: QUARANTINE_NODES.length,
             }));
             return;
@@ -1185,16 +1256,28 @@ const server = http.createServer(async (req, res) => {
             const normalized = normalizeNodeName(nodeRaw);
             const existing = new Set(QUARANTINE_NODES.map(normalizeNodeName));
             if (!existing.has(normalized)) {
-                QUARANTINE_NODES = [...QUARANTINE_NODES, nodeRaw];
-                const nextConfig = { ...config, quarantine_nodes: QUARANTINE_NODES };
+                const nextNodes = [...QUARANTINE_NODES, nodeRaw];
+                const nextConfig = { ...config, quarantine_nodes: nextNodes };
                 validateConfig(nextConfig);
-                applyMutableRuntimeConfig(nextConfig);
                 const persistResult = persistConfigIfPossible(nextConfig, requestId);
+                if (!persistResult.persisted) {
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({
+                        status: 'error',
+                        code: 'CONFIG_PERSIST_FAILED',
+                        request_id: requestId,
+                        message: persistResult.error,
+                    }));
+                    return;
+                }
+                QUARANTINE_NODES = nextNodes;
+                applyMutableRuntimeConfig(nextConfig);
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({
                     status: 'ok',
                     request_id: requestId,
                     quarantine_nodes: QUARANTINE_NODES,
+                    auto_quarantine_nodes: AUTO_QUARANTINE_NODES,
                     quarantine_count: QUARANTINE_NODES.length,
                     persisted: persistResult.persisted,
                     persist_error: persistResult.error,
@@ -1207,6 +1290,7 @@ const server = http.createServer(async (req, res) => {
                 status: 'ok',
                 request_id: requestId,
                 quarantine_nodes: QUARANTINE_NODES,
+                auto_quarantine_nodes: AUTO_QUARANTINE_NODES,
                 quarantine_count: QUARANTINE_NODES.length,
                 persisted: true,
                 persist_error: null,
@@ -1246,17 +1330,35 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
-        QUARANTINE_NODES = QUARANTINE_NODES.filter((name) => normalizeNodeName(name) !== normalized);
-        const nextConfig = { ...config, quarantine_nodes: QUARANTINE_NODES };
+        const nextNodes = QUARANTINE_NODES.filter((name) => normalizeNodeName(name) !== normalized);
+        const nextAutoNodes = AUTO_QUARANTINE_NODES.filter((name) => normalizeNodeName(name) !== normalized);
+        const nextConfig = {
+            ...config,
+            quarantine_nodes: nextNodes,
+            auto_quarantine_nodes: nextAutoNodes,
+        };
         validateConfig(nextConfig);
-        applyMutableRuntimeConfig(nextConfig);
         const persistResult = persistConfigIfPossible(nextConfig, requestId);
+        if (!persistResult.persisted) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                status: 'error',
+                code: 'CONFIG_PERSIST_FAILED',
+                request_id: requestId,
+                message: persistResult.error,
+            }));
+            return;
+        }
+        QUARANTINE_NODES = nextNodes;
+        AUTO_QUARANTINE_NODES = nextAutoNodes;
+        applyMutableRuntimeConfig(nextConfig);
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
             status: 'ok',
             request_id: requestId,
             quarantine_nodes: QUARANTINE_NODES,
+            auto_quarantine_nodes: AUTO_QUARANTINE_NODES,
             quarantine_count: QUARANTINE_NODES.length,
             persisted: persistResult.persisted,
             persist_error: persistResult.error,
@@ -1273,7 +1375,7 @@ const server = http.createServer(async (req, res) => {
             res.end(JSON.stringify({ status: 'error', code: 'REFRESH_GROUPS_FAILED', request_id: requestId, message: 'API token is missing' }));
             return;
         }
-        const refreshed = await refreshGroups();
+        const refreshed = await refreshGroups({ persist: true, requestId });
         if (!refreshed.ok) {
             res.writeHead(502, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'error', code: 'REFRESH_GROUPS_FAILED', request_id: requestId, message: refreshed.error }));
@@ -1318,7 +1420,15 @@ const server = http.createServer(async (req, res) => {
             profile_mode: PROFILE.name,
             runtime_stats: runtimeStats,
             circuit_breaker: cb,
+            groups: Object.keys(GROUPS),
+            last_upstream_success_at: toIsoTimestamp(lastUpstreamSuccessAt),
+            last_upstream_error: lastUpstreamError,
+            last_node_stats_refresh_at: toIsoTimestamp(lastNodeStatsRefreshAt),
+            last_node_stats_error: lastNodeStatsError,
+            cached_nodes: Object.keys(nodeStatsCache).length,
+            token_limiter_size: tokenRateLimiter.size(),
             quarantine_nodes: QUARANTINE_NODES,
+            auto_quarantine_nodes: AUTO_QUARANTINE_NODES,
             quarantine_count: QUARANTINE_NODES.length,
             sticky_enabled: runtime.stickyEnabled,
             sticky: currentStickyStore.summary(),
@@ -1472,16 +1582,21 @@ const server = http.createServer(async (req, res) => {
         });
 
         if (upstream.status !== 200) {
-            lastUpstreamError = `upstream_status_${upstream.status}`;
-            circuitBreaker.recordFailure();
-            const fallback = getCachedFallback(token);
-            if (fallback) {
-                runtimeStats.cache_fallback_total += 1;
-                if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
-                logger.warn('cache_fallback_by_status', { request_id: requestId, status: upstream.status, cache_kind: fallback.kind });
-                res.writeHead(200, forwardResponseHeaders(fallback.item.headers, 'application/json; charset=utf-8'));
-                res.end(fallback.item.body);
-                return;
+            if (isServiceFailureStatus(upstream.status)) {
+                lastUpstreamError = `upstream_status_${upstream.status}`;
+                circuitBreaker.recordFailure();
+            }
+
+            if (canFallbackForStatus(upstream.status)) {
+                const fallback = getCachedFallback(token);
+                if (fallback) {
+                    runtimeStats.cache_fallback_total += 1;
+                    if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
+                    logger.warn('cache_fallback_by_status', { request_id: requestId, status: upstream.status, cache_kind: fallback.kind });
+                    res.writeHead(200, forwardResponseHeaders(fallback.item.headers, 'application/json; charset=utf-8'));
+                    res.end(fallback.item.body);
+                    return;
+                }
             }
             res.writeHead(upstream.status, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'text/plain'));
             res.end(upstream.body);
@@ -1787,7 +1902,7 @@ const server = http.createServer(async (req, res) => {
         circuitBreaker.recordSuccess();
         lastUpstreamSuccessAt = Date.now();
         lastUpstreamError = null;
-        subscriptionCache.set(token, responseBody, upstream.headers);
+        subscriptionCache.set(token, responseBody, sanitizeHeadersForCache(upstream.headers));
 
         const responseHeaders = forwardResponseHeaders(upstream.headers, 'application/json; charset=utf-8');
 
@@ -1848,6 +1963,14 @@ async function start() {
             if (await warmupToken(token)) warmed += 1;
         }
         console.log(`🔥 Warmup: ${warmed}/${WARMUP_TOKENS.length} токенов`);
+    }
+
+    const persistenceWritable = checkConfigPersistenceWritable();
+    if (!persistenceWritable.ok) {
+        logger.warn('config_persistence_not_writable', {
+            config_path: persistenceWritable.path,
+            error: persistenceWritable.error,
+        });
     }
 
     const fastestEnabled = config.fastest_group !== false;

@@ -57,9 +57,9 @@
     "max_redirects": 3,
     "circuit_breaker_failures": 6,
     "circuit_breaker_open_sec": 30,
-    "admin_token": "",
     "warmup_tokens": [],
     "quarantine_nodes": [],
+    "auto_quarantine_nodes": [],
 
     "groups": {
         "🇫🇮 Finland": ["Finland"],

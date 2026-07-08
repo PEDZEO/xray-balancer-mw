@@ -92,6 +92,23 @@ test('filterAndSortByLoad uses outbound addresses for host remark sorting', () =
     assert.deepEqual(result.map((item) => item.tag), ['Германия v2  🇩🇪', 'Германия 🇩🇪']);
 });
 
+test('filterAndSortByLoad applies drain penalty via matched source node', () => {
+    const outbounds = [
+        { tag: 'Germany remark', settings: { vnext: [{ address: 'de.example.com', port: 443 }] } },
+        { tag: 'Finland remark', settings: { vnext: [{ address: 'fi.example.com', port: 443 }] } },
+    ];
+    const cache = {
+        'de.example.com': { load: 0.1, isConnected: true, isDisabled: false, sourceNode: 'DEplay' },
+        'fi.example.com': { load: 0.2, isConnected: true, isDisabled: false, sourceNode: 'FIplay' },
+    };
+
+    const result = filterAndSortByLoad(outbounds, cache, {
+        drainSet: new Set(['deplay']),
+        drainPenalty: 1,
+    });
+    assert.deepEqual(result.map((item) => item.tag), ['Finland remark', 'Germany remark']);
+});
+
 test('filterHiddenOutbounds removes nodes hidden directly or via hidden group', () => {
     const groups = {
         '🇩🇪 Germany': ['German'],

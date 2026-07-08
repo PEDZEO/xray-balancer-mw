@@ -16,6 +16,7 @@ test('readEffectiveRuntime returns config-driven mutable settings', () => {
         hidden_groups: [' 🇺🇸 USA ', '', 42],
         hidden_nodes: [' Germany-9 ', '', 7],
         quarantine_nodes: [' Pedze ', '', 42, 'DEplay'],
+        auto_quarantine_nodes: [' Pedze ', '', 42],
         sticky_enabled: true,
         sticky_mode: 'prefer',
         sticky_new_connections_only: true,
@@ -46,6 +47,7 @@ test('readEffectiveRuntime returns config-driven mutable settings', () => {
     assert.deepEqual(runtime.hiddenGroups, ['🇺🇸 USA']);
     assert.deepEqual(runtime.hiddenNodes, ['Germany-9']);
     assert.deepEqual(runtime.quarantineNodes, ['Pedze', 'DEplay']);
+    assert.deepEqual(runtime.autoQuarantineNodes, ['Pedze']);
     assert.equal(runtime.stickyEnabled, true);
     assert.equal(runtime.stickyMode, 'prefer');
     assert.equal(runtime.stickyNewConnectionsOnly, true);

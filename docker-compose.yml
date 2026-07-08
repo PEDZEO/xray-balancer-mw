@@ -9,7 +9,7 @@ services:
       - CONFIG_RUNTIME_PATH=/app/runtime/config.runtime.json
     volumes:
       - ./config.json:/app/config.json:ro
-      - ./runtime:/app/runtime
+      - xray-balancer-runtime:/app/runtime
     networks:
       - remnawave-network
 
@@ -17,3 +17,6 @@ networks:
   remnawave-network:
     external: true
     name: remnawave-network
+
+volumes:
+  xray-balancer-runtime:

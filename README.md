@@ -53,6 +53,7 @@ REMNAWAVE_URL=https://panel.example.com
 SUB_PAGE_URL=http://subscription-page:3010
 SUB_DOMAIN=sub.example.com
 API_TOKEN=your_api_token
+ADMIN_TOKEN=change_this_admin_token
 ```
 
 ### 3. Создай `config.json`
@@ -180,8 +181,8 @@ https://sub.example.com {
 ## Проверка
 
 ```bash
-curl http://localhost:4100/health
-curl http://localhost:4100/ready
+docker compose exec xray-balancer-mw wget -qO- http://localhost:4100/health
+docker compose exec xray-balancer-mw wget -qO- http://localhost:4100/ready
 ```
 
 ## Happ Headers

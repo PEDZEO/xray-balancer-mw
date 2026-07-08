@@ -19,4 +19,5 @@ test('config schema is valid JSON and contains key sections', () => {
     assert.equal(typeof schema.properties.token_limiter_cleanup_batch, 'object');
     assert.equal(typeof schema.properties.sticky_enabled, 'object');
     assert.equal(typeof schema.properties.sticky_new_connections_only, 'object');
+    assert.equal(typeof schema.properties.auto_quarantine_nodes, 'object');
 });

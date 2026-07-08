@@ -2,7 +2,15 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
 const { validateConfig } = require('../lib/config');
+
+test('config.json.example is valid', () => {
+    const examplePath = path.join(__dirname, '..', 'config.json.example');
+    const cfg = JSON.parse(fs.readFileSync(examplePath, 'utf8'));
+    assert.deepEqual(validateConfig(cfg), cfg);
+});
 
 test('validateConfig accepts a valid config', () => {
     const cfg = {
@@ -89,11 +97,16 @@ test('validateConfig rejects too many groups and overly long patterns', () => {
 test('validateConfig validates quarantine_nodes', () => {
     const cfg = {
         quarantine_nodes: ['Germany-1', 'USA Main'],
+        auto_quarantine_nodes: ['Germany-1'],
     };
     assert.deepEqual(validateConfig(cfg), cfg);
 
     assert.throws(
         () => validateConfig({ quarantine_nodes: [''] }),
         /quarantine_nodes contains invalid node name/,
+    );
+    assert.throws(
+        () => validateConfig({ auto_quarantine_nodes: [''] }),
+        /auto_quarantine_nodes contains invalid node name/,
     );
 });

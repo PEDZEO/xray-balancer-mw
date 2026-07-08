@@ -11,6 +11,7 @@ All endpoints below require `x-admin-token` header:
 - `/admin/refresh-groups`
 - `/admin/debug/stats`
 - `/admin/debug/token/{token}`
+- `/admin/groups` (`GET` current runtime groups, `PUT` update/persist groups and mutable settings)
 - `/admin/quarantine` (`GET` list, `POST` add `{ "node": "name" }`)
 - `/admin/quarantine/{node}` (`DELETE` remove)
 
@@ -21,7 +22,8 @@ Admin endpoints are also rate-limited (`admin_rate_limit_per_minute`, `admin_rat
 - Persist admin UI changes (`groups`, `fastest_*`, `quarantine_nodes`) into `CONFIG_RUNTIME_PATH`.
 - Recommended compose mount:
   - `CONFIG_RUNTIME_PATH=/app/runtime/config.runtime.json`
-  - `./runtime:/app/runtime`
+  - named volume `xray-balancer-runtime:/app/runtime`
+- If you use a bind mount such as `./runtime:/app/runtime`, ensure it is writable by the container `node` user. Otherwise admin changes apply only until restart or fail with `CONFIG_PERSIST_FAILED`.
 
 ## Token Rotation
 1. Generate a new token.
