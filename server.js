@@ -284,6 +284,12 @@ function applyStickySelection(token, scope, outbounds, runtime, currentStickySto
 
 // ─── Утилиты ───
 
+function isSocketHangupError(err) {
+    const msg = String(err && err.message ? err.message : err || '');
+    const code = String(err && err.code ? err.code : '');
+    return /socket hang up|ECONNRESET|EPIPE|EOF/i.test(msg) || /ECONNRESET|EPIPE/i.test(code);
+}
+
 function fetchUrl(targetUrl, headers = {}, maxRedirects = MAX_REDIRECTS) {
     return new Promise((resolve, reject) => {
         const parsed = new URL(targetUrl);
@@ -1574,7 +1580,16 @@ const server = http.createServer(async (req, res) => {
             os: clientMeta.os,
         });
 
-        const upstream = await fetchUrl(targetUrl, forwardHeaders);
+        let upstream;
+        try {
+            upstream = await fetchUrl(targetUrl, forwardHeaders);
+        } catch (err) {
+            if (!isSocketHangupError(err)) {
+                throw err;
+            }
+            logger.warn('upstream_retry_after_socket_hangup', { request_id: requestId, message: err.message });
+            upstream = await fetchUrl(targetUrl, forwardHeaders);
+        }
         logger.info('upstream_response', {
             request_id: requestId,
             status: upstream.status,
@@ -1924,6 +1939,14 @@ const server = http.createServer(async (req, res) => {
             return;
         }
         if (!res.headersSent) {
+            if (isSocketHangupError(err)) {
+                res.writeHead(404, {
+                    'Content-Type': 'text/plain; charset=utf-8',
+                    'Cache-Control': 'no-store',
+                });
+                res.end('Not Found');
+                return;
+            }
             res.writeHead(502, { 'Content-Type': 'text/plain' });
             res.end('Bad Gateway: ' + err.message);
         }
