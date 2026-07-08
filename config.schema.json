@@ -6,7 +6,7 @@
   "properties": {
     "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
     "sub_path": { "type": "string", "pattern": "^/" },
-    "strategy": { "type": "string", "enum": ["leastLoad", "random", "roundRobin"] },
+    "strategy": { "type": "string", "enum": ["leastLoad", "leastload", "leastPing", "leastping", "random", "roundRobin", "roundrobin"] },
     "profile_mode": { "type": "string", "enum": ["balanced", "stable", "aggressive", "debug"] },
     "probe_interval": { "type": "string" },
     "probe_url": { "type": "string", "pattern": "^https?://" },

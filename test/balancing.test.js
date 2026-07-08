@@ -109,6 +109,18 @@ test('filterAndSortByLoad applies drain penalty via matched source node', () => 
     assert.deepEqual(result.map((item) => item.tag), ['Finland remark', 'Germany remark']);
 });
 
+test('filterAndSortByLoad prioritizes latency for leastPing strategy', () => {
+    const outbounds = [{ tag: 'A-node' }, { tag: 'B-node' }, { tag: 'C-node' }];
+    const cache = {
+        'A-node': { load: 0.1, ping_ms: 180, isConnected: true, isDisabled: false },
+        'B-node': { load: 0.8, ping_ms: 20, isConnected: true, isDisabled: false },
+        'C-node': { load: 0.2, isConnected: true, isDisabled: false },
+    };
+
+    const result = filterAndSortByLoad(outbounds, cache, { strategy: 'leastPing' });
+    assert.deepEqual(result.map((item) => item.tag), ['B-node', 'A-node', 'C-node']);
+});
+
 test('filterHiddenOutbounds removes nodes hidden directly or via hidden group', () => {
     const groups = {
         '🇩🇪 Germany': ['German'],

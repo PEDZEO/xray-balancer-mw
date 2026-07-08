@@ -2,7 +2,7 @@
     "port": 4100,
     "sub_path": "/api/sub",
 
-    "strategy": "leastLoad",
+    "strategy": "leastPing",
     "profile_mode": "balanced",
     "probe_interval": "3m",
     "probe_url": "https://www.gstatic.com/generate_204",

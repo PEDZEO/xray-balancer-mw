@@ -67,7 +67,7 @@ cp config.json.example config.json
 ```json
 {
   "port": 4100,
-  "strategy": "leastLoad",
+  "strategy": "leastPing",
   "probe_interval": "1m",
   "probe_url": "https://www.gstatic.com/generate_204",
   "fastest_probe_url": "https://ya.ru",

@@ -3,7 +3,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { validateConfig } = require('./lib/config');
+const { normalizeStrategy, validateConfig } = require('./lib/config');
 const { normalizeRequestId, redactTokenPath, sanitizeClientMetadata } = require('./lib/security');
 const {
     computePublishedGroupEntries,
@@ -93,7 +93,7 @@ let GROUPS = config.groups || {};
 const AUTO_GROUPS = config.auto_groups === true;
 const AUTO_GROUPS_INTERVAL = (config.auto_groups_interval_sec || 300) * 1000;
 
-const STRATEGY = config.strategy || 'leastLoad';
+const STRATEGY = normalizeStrategy(config.strategy) || 'leastLoad';
 const PROBE_URL = config.probe_url || 'https://www.gstatic.com/generate_204';
 const PROFILE_MODE = process.env.PROFILE_MODE || config.profile_mode || 'balanced';
 const PROFILE = resolveProfile(PROFILE_MODE);
@@ -1793,6 +1793,7 @@ const server = http.createServer(async (req, res) => {
                 maxLatencyMs: runtime.balancerMaxLatencyMs,
                 smoothingAlpha: runtime.balancerSmoothingAlpha,
                 hysteresisDelta: runtime.balancerHysteresisDelta,
+                strategy: STRATEGY,
             });
             allOutbounds = [...sortedEligible, ...statsExcluded];
             const after = allOutbounds.length;

@@ -29,6 +29,11 @@ test('validateConfig accepts a valid config', () => {
     assert.deepEqual(validateConfig(cfg), cfg);
 });
 
+test('validateConfig accepts leastPing strategy aliases', () => {
+    assert.deepEqual(validateConfig({ strategy: 'leastPing' }), { strategy: 'leastPing' });
+    assert.deepEqual(validateConfig({ strategy: 'leastping' }), { strategy: 'leastping' });
+});
+
 test('validateConfig rejects invalid port', () => {
     assert.throws(() => validateConfig({ port: 70000 }), /config\.port/);
 });

@@ -56,6 +56,20 @@ test('buildGroupConfig adds fallback balancer and keeps base inbound ports', () 
     assert.deepEqual(out.routing.balancers[1].selector, ['LTE-1', 'LTE-2']);
 });
 
+test('buildGroupConfig emits leastPing strategy without leastLoad settings', () => {
+    const out = buildGroupConfig({}, 'Fastest ping', [
+        { tag: 'Germany-1', protocol: 'vless' },
+        { tag: 'Germany-2', protocol: 'vless' },
+    ], {
+        probeUrl: 'https://example.com/ping',
+        probeInterval: '1m',
+        strategy: 'leastPing',
+    });
+
+    assert.deepEqual(out.burstObservatory.subjectSelector, ['Germany-1', 'Germany-2']);
+    assert.deepEqual(out.routing.balancers[0].strategy, { type: 'leastPing' });
+});
+
 test('buildGroupConfig does not inherit per-server description fields from base config', () => {
     const base = {
         remarks: 'base',
