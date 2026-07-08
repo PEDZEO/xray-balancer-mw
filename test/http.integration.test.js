@@ -219,6 +219,7 @@ test('subscription endpoint uses single-flight fetch and fresh read-through cach
     assert.equal(upstreamHits, 1);
     for (const response of responses) {
         assert.equal(response.status, 200);
+        assert.match(response.headers.get('cache-control'), /no-store/);
         assert.equal(response.headers.get('set-cookie'), null);
         assert.equal(response.headers.get('x-upstream-test'), 'present');
     }
@@ -229,11 +230,110 @@ test('subscription endpoint uses single-flight fetch and fresh read-through cach
 
     const cached = await fetch(`${balancer.baseUrl}/tok123`, { headers });
     assert.equal(cached.status, 200);
+    assert.match(cached.headers.get('cache-control'), /no-store/);
     assert.equal(cached.headers.get('set-cookie'), null);
     assert.equal(upstreamHits, 1);
 
     const ready = await fetch(`${balancer.baseUrl}/ready`);
     assert.equal(ready.status, 200);
+});
+
+test('subscription cache and single-flight are isolated by client variant headers', async (t) => {
+    let upstreamHits = 0;
+    const upstream = http.createServer(async (req, res) => {
+        upstreamHits += 1;
+        await wait(50);
+        const variant = req.headers['x-hwid'] || 'missing';
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([
+            {
+                remarks: 'valid',
+                outbounds: [
+                    {
+                        protocol: 'vless',
+                        tag: `Germany-${variant}`,
+                        settings: { vnext: [{ address: 'node.example.com', port: 443 }] },
+                    },
+                ],
+            },
+        ]));
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+
+    const balancer = await startBalancer(t, { upstreamPort });
+    const [firstA, firstB] = await Promise.all([
+        fetch(`${balancer.baseUrl}/same-token`, { headers: { 'User-Agent': 'Happ/1.0', 'X-HWID': 'A' } }),
+        fetch(`${balancer.baseUrl}/same-token`, { headers: { 'User-Agent': 'Happ/1.0', 'X-HWID': 'B' } }),
+    ]);
+    const bodyA = await firstA.text();
+    const bodyB = await firstB.text();
+
+    assert.equal(firstA.status, 200);
+    assert.equal(firstB.status, 200);
+    assert.match(bodyA, /Germany-A/);
+    assert.match(bodyB, /Germany-B/);
+    assert.equal(upstreamHits, 2);
+
+    const secondA = await fetch(`${balancer.baseUrl}/same-token`, {
+        headers: { 'User-Agent': 'Happ/1.0', 'X-HWID': 'A' },
+    });
+    assert.match(await secondA.text(), /Germany-A/);
+    assert.equal(upstreamHits, 2);
+});
+
+test('subscription endpoint rejects non-GET methods without hitting upstream', async (t) => {
+    let upstreamHits = 0;
+    const upstream = http.createServer((req, res) => {
+        upstreamHits += 1;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(validXrayPayload());
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+
+    const balancer = await startBalancer(t, { upstreamPort });
+    const response = await fetch(`${balancer.baseUrl}/tok123`, { method: 'POST' });
+    const body = await response.json();
+
+    assert.equal(response.status, 405);
+    assert.equal(response.headers.get('allow'), 'GET');
+    assert.match(response.headers.get('cache-control'), /no-store/);
+    assert.equal(body.code, 'METHOD_NOT_ALLOWED');
+    assert.equal(upstreamHits, 0);
+});
+
+test('admin groups can switch strategy at runtime and responses are no-store', async (t) => {
+    const upstream = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(validXrayPayload());
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+
+    const balancer = await startBalancer(t, { upstreamPort, strategy: 'leastLoad' });
+    const update = await fetch(`${balancer.baseUrl}/admin/groups`, {
+        method: 'PUT',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Admin-Token': 'integration-admin-token',
+        },
+        body: JSON.stringify({ strategy: 'leastping' }),
+    });
+    const updateBody = await update.json();
+
+    assert.equal(update.status, 200);
+    assert.match(update.headers.get('cache-control'), /no-store/);
+    assert.equal(updateBody.strategy, 'leastPing');
+
+    const response = await fetch(`${balancer.baseUrl}/tok-strategy`, {
+        headers: { 'User-Agent': 'Happ/1.0' },
+    });
+    const subscription = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(subscription[0].routing.balancers[0].strategy.type, 'leastPing');
+    assert.equal(subscription[0].routing.balancers[0].strategy.settings, undefined);
 });
 
 test('subscription endpoint enforces total upstream deadline', async (t) => {

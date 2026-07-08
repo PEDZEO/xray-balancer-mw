@@ -2,7 +2,8 @@
 
 ## Readiness
 - `GET /ready` returns `ready` when recent upstream success exists or cache has fresh data.
-- If `not_ready`: check upstream connectivity, API token, and warmup tokens.
+- A fresh restart can return `503 not_ready` until the first successful subscription request or warmup token succeeds. Use `/health` for liveness checks.
+- If `not_ready`: check upstream connectivity, API token, and configure `warmup_tokens` for known critical subscriptions.
 
 ## Admin Endpoints
 All endpoints below require `x-admin-token` header:
@@ -24,6 +25,7 @@ Admin endpoints are also rate-limited (`admin_rate_limit_per_minute`, `admin_rat
   - `CONFIG_RUNTIME_PATH=/app/runtime/config.runtime.json`
   - named volume `xray-balancer-runtime:/app/runtime`
 - If you use a bind mount such as `./runtime:/app/runtime`, ensure it is writable by the container `node` user. Otherwise admin changes apply only until restart or fail with `CONFIG_PERSIST_FAILED`.
+- Runtime patch values override base `config.json` on restart. Before migrations, inspect and backup `runtime/config.runtime.json`; update stale keys through the admin API or remove them intentionally.
 
 ## Token Rotation
 1. Generate a new token.
@@ -50,7 +52,7 @@ Admin endpoints are also rate-limited (`admin_rate_limit_per_minute`, `admin_rat
 
 ### All clients appear as one IP behind proxy
 - Set `trust_x_forwarded_for: true` only when middleware is behind your trusted reverse proxy.
-- If middleware is exposed directly, keep `trust_x_forwarded_for: false`.
+- X-Forwarded-For is accepted only from loopback/private reverse-proxy addresses. If middleware is exposed directly, keep `trust_x_forwarded_for: false`.
 
 ### Wrong grouping or fallback to `Other`
 - Adjust `groups` patterns.
@@ -58,7 +60,7 @@ Admin endpoints are also rate-limited (`admin_rate_limit_per_minute`, `admin_rat
 
 ### Need to isolate a broken node quickly
 - Add node to quarantine via `/admin/quarantine`.
-- Verify `quarantine_count` in `/health`.
+- Verify `quarantine_count` in `/admin/quarantine` or `/admin/debug/stats`.
 - Remove when node is healthy again.
 
 ## Safe Defaults

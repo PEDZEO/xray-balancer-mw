@@ -16,9 +16,14 @@ test('validateConfig accepts a valid config', () => {
     const cfg = {
         port: 4100,
         sub_path: '/api/sub',
+        remnawave_url: 'https://panel.example.com',
+        sub_page_url: 'http://subscription-page:3010',
+        sub_domain: 'sub.example.com',
         strategy: 'leastLoad',
         fastest_group: true,
         node_stats: true,
+        api_token: 'panel-token',
+        panel_auth_cookie: '',
         max_users_per_gb: 20,
         max_users_per_cpu: 40,
         groups: {
@@ -72,6 +77,11 @@ test('validateConfig accepts runtime and fastest-exclude options', () => {
 
 test('validateConfig rejects malformed fastest probe url', () => {
     assert.throws(() => validateConfig({ fastest_probe_url: 'ya.ru' }), /fastest_probe_url/);
+});
+
+test('validateConfig rejects malformed supported URLs', () => {
+    assert.throws(() => validateConfig({ remnawave_url: 'panel.example.com' }), /remnawave_url/);
+    assert.throws(() => validateConfig({ sub_page_url: 'subscription-page:3010' }), /sub_page_url/);
 });
 
 test('validateConfig rejects malformed hidden lists', () => {

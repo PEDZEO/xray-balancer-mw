@@ -6,6 +6,9 @@
   "properties": {
     "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
     "sub_path": { "type": "string", "pattern": "^/" },
+    "remnawave_url": { "type": "string", "pattern": "^https?://" },
+    "sub_page_url": { "type": "string", "pattern": "^https?://" },
+    "sub_domain": { "type": "string", "minLength": 1 },
     "strategy": { "type": "string", "enum": ["leastLoad", "leastload", "leastPing", "leastping", "random", "roundRobin", "roundrobin"] },
     "profile_mode": { "type": "string", "enum": ["balanced", "stable", "aggressive", "debug"] },
     "probe_interval": { "type": "string" },
@@ -80,6 +83,8 @@
     "circuit_breaker_failures": { "type": "integer", "minimum": 1 },
     "circuit_breaker_open_sec": { "type": "integer", "minimum": 1 },
     "admin_token": { "type": "string", "minLength": 8 },
+    "api_token": { "type": "string" },
+    "panel_auth_cookie": { "type": "string" },
     "warmup_tokens": {
       "type": "array",
       "items": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" }

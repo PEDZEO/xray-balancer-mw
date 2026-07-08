@@ -1,6 +1,7 @@
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
+const net = require('net');
 const path = require('path');
 const crypto = require('crypto');
 const { normalizeStrategy, validateConfig } = require('./lib/config');
@@ -26,6 +27,7 @@ const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json
 const CONFIG_RUNTIME_PATH = process.env.CONFIG_RUNTIME_PATH || '';
 const MUTABLE_CONFIG_KEYS = [
     'groups',
+    'strategy',
     'fastest_group',
     'fastest_group_name',
     'fastest_exclude_groups',
@@ -93,7 +95,7 @@ let GROUPS = config.groups || {};
 const AUTO_GROUPS = config.auto_groups === true;
 const AUTO_GROUPS_INTERVAL = (config.auto_groups_interval_sec || 300) * 1000;
 
-const STRATEGY = normalizeStrategy(config.strategy) || 'leastLoad';
+let STRATEGY = normalizeStrategy(config.strategy) || 'leastLoad';
 const PROBE_URL = config.probe_url || 'https://www.gstatic.com/generate_204';
 const PROFILE_MODE = process.env.PROFILE_MODE || config.profile_mode || 'balanced';
 const PROFILE = resolveProfile(PROFILE_MODE);
@@ -105,8 +107,14 @@ function pickRuntimeInt(envKey, configKey) {
     return PROFILE.values[configKey];
 }
 
+function pickRuntimeBool(envKey, configKey) {
+    if (process.env[envKey] === 'true') return true;
+    if (process.env[envKey] === 'false') return false;
+    return config[configKey] === true;
+}
+
 // Node stats — опрос нагрузки нод из API панели
-const NODE_STATS_ENABLED = process.env.NODE_STATS === 'true' || config.node_stats === true;
+const NODE_STATS_ENABLED = pickRuntimeBool('NODE_STATS', 'node_stats');
 const NODE_STATS_INTERVAL = (parseInt(process.env.NODE_STATS_INTERVAL_SEC, 10) || config.node_stats_interval_sec || 120) * 1000;
 const MAX_USERS_PER_GB = parseInt(process.env.MAX_USERS_PER_GB, 10) || config.max_users_per_gb || 20;
 const MAX_USERS_PER_CPU = parseInt(process.env.MAX_USERS_PER_CPU, 10) || config.max_users_per_cpu || 40;
@@ -119,7 +127,7 @@ const TOKEN_RATE_LIMIT_PER_MINUTE = pickRuntimeInt('TOKEN_RATE_LIMIT_PER_MINUTE'
 const TOKEN_RATE_LIMIT_BURST_10S = pickRuntimeInt('TOKEN_RATE_LIMIT_BURST_10S', 'token_rate_limit_burst_10s');
 const TOKEN_LIMITER_MAX_ENTRIES = parseInt(process.env.TOKEN_LIMITER_MAX_ENTRIES, 10) || config.token_limiter_max_entries || 5000;
 const TOKEN_LIMITER_CLEANUP_BATCH = parseInt(process.env.TOKEN_LIMITER_CLEANUP_BATCH, 10) || config.token_limiter_cleanup_batch || 200;
-const TRUST_X_FORWARDED_FOR = process.env.TRUST_X_FORWARDED_FOR === 'true' || config.trust_x_forwarded_for === true;
+const TRUST_X_FORWARDED_FOR = pickRuntimeBool('TRUST_X_FORWARDED_FOR', 'trust_x_forwarded_for');
 const ADMIN_RATE_LIMIT_PER_MINUTE = parseInt(process.env.ADMIN_RATE_LIMIT_PER_MINUTE, 10) || config.admin_rate_limit_per_minute || 60;
 const ADMIN_RATE_LIMIT_BURST_10S = parseInt(process.env.ADMIN_RATE_LIMIT_BURST_10S, 10) || config.admin_rate_limit_burst_10s || 20;
 const READY_SUCCESS_WINDOW_SEC = pickRuntimeInt('READY_SUCCESS_WINDOW_SEC', 'ready_success_window_sec');
@@ -231,6 +239,7 @@ function ensureStickyStore() {
 
 function applyMutableRuntimeConfig(nextConfig) {
     config = nextConfig;
+    STRATEGY = normalizeStrategy(nextConfig.strategy) || 'leastLoad';
     GROUPS = nextConfig.groups || {};
     const runtime = getRuntimeConfig();
     FASTEST_EXCLUDE_GROUPS = runtime.fastestExcludeGroups;
@@ -390,8 +399,8 @@ async function fetchUrlWithSocketRetry(targetUrl, headers, requestId) {
     }
 }
 
-async function fetchUpstreamSingleFlight(token, targetUrl, headers, requestId) {
-    const existing = inFlightUpstreamFetches.get(token);
+async function fetchUpstreamSingleFlight(cacheKey, token, targetUrl, headers, requestId) {
+    const existing = inFlightUpstreamFetches.get(cacheKey);
     if (existing) {
         runtimeStats.upstream_singleflight_joined_total += 1;
         logger.info('upstream_singleflight_joined', {
@@ -402,12 +411,12 @@ async function fetchUpstreamSingleFlight(token, targetUrl, headers, requestId) {
     }
 
     const promise = fetchUrlWithSocketRetry(targetUrl, headers, requestId);
-    inFlightUpstreamFetches.set(token, promise);
+    inFlightUpstreamFetches.set(cacheKey, promise);
     try {
         return await promise;
     } finally {
-        if (inFlightUpstreamFetches.get(token) === promise) {
-            inFlightUpstreamFetches.delete(token);
+        if (inFlightUpstreamFetches.get(cacheKey) === promise) {
+            inFlightUpstreamFetches.delete(cacheKey);
         }
     }
 }
@@ -431,10 +440,35 @@ function sanitizeAdminPath(pathname) {
     return pathname;
 }
 
+function normalizeIpAddress(value) {
+    const ip = (value || '').toString().trim();
+    return net.isIP(ip) ? ip : null;
+}
+
+function isTrustedProxyAddress(ip) {
+    const normalized = normalizeIpAddress(ip);
+    if (!normalized) return false;
+    if (normalized === '::1' || normalized === '127.0.0.1' || normalized === '::ffff:127.0.0.1') return true;
+
+    if (net.isIP(normalized) === 4) {
+        const parts = normalized.split('.').map((part) => Number(part));
+        if (parts[0] === 10) return true;
+        if (parts[0] === 127) return true;
+        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+        if (parts[0] === 192 && parts[1] === 168) return true;
+        if (parts[0] === 169 && parts[1] === 254) return true;
+        return false;
+    }
+
+    const lower = normalized.toLowerCase();
+    return lower.startsWith('fc') || lower.startsWith('fd') || lower.startsWith('fe80:');
+}
+
 function resolveClientIp(req) {
-    const remoteIp = (req.socket.remoteAddress || '127.0.0.1').toString().trim();
+    const remoteIp = normalizeIpAddress(req.socket.remoteAddress) || '127.0.0.1';
     if (!TRUST_X_FORWARDED_FOR) return remoteIp;
-    const forwardedIp = (req.headers['x-forwarded-for'] || '').toString().split(',')[0].trim();
+    if (!isTrustedProxyAddress(remoteIp)) return remoteIp;
+    const forwardedIp = normalizeIpAddress((req.headers['x-forwarded-for'] || '').toString().split(',')[0]);
     return forwardedIp || remoteIp;
 }
 
@@ -1007,13 +1041,83 @@ const SKIP_RESPONSE_HEADERS = new Set([
     'upgrade',
     'proxy-authenticate',
     'proxy-authorization',
+    'cache-control',
+    'pragma',
+    'expires',
     'content-length',       // Пересчитываем сами
     'content-encoding',     // Мы отдаём без сжатия
     'date',                 // Своё выставит Node.js
     'server',               // Не светим upstream (nginx и т.д.)
 ]);
 
-// Собрать все заголовки от upstream кроме служебных
+// Request/response header helpers.
+const CACHE_VARIANT_HEADER_SKIP = new Set([
+    'host',
+    'x-forwarded-for',
+    'x-forwarded-proto',
+    'x-real-ip',
+    'x-request-id',
+    'x-correlation-id',
+    'traceparent',
+    'tracestate',
+]);
+
+const NO_STORE_HEADERS = {
+    'Cache-Control': 'no-store, private',
+    Pragma: 'no-cache',
+    Expires: '0',
+};
+
+function applyNoStoreHeaders(res) {
+    for (const [key, value] of Object.entries(NO_STORE_HEADERS)) {
+        res.setHeader(key, value);
+    }
+}
+
+function buildForwardHeaders(req, clientIp) {
+    const forwardHeaders = {};
+    for (const [key, value] of Object.entries(req.headers)) {
+        if (!SKIP_REQUEST_HEADERS.has(key)) {
+            forwardHeaders[key] = value;
+        }
+    }
+
+    if (!forwardHeaders['user-agent']) {
+        forwardHeaders['user-agent'] = 'Happ/1.0';
+    }
+
+    if (SUB_PAGE_URL) {
+        forwardHeaders['X-Forwarded-Proto'] = 'https';
+        forwardHeaders['X-Forwarded-For'] = clientIp;
+        forwardHeaders['X-Real-IP'] = clientIp;
+        forwardHeaders['Host'] = SUB_DOMAIN || req.headers['host'] || 'localhost';
+    }
+
+    return forwardHeaders;
+}
+
+function normalizeHeaderValue(value) {
+    const raw = Array.isArray(value) ? value.join(',') : String(value ?? '');
+    return raw.trim().replace(/\s+/g, ' ').slice(0, 1024);
+}
+
+function buildSubscriptionCacheKey(token, forwardHeaders = {}) {
+    const variantHeaders = [];
+    for (const [key, value] of Object.entries(forwardHeaders)) {
+        const normalizedKey = key.toLowerCase();
+        if (CACHE_VARIANT_HEADER_SKIP.has(normalizedKey)) continue;
+        const normalizedValue = normalizeHeaderValue(value);
+        if (normalizedValue) variantHeaders.push([normalizedKey, normalizedValue]);
+    }
+    variantHeaders.sort(([a], [b]) => a.localeCompare(b));
+    const variantHash = crypto
+        .createHash('sha256')
+        .update(JSON.stringify(variantHeaders))
+        .digest('base64url')
+        .slice(0, 16);
+    return `${token}:${variantHash}`;
+}
+
 function forwardResponseHeaders(upstreamHeaders, contentType) {
     const result = { 'Content-Type': contentType || 'application/json; charset=utf-8' };
     for (const [key, val] of Object.entries(upstreamHeaders)) {
@@ -1083,12 +1187,14 @@ async function warmupToken(token) {
     const targetUrl = SUB_PAGE_URL
         ? `${SUB_PAGE_URL}/${token}`
         : `${REMNAWAVE_URL}${REMNAWAVE_SUB_PATH}/${token}`;
+    const forwardHeaders = { 'user-agent': 'Happ/1.0' };
+    const cacheKey = buildSubscriptionCacheKey(token, forwardHeaders);
     try {
-        const upstream = await fetchUrl(targetUrl, { 'user-agent': 'Happ/1.0' });
+        const upstream = await fetchUrl(targetUrl, forwardHeaders);
         if (upstream.status !== 200) return false;
         const classified = classifyUpstreamPayload(upstream.body);
         if (classified.type === 'xray_json') {
-            subscriptionCache.set(token, upstream.body, sanitizeHeadersForCache(upstream.headers));
+            subscriptionCache.set(cacheKey, upstream.body, sanitizeHeadersForCache(upstream.headers));
             lastUpstreamSuccessAt = Date.now();
             return true;
         }
@@ -1119,6 +1225,13 @@ function setNonOverlappingInterval(taskName, task, intervalMs) {
     return timer;
 }
 
+function formatStrategyForLog() {
+    if (STRATEGY === 'leastLoad') {
+        return `${STRATEGY} (expected=1, baselines=1s, tolerance=0.8)`;
+    }
+    return STRATEGY;
+}
+
 const server = http.createServer(async (req, res) => {
     const requestId = normalizeRequestId(req.headers['x-request-id'], crypto.randomUUID());
     let parsedUrl;
@@ -1131,6 +1244,9 @@ const server = http.createServer(async (req, res) => {
     }
     const pathname = parsedUrl.pathname;
     const clientIp = resolveClientIp(req);
+    if (pathname.startsWith('/admin/')) {
+        applyNoStoreHeaders(res);
+    }
 
     if (pathname === '/health' || pathname === '/mw-health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1153,6 +1269,7 @@ const server = http.createServer(async (req, res) => {
                 status: 'ok',
                 request_id: requestId,
                 groups: GROUPS,
+                strategy: STRATEGY,
                 fastest_group: config.fastest_group !== false,
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
@@ -1221,6 +1338,9 @@ const server = http.createServer(async (req, res) => {
                     nextConfig[key] = payload[key];
                 }
             }
+            if (nextConfig.strategy !== undefined) {
+                nextConfig.strategy = normalizeStrategy(nextConfig.strategy);
+            }
 
             validateConfig(nextConfig);
             const persistResult = persistConfigIfPossible(nextConfig, requestId);
@@ -1251,6 +1371,7 @@ const server = http.createServer(async (req, res) => {
                 status: 'ok',
                 request_id: requestId,
                 groups: GROUPS,
+                strategy: STRATEGY,
                 fastest_group: config.fastest_group !== false,
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
                 fastest_exclude_groups: FASTEST_EXCLUDE_GROUPS,
@@ -1526,6 +1647,7 @@ const server = http.createServer(async (req, res) => {
             status: 'ok',
             request_id: requestId,
             profile_mode: PROFILE.name,
+            strategy: STRATEGY,
             runtime_stats: runtimeStats,
             circuit_breaker: cb,
             groups: Object.keys(GROUPS),
@@ -1552,7 +1674,7 @@ const server = http.createServer(async (req, res) => {
         const debugTarget = SUB_PAGE_URL
             ? `${SUB_PAGE_URL}/${debugToken}`
             : `${REMNAWAVE_URL}${REMNAWAVE_SUB_PATH}/${debugToken}`;
-        const fallback = getCachedFallback(debugToken);
+        const fallback = getCachedFallback(buildSubscriptionCacheKey(debugToken, { 'user-agent': 'Happ/1.0' }));
         let upstreamType = 'unavailable';
         let upstreamBytes = 0;
         let upstreamStatus = null;
@@ -1624,6 +1746,15 @@ const server = http.createServer(async (req, res) => {
         ? `${SUB_PAGE_URL}/${token}`
         : `${REMNAWAVE_URL}${REMNAWAVE_SUB_PATH}/${token}`;
 
+    applyNoStoreHeaders(res);
+    if (req.method !== 'GET') {
+        res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'GET' });
+        res.end(JSON.stringify({ status: 'error', code: 'METHOD_NOT_ALLOWED', request_id: requestId }));
+        return;
+    }
+
+    const forwardHeaders = buildForwardHeaders(req, clientIp);
+    const cacheKey = buildSubscriptionCacheKey(token, forwardHeaders);
     const safePath = redactTokenPath(pathname);
     runtimeStats.requests_total += 1;
     const guardDecision = requestGuard.evaluate(clientIp, token);
@@ -1635,7 +1766,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (guardDecision.allowFallback) {
-            const fallback = getCachedFallback(token);
+            const fallback = getCachedFallback(cacheKey);
             if (fallback) {
                 runtimeStats.cache_fallback_total += 1;
                 if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
@@ -1652,7 +1783,7 @@ const server = http.createServer(async (req, res) => {
     }
     logger.info('request_start', { request_id: requestId, method: req.method, path: safePath, ip: clientIp });
 
-    const cachedSubscription = subscriptionCache.get(token);
+    const cachedSubscription = subscriptionCache.get(cacheKey);
     if (cachedSubscription) {
         runtimeStats.cache_hits_total += 1;
         logger.info('cache_hit', { request_id: requestId, token: redactTokenPath(`/${token}`).slice(1) });
@@ -1663,26 +1794,8 @@ const server = http.createServer(async (req, res) => {
 
     try {
         // Пробрасываем ВСЕ заголовки от клиента, кроме тех что ломают проксирование
-        const forwardHeaders = {};
-        for (const [key, value] of Object.entries(req.headers)) {
-            if (!SKIP_REQUEST_HEADERS.has(key)) {
-                forwardHeaders[key] = value;
-            }
-        }
-
         // Дефолтный User-Agent если клиент не прислал
-        if (!forwardHeaders['user-agent']) {
-            forwardHeaders['user-agent'] = 'Happ/1.0';
-        }
-
         // Проксирование через subscription page — подставляем правильные заголовки
-        if (SUB_PAGE_URL) {
-            forwardHeaders['X-Forwarded-Proto'] = 'https';
-            forwardHeaders['X-Forwarded-For'] = clientIp;
-            forwardHeaders['X-Real-IP'] = clientIp;
-            forwardHeaders['Host'] = SUB_DOMAIN || req.headers['host'] || 'localhost';
-        }
-
         const clientMeta = sanitizeClientMetadata(req);
         logger.info('request_meta', {
             request_id: requestId,
@@ -1691,7 +1804,7 @@ const server = http.createServer(async (req, res) => {
             os: clientMeta.os,
         });
 
-        const upstream = await fetchUpstreamSingleFlight(token, targetUrl, forwardHeaders, requestId);
+        const upstream = await fetchUpstreamSingleFlight(cacheKey, token, targetUrl, forwardHeaders, requestId);
         logger.info('upstream_response', {
             request_id: requestId,
             status: upstream.status,
@@ -1705,7 +1818,7 @@ const server = http.createServer(async (req, res) => {
             }
 
             if (canFallbackForStatus(upstream.status)) {
-                const fallback = getCachedFallback(token);
+                const fallback = getCachedFallback(cacheKey);
                 if (fallback) {
                     runtimeStats.cache_fallback_total += 1;
                     if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
@@ -2020,7 +2133,7 @@ const server = http.createServer(async (req, res) => {
         circuitBreaker.recordSuccess();
         lastUpstreamSuccessAt = Date.now();
         lastUpstreamError = null;
-        subscriptionCache.set(token, responseBody, sanitizeHeadersForCache(upstream.headers));
+        subscriptionCache.set(cacheKey, responseBody, sanitizeHeadersForCache(upstream.headers));
 
         const responseHeaders = forwardResponseHeaders(upstream.headers, 'application/json; charset=utf-8');
 
@@ -2032,7 +2145,7 @@ const server = http.createServer(async (req, res) => {
         lastUpstreamError = err.message;
         circuitBreaker.recordFailure();
         logger.error('request_failed', { request_id: requestId, message: err.message });
-        const fallback = getCachedFallback(token);
+        const fallback = getCachedFallback(cacheKey);
         if (fallback) {
             runtimeStats.cache_fallback_total += 1;
             if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
@@ -2109,7 +2222,7 @@ async function start() {
         const fastestLabel = config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME;
         console.log(`🏁 Fastest group (${fastestLabel}): ${fastestEnabled ? '✅' : '❌'}`);
         console.log(`🪂 Fastest fallback groups: ${FASTEST_FALLBACK_GROUPS.length > 0 ? FASTEST_FALLBACK_GROUPS.join(', ') : 'none'}`);
-        console.log(`🎯 Стратегия: ${STRATEGY} (expected=1, baselines=1s, tolerance=0.8)`);
+        console.log(`🎯 Стратегия: ${formatStrategyForLog()}`);
         console.log(`🧭 Profile: ${PROFILE.name}`);
         console.log(`📡 Probe: groups=${PROBE_URL} fastest=${runtime.fastestProbeUrl} каждые ${runtime.probeInterval}`);
         console.log(`🧷 Sticky: ${runtime.stickyEnabled ? `✅ (${runtime.stickyMode}, ttl=${runtime.stickyTtlSec}s)` : '❌'}`);
