@@ -347,6 +347,59 @@ test('admin groups can switch strategy at runtime and responses are no-store', a
     assert.equal(subscription[0].routing.balancers[0].strategy.settings, undefined);
 });
 
+test('admin groups update invalidates subscription cache immediately', async (t) => {
+    let upstreamHits = 0;
+    const upstream = http.createServer((req, res) => {
+        upstreamHits += 1;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(validXrayPayload());
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        fastest_group: false,
+        groups: { Germany: ['Germany'] },
+        cache_ttl_sec: 300,
+    });
+
+    const headers = { 'User-Agent': 'Happ/1.0' };
+    const first = await fetch(`${balancer.baseUrl}/tok-cache`, { headers });
+    const firstBody = await first.json();
+
+    assert.equal(first.status, 200);
+    assert.equal(firstBody[0].remarks, 'Germany');
+    assert.equal(upstreamHits, 1);
+
+    const cachedBeforeUpdate = await fetch(`${balancer.baseUrl}/tok-cache`, { headers });
+    const cachedBeforeUpdateBody = await cachedBeforeUpdate.json();
+
+    assert.equal(cachedBeforeUpdate.status, 200);
+    assert.equal(cachedBeforeUpdateBody[0].remarks, 'Germany');
+    assert.equal(upstreamHits, 1);
+
+    const update = await fetch(`${balancer.baseUrl}/admin/groups`, {
+        method: 'PUT',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Admin-Token': 'integration-admin-token',
+        },
+        body: JSON.stringify({ groups: { France: ['Germany'] } }),
+    });
+    const updateBody = await update.json();
+
+    assert.equal(update.status, 200);
+    assert.deepEqual(Object.keys(updateBody.groups), ['France']);
+
+    const afterUpdate = await fetch(`${balancer.baseUrl}/tok-cache`, { headers });
+    const afterUpdateBody = await afterUpdate.json();
+
+    assert.equal(afterUpdate.status, 200);
+    assert.equal(afterUpdateBody[0].remarks, 'France');
+    assert.equal(upstreamHits, 2);
+});
+
 test('subscription endpoint enforces total upstream deadline', async (t) => {
     const upstream = http.createServer((req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });

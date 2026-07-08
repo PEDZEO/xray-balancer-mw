@@ -187,6 +187,7 @@ let lastNodeStatsError = null;
 let nodeStatsRefreshInFlight = null;
 const autoQuarantineState = new Map();
 const subscriptionCache = createTokenCache(CACHE_TTL_SEC, CACHE_MAX_ENTRIES);
+let subscriptionCacheGeneration = 0;
 const inFlightUpstreamFetches = new Map();
 const rateLimiter = createRateLimiter(RATE_LIMIT_PER_MINUTE, RATE_LIMIT_BURST_10S);
 const tokenRateLimiter = createKeyedRateLimiter(TOKEN_RATE_LIMIT_PER_MINUTE, TOKEN_RATE_LIMIT_BURST_10S, {
@@ -202,6 +203,7 @@ const runtimeStats = {
     cache_hits_total: 0,
     cache_fallback_total: 0,
     cache_fallback_stale_total: 0,
+    cache_invalidations_total: 0,
     upstream_singleflight_joined_total: 0,
     background_overlap_skipped_total: 0,
     circuit_open_total: 0,
@@ -273,6 +275,19 @@ function applyMutableRuntimeConfig(nextConfig) {
 }
 
 applyMutableRuntimeConfig(config);
+
+function clearSubscriptionCache(reason, requestId) {
+    const removed = subscriptionCache.clear();
+    subscriptionCacheGeneration += 1;
+    runtimeStats.cache_invalidations_total += 1;
+    logger.info('subscription_cache_cleared', {
+        request_id: requestId,
+        reason,
+        removed,
+        generation: subscriptionCacheGeneration,
+    });
+    return removed;
+}
 
 function applyStickySelection(token, scope, outbounds, runtime, currentStickyStore) {
     if (!runtime.stickyEnabled || !Array.isArray(outbounds) || outbounds.length === 0) {
@@ -566,6 +581,9 @@ async function mutateRuntimeConfig(requestId, buildMutation) {
         }
 
         applyMutableRuntimeConfig(mutation.nextConfig);
+        if (mutation.changed !== false) {
+            clearSubscriptionCache('runtime_config_mutation', requestId);
+        }
         return {
             changed: mutation.changed !== false,
             persisted: true,
@@ -1057,8 +1075,12 @@ async function refreshGroups(opts = {}) {
             return { ok: false, error: mutationResult.error || 'Failed to persist refreshed groups' };
         }
     } else {
+        const previousGroupsJson = JSON.stringify(GROUPS);
         const mergedGroups = { ...newGroups, ...(config.groups || {}) };
         GROUPS = mergedGroups;
+        if (JSON.stringify(GROUPS) !== previousGroupsJson) {
+            clearSubscriptionCache('refresh_groups', opts.requestId || 'refresh-groups');
+        }
     }
     console.log(`[auto-groups] Обновлены: ${Object.entries(GROUPS).map(([k, v]) => `${k} [${v}]`).join(' | ')}`);
     return { ok: true, groups: GROUPS };
@@ -1897,6 +1919,7 @@ const server = http.createServer(async (req, res) => {
 
     const forwardHeaders = buildForwardHeaders(req, clientIp);
     const cacheKey = buildSubscriptionCacheKey(token, forwardHeaders);
+    const cacheGeneration = subscriptionCacheGeneration;
     const safePath = redactTokenPath(pathname);
     runtimeStats.requests_total += 1;
     const guardDecision = requestGuard.evaluate(clientIp, token);
@@ -2276,7 +2299,15 @@ const server = http.createServer(async (req, res) => {
         circuitBreaker.recordSuccess();
         lastUpstreamSuccessAt = Date.now();
         lastUpstreamError = null;
-        subscriptionCache.set(cacheKey, responseBody, sanitizeHeadersForCache(upstream.headers));
+        if (cacheGeneration === subscriptionCacheGeneration) {
+            subscriptionCache.set(cacheKey, responseBody, sanitizeHeadersForCache(upstream.headers));
+        } else {
+            logger.info('subscription_cache_store_skipped_after_invalidation', {
+                request_id: requestId,
+                cache_generation: cacheGeneration,
+                current_generation: subscriptionCacheGeneration,
+            });
+        }
 
         const responseHeaders = forwardResponseHeaders(upstream.headers, 'application/json; charset=utf-8');
 

@@ -45,6 +45,17 @@ test('token cache evicts oldest items when limit exceeded', () => {
     assert.equal(cache.get('c').body, 'C');
 });
 
+test('token cache can be cleared after runtime config changes', () => {
+    const cache = createTokenCache(30, 10);
+    cache.set('a', 'A', {});
+    cache.set('b', 'B', {});
+
+    assert.equal(cache.clear(), 2);
+    assert.equal(cache.get('a'), null);
+    assert.equal(cache.getStale('b', 60), null);
+    assert.equal(cache.clear(), 0);
+});
+
 test('rate limiter blocks burst overflow', () => {
     const limiter = createRateLimiter(100, 2);
     const ip = '1.1.1.1';
