@@ -109,3 +109,19 @@ test('readEffectiveRuntime honors env overrides for mutable settings', () => {
     assert.equal(runtime.balancerLoadWeight, 0.7);
     assert.equal(runtime.balancerMaxLatencyMs, 200);
 });
+
+test('readEffectiveRuntime normalizes fastest exclude groups', () => {
+    const runtime = readEffectiveRuntime({
+        fastest_exclude_groups: [' Germany ', '', 7],
+    }, {});
+
+    assert.deepEqual(runtime.fastestExcludeGroups, ['Germany']);
+});
+
+test('readEffectiveRuntime ignores out-of-range smoothing alpha env override', () => {
+    const runtime = readEffectiveRuntime({}, {
+        BALANCER_SMOOTHING_ALPHA: '2',
+    });
+
+    assert.equal(runtime.balancerSmoothingAlpha, 0.35);
+});

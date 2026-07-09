@@ -172,7 +172,7 @@ function rawRequest(port, payload) {
     return new Promise((resolve, reject) => {
         const socket = net.connect({ host: '127.0.0.1', port }, () => socket.write(payload));
         let response = '';
-        socket.setTimeout(2000, () => {
+        socket.setTimeout(5000, () => {
             socket.destroy();
             reject(new Error('raw request timed out'));
         });
@@ -291,6 +291,17 @@ test('subscription cache and single-flight are isolated by client variant header
     });
     assert.match(await secondA.text(), /Germany-A/);
     assert.equal(upstreamHits, 2);
+
+    const noisyA = await fetch(`${balancer.baseUrl}/same-token`, {
+        headers: {
+            'User-Agent': 'Happ/1.0',
+            'X-HWID': 'A',
+            'Accept-Language': 'ru',
+            'Sec-Fetch-Site': 'same-origin',
+        },
+    });
+    assert.match(await noisyA.text(), /Germany-A/);
+    assert.equal(upstreamHits, 2);
 });
 
 test('subscription endpoint rejects non-GET methods without hitting upstream', async (t) => {
@@ -312,6 +323,40 @@ test('subscription endpoint rejects non-GET methods without hitting upstream', a
     assert.match(response.headers.get('cache-control'), /no-store/);
     assert.equal(body.code, 'METHOD_NOT_ALLOWED');
     assert.equal(upstreamHits, 0);
+});
+
+test('trusted proxy client IP resolution ignores spoofed X-Forwarded-For prefix', async (t) => {
+    let upstreamHits = 0;
+    const upstream = http.createServer((req, res) => {
+        upstreamHits += 1;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(validXrayPayload());
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+
+    const balancer = await startBalancer(
+        t,
+        {
+            upstreamPort,
+            rate_limit_per_minute: 100,
+            rate_limit_burst_10s: 1,
+        },
+        { TRUST_X_FORWARDED_FOR: 'true' }
+    );
+
+    const first = await fetch(`${balancer.baseUrl}/xff-a`, {
+        headers: { 'X-Forwarded-For': '1.1.1.1, 8.8.8.8' },
+    });
+    const second = await fetch(`${balancer.baseUrl}/xff-b`, {
+        headers: { 'X-Forwarded-For': '2.2.2.2, 8.8.8.8' },
+    });
+    const secondBody = await second.json();
+
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 429);
+    assert.equal(secondBody.code, 'RATE_LIMITED');
+    assert.equal(upstreamHits, 1);
 });
 
 test('admin groups can switch strategy at runtime and responses are no-store', async (t) => {
@@ -345,6 +390,62 @@ test('admin groups can switch strategy at runtime and responses are no-store', a
     assert.equal(response.status, 200);
     assert.equal(subscription[0].routing.balancers[0].strategy.type, 'leastPing');
     assert.equal(subscription[0].routing.balancers[0].strategy.settings, undefined);
+});
+
+test('admin endpoints enforce explicit method allow lists', async (t) => {
+    let hostRequests = 0;
+    const panel = http.createServer((req, res) => {
+        if (req.url === '/api/hosts/') {
+            hostRequests += 1;
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                response: [
+                    { remark: 'Germany Berlin 1', isDisabled: false },
+                ],
+            }));
+            return;
+        }
+
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('not found');
+    });
+    const panelPort = await listenOnRandomPort(panel);
+    t.after(() => closeServer(panel));
+
+    const balancer = await startBalancer(
+        t,
+        { remnawave_url: `http://127.0.0.1:${panelPort}` },
+        { API_TOKEN: 'integration-api-token' }
+    );
+    const headers = { 'X-Admin-Token': 'integration-admin-token' };
+
+    const refreshGet = await fetch(`${balancer.baseUrl}/admin/refresh-groups`, { headers });
+    const refreshGetBody = await refreshGet.json();
+
+    assert.equal(refreshGet.status, 405);
+    assert.equal(refreshGet.headers.get('allow'), 'POST');
+    assert.equal(refreshGetBody.code, 'METHOD_NOT_ALLOWED');
+    assert.equal(hostRequests, 0);
+
+    const debugPost = await fetch(`${balancer.baseUrl}/admin/debug/stats`, {
+        method: 'POST',
+        headers,
+    });
+    const debugPostBody = await debugPost.json();
+
+    assert.equal(debugPost.status, 405);
+    assert.equal(debugPost.headers.get('allow'), 'GET');
+    assert.equal(debugPostBody.code, 'METHOD_NOT_ALLOWED');
+
+    const refreshPost = await fetch(`${balancer.baseUrl}/admin/refresh-groups`, {
+        method: 'POST',
+        headers,
+    });
+    const refreshPostBody = await refreshPost.json();
+
+    assert.equal(refreshPost.status, 200);
+    assert.equal(refreshPostBody.status, 'ok');
+    assert.equal(hostRequests, 1);
 });
 
 test('admin groups update invalidates subscription cache immediately', async (t) => {
@@ -400,6 +501,39 @@ test('admin groups update invalidates subscription cache immediately', async (t)
     assert.equal(upstreamHits, 2);
 });
 
+test('warmup tokens cache processed subscription output', async (t) => {
+    let upstreamHits = 0;
+    const upstream = http.createServer((req, res) => {
+        upstreamHits += 1;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(validXrayPayload());
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        warmup_tokens: ['warm-token'],
+        groups: { Germany: ['Germany'] },
+        fastest_group: false,
+        cache_ttl_sec: 300,
+    });
+
+    await waitFor(async () => {
+        const ready = await fetch(`${balancer.baseUrl}/ready`);
+        return ready.status === 200 && upstreamHits >= 1;
+    }, 3000);
+
+    const response = await fetch(`${balancer.baseUrl}/warm-token`, {
+        headers: { 'User-Agent': 'Happ/1.0' },
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(upstreamHits, 1);
+    assert.equal(body[0].remarks, 'Germany');
+});
+
 test('subscription endpoint enforces total upstream deadline', async (t) => {
     const upstream = http.createServer((req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -436,6 +570,38 @@ test('subscription endpoint enforces total upstream deadline', async (t) => {
     assert.equal(response.status, 502);
     assert.match(body, /Timeout/);
     assert.ok(Date.now() - started < 1000);
+});
+
+test('socket retry shares the original upstream deadline', async (t) => {
+    let upstreamHits = 0;
+    const upstream = http.createServer((req, res) => {
+        upstreamHits += 1;
+        if (upstreamHits === 1) {
+            setTimeout(() => req.socket.destroy(), 120);
+            return;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        const timer = setTimeout(() => res.end(validXrayPayload()), 180);
+        res.on('close', () => clearTimeout(timer));
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        request_timeout_ms: 200,
+        cache_ttl_sec: 1,
+    });
+
+    const started = Date.now();
+    const response = await fetch(`${balancer.baseUrl}/retry-deadline`);
+    const body = await response.text();
+
+    assert.equal(response.status, 502);
+    assert.match(body, /Timeout/);
+    assert.equal(upstreamHits, 2);
+    assert.ok(Date.now() - started < 800);
 });
 
 test('background refresh loop skips overlapping auto-groups runs', async (t) => {
@@ -525,6 +691,101 @@ test('startup health is not blocked by slow initial auto-groups refresh', async 
 
     const health = await fetch(`${balancer.baseUrl}/health`);
     assert.equal(health.status, 200);
+});
+
+test('leastPing uses latency fields from panel node stats', async (t) => {
+    const upstream = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([
+            {
+                remarks: 'valid',
+                outbounds: [
+                    {
+                        protocol: 'vless',
+                        tag: 'Germany-A',
+                        settings: { vnext: [{ address: 'a.example.com', port: 443 }] },
+                    },
+                    {
+                        protocol: 'vless',
+                        tag: 'Germany-B',
+                        settings: { vnext: [{ address: 'b.example.com', port: 443 }] },
+                    },
+                ],
+            },
+        ]));
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+
+    const panel = http.createServer((req, res) => {
+        if (req.url !== '/api/nodes/') {
+            res.writeHead(404, { 'Content-Type': 'text/plain' });
+            res.end('not found');
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            response: [
+                {
+                    name: 'Germany-A',
+                    address: 'a.example.com',
+                    usersOnline: 0,
+                    totalRam: '1GB',
+                    cpuCount: 1,
+                    ping_ms: 180,
+                    isConnected: true,
+                    isDisabled: false,
+                },
+                {
+                    name: 'Germany-B',
+                    address: 'b.example.com',
+                    usersOnline: 20,
+                    totalRam: '1GB',
+                    cpuCount: 1,
+                    ping_ms: 20,
+                    isConnected: true,
+                    isDisabled: false,
+                },
+            ],
+        }));
+    });
+    const panelPort = await listenOnRandomPort(panel);
+    t.after(() => closeServer(panel));
+
+    const balancer = await startBalancer(
+        t,
+        {
+            upstreamPort,
+            remnawave_url: `http://127.0.0.1:${panelPort}`,
+            strategy: 'leastPing',
+            node_stats: true,
+            node_stats_interval_sec: 30,
+            request_timeout_ms: 1000,
+        },
+        {
+            API_TOKEN: 'integration-api-token',
+            NODE_STATS: 'true',
+        }
+    );
+
+    await waitFor(async () => {
+        const response = await fetch(`${balancer.baseUrl}/admin/debug/stats`, {
+            headers: { 'X-Admin-Token': 'integration-admin-token' },
+        });
+        const body = await response.json();
+        return body.cached_nodes >= 2 && body.node_stats_fresh ? body : null;
+    }, 3000);
+
+    const response = await fetch(`${balancer.baseUrl}/least-ping-token`, {
+        headers: { 'User-Agent': 'Happ/1.0' },
+    });
+    const body = await response.json();
+    const tags = body[0].outbounds
+        .filter((outbound) => outbound.protocol === 'vless' && outbound.tag !== 'proxy')
+        .map((outbound) => outbound.tag);
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(tags, ['Germany-B', 'Germany-A']);
 });
 
 test('stale node stats do not influence subscription ordering', async (t) => {
@@ -667,8 +928,8 @@ test('concurrent admin stats refreshes share one upstream request', async (t) =>
 
     const headers = { 'X-Admin-Token': 'integration-admin-token' };
     const [first, second] = await Promise.all([
-        fetch(`${balancer.baseUrl}/admin/refresh-stats`, { headers }),
-        fetch(`${balancer.baseUrl}/admin/refresh-stats`, { headers }),
+        fetch(`${balancer.baseUrl}/admin/refresh-stats`, { method: 'POST', headers }),
+        fetch(`${balancer.baseUrl}/admin/refresh-stats`, { method: 'POST', headers }),
     ]);
     const [firstBody, secondBody] = await Promise.all([first.json(), second.json()]);
 

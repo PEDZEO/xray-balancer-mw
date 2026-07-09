@@ -76,7 +76,7 @@
     "balancer_load_weight": { "type": "number", "minimum": 0 },
     "balancer_latency_weight": { "type": "number", "minimum": 0 },
     "balancer_max_latency_ms": { "type": "integer", "minimum": 1 },
-    "balancer_smoothing_alpha": { "type": "number", "minimum": 0 },
+    "balancer_smoothing_alpha": { "type": "number", "minimum": 0, "maximum": 1 },
     "balancer_hysteresis_delta": { "type": "number", "minimum": 0 },
     "ready_success_window_sec": { "type": "integer", "minimum": 1 },
     "request_timeout_ms": { "type": "integer", "minimum": 1 },

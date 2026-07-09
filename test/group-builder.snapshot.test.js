@@ -90,3 +90,17 @@ test('buildGroupConfig does not inherit per-server description fields from base 
     assert.equal(out.server_description, undefined);
     assert.deepEqual(out.extraField, { x: 1 });
 });
+
+test('buildGroupConfig does not inherit stale observatory from base config', () => {
+    const out = buildGroupConfig({
+        observatory: { subjectSelector: ['old-node'] },
+        burstObservatory: { subjectSelector: ['old-burst-node'] },
+    }, 'Europe', [{ tag: 'Germany-1', protocol: 'vless' }], {
+        probeUrl: 'https://example.com/ping',
+        probeInterval: '3m',
+        strategy: 'leastLoad',
+    });
+
+    assert.equal(out.observatory, undefined);
+    assert.deepEqual(out.burstObservatory.subjectSelector, ['Germany-1']);
+});

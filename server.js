@@ -422,14 +422,15 @@ function fetchUrl(targetUrl, headers = {}, maxRedirects = MAX_REDIRECTS, deadlin
 }
 
 async function fetchUrlWithSocketRetry(targetUrl, headers, requestId) {
+    const deadlineAt = Date.now() + REQUEST_TIMEOUT_MS;
     try {
-        return await fetchUrl(targetUrl, headers);
+        return await fetchUrl(targetUrl, headers, MAX_REDIRECTS, deadlineAt);
     } catch (err) {
         if (!isSocketHangupError(err)) {
             throw err;
         }
         logger.warn('upstream_retry_after_socket_hangup', { request_id: requestId, message: err.message });
-        return fetchUrl(targetUrl, headers);
+        return fetchUrl(targetUrl, headers, MAX_REDIRECTS, deadlineAt);
     }
 }
 
@@ -498,12 +499,32 @@ function isTrustedProxyAddress(ip) {
     return lower.startsWith('fc') || lower.startsWith('fd') || lower.startsWith('fe80:');
 }
 
+function parseForwardedForHeader(value) {
+    const raw = Array.isArray(value) ? value.join(',') : String(value || '');
+    return raw
+        .split(',')
+        .map((part) => normalizeIpAddress(part))
+        .filter(Boolean);
+}
+
+function resolveForwardedClientIp(remoteIp, forwardedForHeader) {
+    const forwardedIps = parseForwardedForHeader(forwardedForHeader);
+    if (forwardedIps.length === 0) return remoteIp;
+
+    const chain = [...forwardedIps, remoteIp].filter(Boolean);
+    for (let i = chain.length - 1; i >= 0; i -= 1) {
+        const candidate = chain[i];
+        if (!isTrustedProxyAddress(candidate)) return candidate;
+    }
+
+    return forwardedIps[0] || remoteIp;
+}
+
 function resolveClientIp(req) {
     const remoteIp = normalizeIpAddress(req.socket.remoteAddress) || '127.0.0.1';
     if (!TRUST_X_FORWARDED_FOR) return remoteIp;
     if (!isTrustedProxyAddress(remoteIp)) return remoteIp;
-    const forwardedIp = normalizeIpAddress((req.headers['x-forwarded-for'] || '').toString().split(',')[0]);
-    return forwardedIp || remoteIp;
+    return resolveForwardedClientIp(remoteIp, req.headers['x-forwarded-for']);
 }
 
 function enforceAdminAccess(req, res, requestId, clientIp, pathname) {
@@ -808,6 +829,24 @@ function computeNodeLoad(usersOnline, totalRamGb, cpuCount) {
     return { ramLoad, cpuLoad, load };
 }
 
+function readNodeLatencyMs(node) {
+    const candidates = [
+        node?.latency_ms,
+        node?.latencyMs,
+        node?.latency,
+        node?.ping_ms,
+        node?.pingMs,
+        node?.ping,
+        node?.rtt_ms,
+        node?.rtt,
+    ];
+    for (const candidate of candidates) {
+        const value = Number(candidate);
+        if (Number.isFinite(value) && value >= 0) return value;
+    }
+    return null;
+}
+
 function updateAutoDrainFromNodes(nodes) {
     const runtime = getRuntimeConfig();
     if (!runtime.autoDrainEnabled || !Array.isArray(nodes) || nodes.length === 0) return;
@@ -894,6 +933,7 @@ async function fetchNodeStatsNow() {
             const cpuCount = node.cpuCount || 1;
             const isConnected = node.isConnected || false;
             const isDisabled = node.isDisabled || false;
+            const latencyMs = readNodeLatencyMs(node);
 
             const { ramLoad, cpuLoad, load } = computeNodeLoad(usersOnline, totalRamGb, cpuCount);
             const normalizedLoad = Math.round(load * 100) / 100;
@@ -909,6 +949,7 @@ async function fetchNodeStatsNow() {
                 isDisabled,
                 isAlias: false,
                 sourceNode: name,
+                ...(latencyMs === null ? {} : { latency_ms: latencyMs }),
             };
 
             if (address && address !== name) {
@@ -1166,6 +1207,7 @@ const SKIP_RESPONSE_HEADERS = new Set([
 // Request/response header helpers.
 const CACHE_VARIANT_HEADER_SKIP = new Set([
     'host',
+    'accept-language',
     'x-forwarded-for',
     'x-forwarded-proto',
     'x-real-ip',
@@ -1173,6 +1215,12 @@ const CACHE_VARIANT_HEADER_SKIP = new Set([
     'x-correlation-id',
     'traceparent',
     'tracestate',
+    'sec-fetch-dest',
+    'sec-fetch-mode',
+    'sec-fetch-site',
+    'sec-fetch-user',
+    'priority',
+    'dnt',
 ]);
 
 const NO_STORE_HEADERS = {
@@ -1185,6 +1233,14 @@ function applyNoStoreHeaders(res) {
     for (const [key, value] of Object.entries(NO_STORE_HEADERS)) {
         res.setHeader(key, value);
     }
+}
+
+function sendMethodNotAllowed(res, requestId, allowedMethods) {
+    res.writeHead(405, {
+        'Content-Type': 'application/json',
+        Allow: allowedMethods.join(', '),
+    });
+    res.end(JSON.stringify({ status: 'error', code: 'METHOD_NOT_ALLOWED', request_id: requestId }));
 }
 
 function buildForwardHeaders(req, clientIp) {
@@ -1306,18 +1362,16 @@ function isNodeStatsFresh(now = Date.now()) {
 }
 
 async function warmupToken(token) {
-    const targetUrl = SUB_PAGE_URL
-        ? `${SUB_PAGE_URL}/${token}`
-        : `${REMNAWAVE_URL}${REMNAWAVE_SUB_PATH}/${token}`;
-    const forwardHeaders = { 'user-agent': 'Happ/1.0' };
-    const cacheKey = buildSubscriptionCacheKey(token, forwardHeaders);
+    const targetUrl = `http://127.0.0.1:${PORT}/${token}`;
+    const forwardHeaders = {
+        'user-agent': 'Happ/1.0',
+        accept: '*/*',
+    };
     try {
-        const upstream = await fetchUrl(targetUrl, forwardHeaders);
+        const upstream = await fetchUrl(targetUrl, forwardHeaders, 0, Date.now() + REQUEST_TIMEOUT_MS + 1000);
         if (upstream.status !== 200) return false;
         const classified = classifyUpstreamPayload(upstream.body);
         if (classified.type === 'xray_json') {
-            subscriptionCache.set(cacheKey, upstream.body, sanitizeHeadersForCache(upstream.headers));
-            lastUpstreamSuccessAt = Date.now();
             return true;
         }
         return false;
@@ -1498,8 +1552,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method !== 'PUT') {
-            res.writeHead(405, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'error', code: 'METHOD_NOT_ALLOWED', request_id: requestId }));
+            sendMethodNotAllowed(res, requestId, ['GET', 'PUT']);
             return;
         }
 
@@ -1627,6 +1680,10 @@ const server = http.createServer(async (req, res) => {
         if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
             return;
         }
+        if (req.method !== 'GET') {
+            sendMethodNotAllowed(res, requestId, ['GET']);
+            return;
+        }
         const quarantineSet = buildQuarantineSet();
         const enriched = Object.fromEntries(
             Object.entries(nodeStatsCache).map(([name, stats]) => [
@@ -1660,8 +1717,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method !== 'POST') {
-            res.writeHead(405, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'error', code: 'METHOD_NOT_ALLOWED', request_id: requestId }));
+            sendMethodNotAllowed(res, requestId, ['GET', 'POST']);
             return;
         }
 
@@ -1710,8 +1766,7 @@ const server = http.createServer(async (req, res) => {
             return;
         }
         if (req.method !== 'DELETE') {
-            res.writeHead(405, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ status: 'error', code: 'METHOD_NOT_ALLOWED', request_id: requestId }));
+            sendMethodNotAllowed(res, requestId, ['DELETE']);
             return;
         }
 
@@ -1759,6 +1814,10 @@ const server = http.createServer(async (req, res) => {
         if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
             return;
         }
+        if (req.method !== 'POST') {
+            sendMethodNotAllowed(res, requestId, ['POST']);
+            return;
+        }
         if (!API_TOKEN) {
             res.writeHead(502, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'error', code: 'REFRESH_GROUPS_FAILED', request_id: requestId, message: 'API token is missing' }));
@@ -1779,6 +1838,10 @@ const server = http.createServer(async (req, res) => {
         if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
             return;
         }
+        if (req.method !== 'POST') {
+            sendMethodNotAllowed(res, requestId, ['POST']);
+            return;
+        }
         if (!API_TOKEN) {
             res.writeHead(502, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'error', code: 'REFRESH_STATS_FAILED', request_id: requestId, message: 'API token is missing' }));
@@ -1797,6 +1860,10 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/admin/debug/stats') {
         if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
+            return;
+        }
+        if (req.method !== 'GET') {
+            sendMethodNotAllowed(res, requestId, ['GET']);
             return;
         }
         const runtime = getRuntimeConfig();
@@ -1832,6 +1899,10 @@ const server = http.createServer(async (req, res) => {
 
     if (debugTokenValue) {
         if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
+            return;
+        }
+        if (req.method !== 'GET') {
+            sendMethodNotAllowed(res, requestId, ['GET']);
             return;
         }
         const debugToken = debugTokenValue;
@@ -2159,9 +2230,10 @@ const server = http.createServer(async (req, res) => {
         const fastestEnabled = config.fastest_group !== false;
         const excludedTags = new Set();
         const fallbackTags = new Set();
+        const excludedGroupSet = buildGroupNameSet(FASTEST_EXCLUDE_GROUPS);
         const fallbackGroupSet = buildGroupNameSet(FASTEST_FALLBACK_GROUPS);
         for (const [groupName, outbounds] of Object.entries(grouped)) {
-            if (FASTEST_EXCLUDE_GROUPS.includes(groupName)) {
+            if (excludedGroupSet.has(normalizeNodeName(groupName))) {
                 for (const outbound of outbounds) excludedTags.add(outbound.tag);
             }
             if (fallbackGroupSet.has(normalizeNodeName(groupName))) {

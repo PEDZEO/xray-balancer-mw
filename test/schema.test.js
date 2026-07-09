@@ -26,4 +26,5 @@ test('config schema is valid JSON and contains key sections', () => {
     assert.equal(typeof schema.properties.api_token, 'object');
     assert.equal(typeof schema.properties.panel_auth_cookie, 'object');
     assert.equal(schema.properties.strategy.enum.includes('leastPing'), true);
+    assert.equal(schema.properties.balancer_smoothing_alpha.maximum, 1);
 });

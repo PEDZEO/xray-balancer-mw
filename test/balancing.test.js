@@ -121,6 +121,24 @@ test('filterAndSortByLoad prioritizes latency for leastPing strategy', () => {
     assert.deepEqual(result.map((item) => item.tag), ['B-node', 'A-node', 'C-node']);
 });
 
+test('filterAndSortByLoad preserves strategy order for random and roundRobin', () => {
+    const outbounds = [{ tag: 'A-node' }, { tag: 'B-node' }, { tag: 'C-node' }];
+    const cache = {
+        'A-node': { load: 0.9, isConnected: true, isDisabled: false },
+        'B-node': { load: 0.1, isConnected: true, isDisabled: false },
+        'C-node': { load: 0.2, isConnected: false, isDisabled: false },
+    };
+
+    assert.deepEqual(
+        filterAndSortByLoad(outbounds, cache, { strategy: 'roundRobin' }).map((item) => item.tag),
+        ['A-node', 'B-node'],
+    );
+    assert.deepEqual(
+        filterAndSortByLoad(outbounds, cache, { strategy: 'random' }).map((item) => item.tag),
+        ['A-node', 'B-node'],
+    );
+});
+
 test('filterHiddenOutbounds removes nodes hidden directly or via hidden group', () => {
     const groups = {
         '🇩🇪 Germany': ['German'],

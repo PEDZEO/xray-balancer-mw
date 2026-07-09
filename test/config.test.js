@@ -125,3 +125,12 @@ test('validateConfig validates quarantine_nodes', () => {
         /auto_quarantine_nodes contains invalid node name/,
     );
 });
+
+test('validateConfig bounds smoothing alpha to 0..1', () => {
+    assert.deepEqual(validateConfig({ balancer_smoothing_alpha: 0 }), { balancer_smoothing_alpha: 0 });
+    assert.deepEqual(validateConfig({ balancer_smoothing_alpha: 1 }), { balancer_smoothing_alpha: 1 });
+    assert.throws(
+        () => validateConfig({ balancer_smoothing_alpha: 1.5 }),
+        /balancer_smoothing_alpha must be <= 1/,
+    );
+});

@@ -7,11 +7,11 @@
 
 ## Admin Endpoints
 All endpoints below require `x-admin-token` header:
-- `/admin/node-stats`
-- `/admin/refresh-stats`
-- `/admin/refresh-groups`
-- `/admin/debug/stats`
-- `/admin/debug/token/{token}`
+- `GET /admin/node-stats`
+- `POST /admin/refresh-stats`
+- `POST /admin/refresh-groups`
+- `GET /admin/debug/stats`
+- `GET /admin/debug/token/{token}`
 - `/admin/groups` (`GET` current runtime groups, `PUT` update/persist groups and mutable settings)
 - `/admin/quarantine` (`GET` list, `POST` add `{ "node": "name" }`)
 - `/admin/quarantine/{node}` (`DELETE` remove)
@@ -53,6 +53,7 @@ Admin endpoints are also rate-limited (`admin_rate_limit_per_minute`, `admin_rat
 ### All clients appear as one IP behind proxy
 - Set `trust_x_forwarded_for: true` only when middleware is behind your trusted reverse proxy.
 - X-Forwarded-For is accepted only from loopback/private reverse-proxy addresses. If middleware is exposed directly, keep `trust_x_forwarded_for: false`.
+- For nginx, prefer `proxy_set_header X-Forwarded-For $remote_addr;` instead of appending `$proxy_add_x_forwarded_for`; the middleware resolves proxy chains from right to left, but replacing the header avoids preserving spoofed client prefixes.
 
 ### Wrong grouping or fallback to `Other`
 - Adjust `groups` patterns.
