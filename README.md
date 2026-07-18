@@ -105,7 +105,7 @@ docker compose up -d --build
 ```caddyfile
 https://sub.example.com {
     @xray_client {
-        header_regexp User-Agent (?i)(happ|streisand|v2ray|v2raytun|neko|foxray|v2box|xray|invisibleman)
+        header_regexp User-Agent (?i)(happ|incy|v2plus|streisand|v2ray|v2raytun|neko|foxray|v2box|xray|invisibleman)
     }
 
     handle @xray_client {

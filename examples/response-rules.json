@@ -2,14 +2,6 @@
     "version": "1",
     "rules": [
         {
-            "name": "Browser Subscription",
-            "description": "System critical: do not delete or disable this rule.",
-            "enabled": true,
-            "operator": "AND",
-            "conditions": [{ "headerName": "accept", "operator": "CONTAINS", "value": "text/html", "caseSensitive": true }],
-            "responseType": "BROWSER"
-        },
-        {
             "name": "Mihomo Clients",
             "description": "Response with generated YAML config (Mihomo Template)",
             "enabled": true,
@@ -34,12 +26,20 @@
             "responseType": "SINGBOX"
         },
         {
-            "name": "Happ / Xray JSON Clients",
-            "description": "Response with generated JSON config (Xray JSON Template). Includes V2RayTUN.",
+            "name": "Happ / Incy / v2plus / Xray JSON Clients",
+            "description": "Response with generated JSON config (Xray JSON Template). Includes Happ, Incy, v2plus and V2RayTUN.",
             "enabled": true,
             "operator": "AND",
-            "conditions": [{ "headerName": "user-agent", "operator": "REGEX", "value": "^(?:Happ|Streisand|FoXray|V2Box|V2rayN|V2RayTUN|InvisibleMan|Xray)", "caseSensitive": false }],
+            "conditions": [{ "headerName": "user-agent", "operator": "REGEX", "value": "^(?:Happ|Incy|v2plus|Streisand|FoXray|V2Box|V2rayN|V2RayTUN|InvisibleMan|Xray)", "caseSensitive": false }],
             "responseType": "XRAY_JSON"
+        },
+        {
+            "name": "Browser Subscription",
+            "description": "System critical: do not delete or disable this rule.",
+            "enabled": true,
+            "operator": "AND",
+            "conditions": [{ "headerName": "accept", "operator": "CONTAINS", "value": "text/html", "caseSensitive": true }],
+            "responseType": "BROWSER"
         },
         {
             "name": "Clash Core Clients",
