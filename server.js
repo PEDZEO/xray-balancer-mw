@@ -28,6 +28,7 @@ const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json
 const CONFIG_RUNTIME_PATH = process.env.CONFIG_RUNTIME_PATH || '';
 const MUTABLE_CONFIG_KEYS = [
     'groups',
+    'group_descriptions',
     'strategy',
     'fastest_group',
     'fastest_group_name',
@@ -168,6 +169,7 @@ const REQUEST_TIMEOUT_MS = pickRuntimeInt('REQUEST_TIMEOUT_MS', 'request_timeout
 const MAX_REDIRECTS = pickRuntimeInt('MAX_REDIRECTS', 'max_redirects');
 const CIRCUIT_BREAKER_FAILURES = pickRuntimeInt('CIRCUIT_BREAKER_FAILURES', 'circuit_breaker_failures');
 const CIRCUIT_BREAKER_OPEN_SEC = pickRuntimeInt('CIRCUIT_BREAKER_OPEN_SEC', 'circuit_breaker_open_sec');
+let GROUP_DESCRIPTIONS = {};
 let FASTEST_EXCLUDE_GROUPS = [];
 let FASTEST_FALLBACK_GROUPS = [];
 let NODE_STATS_EXCLUDE_GROUPS = [];
@@ -362,6 +364,7 @@ function applyMutableRuntimeConfig(nextConfig) {
     config = nextConfig;
     STRATEGY = normalizeStrategy(nextConfig.strategy) || 'leastLoad';
     GROUPS = nextConfig.groups || {};
+    GROUP_DESCRIPTIONS = nextConfig.group_descriptions || {};
     const runtime = getRuntimeConfig();
     FASTEST_EXCLUDE_GROUPS = runtime.fastestExcludeGroups;
     FASTEST_FALLBACK_GROUPS = runtime.fastestFallbackGroups;
@@ -1430,6 +1433,11 @@ function collectAllProxyOutbounds(configArray) {
                 }
             }
             cloned.tag = tag;
+            if (cfg.description && !cloned.description) cloned.description = cfg.description;
+            if (cfg.serverDescription && !cloned.serverDescription) cloned.serverDescription = cfg.serverDescription;
+            if (cfg.server_description && !cloned.server_description) cloned.server_description = cfg.server_description;
+            if (cfg.title && !cloned.title) cloned.title = cfg.title;
+            if (cfg.ps && !cloned.ps) cloned.ps = cfg.ps;
             seenTags.add(tag);
             allOutbounds.push(cloned);
         }
@@ -1809,6 +1817,7 @@ const server = http.createServer(async (req, res) => {
                 status: 'ok',
                 request_id: requestId,
                 groups: GROUPS,
+                group_descriptions: GROUP_DESCRIPTIONS,
                 strategy: STRATEGY,
                 fastest_group: config.fastest_group !== false,
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
@@ -1866,6 +1875,7 @@ const server = http.createServer(async (req, res) => {
         try {
             const payload = await readJsonBody(req);
             const incomingGroups = payload.groups;
+            const incomingGroupDescriptions = payload.group_descriptions;
             const incomingExclude = payload.fastest_exclude_groups;
             const incomingFastestFallback = payload.fastest_fallback;
             const incomingNodeStatsExclude = payload.node_stats_exclude;
@@ -1878,6 +1888,7 @@ const server = http.createServer(async (req, res) => {
             const mutationResult = await mutateRuntimeConfig(requestId, (currentConfig) => {
                 const nextConfig = { ...currentConfig };
                 if (incomingGroups !== undefined) nextConfig.groups = incomingGroups;
+                if (incomingGroupDescriptions !== undefined) nextConfig.group_descriptions = incomingGroupDescriptions;
                 if (incomingExclude !== undefined) nextConfig.fastest_exclude_groups = incomingExclude;
                 if (incomingFastestFallback !== undefined) nextConfig.fastest_fallback = incomingFastestFallback;
                 if (incomingNodeStatsExclude !== undefined) nextConfig.node_stats_exclude = incomingNodeStatsExclude;
@@ -2777,6 +2788,7 @@ const server = http.createServer(async (req, res) => {
                 probeConnectivity: runtime.probeConnectivityUrl,
                 probeHttpMethod: runtime.probeHttpMethod,
                 strategy: STRATEGY,
+                groupDescription: (GROUP_DESCRIPTIONS && GROUP_DESCRIPTIONS[fastestGroupName]) || '',
             });
             resultConfigs.push(fastestConfig);
             logger.info('group_fastest', {
@@ -2847,6 +2859,7 @@ const server = http.createServer(async (req, res) => {
                 probeConnectivity: runtime.probeConnectivityUrl,
                 probeHttpMethod: runtime.probeHttpMethod,
                 strategy: STRATEGY,
+                groupDescription: (GROUP_DESCRIPTIONS && (GROUP_DESCRIPTIONS[configName] || GROUP_DESCRIPTIONS[groupName])) || '',
             });
             resultConfigs.push(groupConfig);
 
