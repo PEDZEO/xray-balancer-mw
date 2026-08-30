@@ -133,11 +133,11 @@ docker compose up -d --build
 
 ```caddyfile
 https://sub.example.com {
-    @xray_client {
-        header_regexp User-Agent (?i)(happ|incy|v2plus|streisand|v2ray|v2raytun|neko|foxray|v2box|xray|invisibleman)
+    @balanced_subscription_client {
+        header_regexp User-Agent "(?i)(happ|incy|v2plus|streisand|v2ray|v2raytun|neko|foxray|v2box|xray|invisibleman|flclash|flowvy|clash-verge|koala-clash|clash-?meta|murge|clashx[ ]meta|mihomo|clash-nyanpasu|clash[.]meta|prizrak-box)"
     }
 
-    handle @xray_client {
+    handle @balanced_subscription_client {
         reverse_proxy xray-balancer-mw:4100
     }
 
