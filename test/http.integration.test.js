@@ -693,7 +693,11 @@ test('generated Xray groups preserve merged panel routing and DNS policy', async
                 serverDescription: 'XHTTP server description',
                 routing: {
                     domainStrategy: 'AsIs',
-                    rules: [{ type: 'field', domain: ['geosite:ru'], ip: ['geoip:ru'], outboundTag: 'direct' }],
+                    rules: [
+                        { type: 'field', domain: ['geosite:ru'], ip: ['geoip:ru'], outboundTag: 'direct' },
+                        { type: 'field', domain: ['geosite:private'], outboundTag: 'direct' },
+                        { type: 'field', ip: ['geoip:private'], outboundTag: 'direct' },
+                    ],
                 },
                 outbounds: [
                     { tag: 'proxy', protocol: 'vless', settings: { vnext: [{ address: 'de.example.com', port: 443 }] } },
@@ -743,11 +747,19 @@ test('generated Xray groups preserve merged panel routing and DNS policy', async
     assert.equal(europe.routing.domainStrategy, 'AsIs');
     assert.ok(europe.routing.rules.some((rule) => rule.domain?.includes('geosite:ru') && rule.outboundTag === 'direct'));
     assert.ok(europe.routing.rules.some((rule) => rule.domain?.includes('geosite:category-ads-all') && rule.outboundTag === 'block'));
+    assert.equal(JSON.stringify(europe.routing.rules).includes('geosite:private'), false);
+    assert.equal(JSON.stringify(europe.routing.rules).includes('geoip:private'), false);
     assert.ok(europe.routing.rules.some((rule) => rule.network === 'tcp,udp' && rule.balancerTag === 'Europe-balancer'));
     assert.equal(europe.routing.rules.some((rule) => rule.outboundTag === 'proxy'), false);
     assert.equal(europe.routing.balancers[0].selector.includes('route-again'), false);
     assert.ok(europe.outbounds.some((outbound) => outbound.tag === 'route-again' && outbound.protocol === 'loopback'));
     assert.deepEqual(europe.outbounds[0], {
+        tag: '__xrb_01__:Germany',
+        protocol: 'vless',
+        settings: { vnext: [{ address: 'de.example.com', port: 443 }] },
+        serverDescription: 'XHTTP server description',
+    });
+    assert.deepEqual(europe.outbounds[1], {
         tag: 'proxy',
         protocol: 'loopback',
         settings: { inboundTag: 'Europe-proxy-in' },

@@ -29,7 +29,7 @@ test('buildGroupConfig output matches snapshot fixture', () => {
     assert.deepEqual(out, expected);
 });
 
-test('buildGroupConfig uses a loopback outbound to preserve the fallback pool', () => {
+test('buildGroupConfig exposes a real node first and keeps loopback routing for the fallback pool', () => {
     const base = {
         inbounds: [
             { tag: 'socks', port: 10808, protocol: 'socks' },
@@ -48,7 +48,13 @@ test('buildGroupConfig uses a loopback outbound to preserve the fallback pool', 
     });
 
     assert.deepEqual(out.inbounds.map((inbound) => inbound.port), [10808, 10809]);
-    assert.equal(out.outbounds[0].tag, 'proxy');
+    assert.equal(out.outbounds[0].tag, '__xrb_01__:Main-1');
+    assert.equal(out.outbounds[0].protocol, 'vless');
+    assert.deepEqual(out.outbounds[1], {
+        tag: 'proxy',
+        protocol: 'loopback',
+        settings: { inboundTag: '_Fastest-proxy-in' },
+    });
     assert.deepEqual(out.burstObservatory.subjectSelector, [
         '__xrb_01__:Main-1',
         '__xrb_02__:LTE-1',
@@ -112,7 +118,7 @@ test('buildGroupConfig preserves panel routing rules and remaps proxy to the gen
 
     assert.equal(out.routing.domainStrategy, 'AsIs');
     assert.equal(out.routing.domainMatcher, 'hybrid');
-    assert.deepEqual(out.outbounds[0], {
+    assert.deepEqual(out.outbounds[1], {
         tag: 'proxy',
         protocol: 'loopback',
         settings: { inboundTag: 'Europe-proxy-in' },
@@ -171,6 +177,40 @@ test('buildGroupConfig moves a panel catch-all behind specialized routing rules'
     ));
     assert.ok(ruIndex >= 0);
     assert.ok(catchAllIndex > ruIndex);
+});
+
+test('buildGroupConfig removes only redundant direct private geo rules', () => {
+    const out = buildGroupConfig({
+        routing: {
+            rules: [
+                { type: 'field', ip: ['geoip:private'], outboundTag: 'direct' },
+                { type: 'field', domain: ['geosite:private'], outboundTag: 'direct' },
+                { type: 'field', domain: ['geosite:private'], outboundTag: 'block' },
+                { type: 'field', domain: ['geosite:private', 'geosite:ru'], outboundTag: 'direct' },
+            ],
+        },
+    }, 'Geo compatibility', [{ tag: 'node', protocol: 'vless' }], {
+        probeUrl: 'https://example.com/ping',
+        probeInterval: '1m',
+        strategy: 'leastPing',
+    });
+
+    const serializedRules = JSON.stringify(out.routing.rules);
+    assert.equal(out.routing.rules.some((rule) => (
+        rule.outboundTag === 'direct' && rule.ip?.length === 1 && rule.ip[0] === 'geoip:private'
+    )), false);
+    assert.equal(out.routing.rules.some((rule) => (
+        rule.outboundTag === 'direct' && rule.domain?.length === 1 && rule.domain[0] === 'geosite:private'
+    )), false);
+    assert.ok(out.routing.rules.some((rule) => (
+        rule.outboundTag === 'block' && rule.domain?.includes('geosite:private')
+    )));
+    assert.ok(out.routing.rules.some((rule) => (
+        rule.outboundTag === 'direct'
+        && rule.domain?.includes('geosite:private')
+        && rule.domain?.includes('geosite:ru')
+    )));
+    assert.match(serializedRules, /geosite:private/);
 });
 
 test('mergeProfileBaseConfigs merges DNS and routing policy from every upstream profile', () => {
@@ -280,7 +320,6 @@ test('every observed balancer fallback resolves to a safe outbound', () => {
                 assert.equal(balancerTags.has(balancer.fallbackTag), false, 'fallbackTag must not resolve to a balancer');
                 assert.notEqual(balancer.fallbackTag, 'direct', 'fallback must not leak traffic directly');
                 assert.notEqual(balancer.fallbackTag, 'block', 'fallback must not silently block traffic');
-                assert.notEqual(balancer.fallbackTag, out.outbounds[0].tag, 'fallback must not use the default outbound implicitly');
                 assert.notEqual(outboundsByTag.get(balancer.fallbackTag).protocol, 'freedom');
                 assert.notEqual(outboundsByTag.get(balancer.fallbackTag).protocol, 'blackhole');
             }
@@ -330,10 +369,9 @@ test('buildGroupConfig does not inherit per-server title/description fields from
     assert.equal(out.serverDescription, undefined);
     assert.equal(out.server_description, undefined);
     assert.deepEqual(out.extraField, { x: 1 });
-    assert.equal(out.outbounds[0].tag, 'proxy');
-    assert.equal(out.outbounds[0].title, undefined);
-    assert.equal(out.outbounds[1].tag, '__xrb_01__:Germany-1');
-    assert.equal(out.outbounds[1].title, 'Germany-1 Title');
+    assert.equal(out.outbounds[0].tag, '__xrb_01__:Germany-1');
+    assert.equal(out.outbounds[0].title, 'Germany-1 Title');
+    assert.equal(out.outbounds[1].tag, 'proxy');
 });
 
 test('buildGroupConfig applies custom groupDescription when provided in options', () => {
