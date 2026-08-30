@@ -8,6 +8,7 @@ const http = require('node:http');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
+const YAML = require('yaml');
 
 const repoRoot = path.join(__dirname, '..');
 
@@ -168,6 +169,30 @@ function validXrayPayload() {
     ]);
 }
 
+function validMihomoPayload() {
+    return YAML.stringify({
+        profile: { 'store-selected': true },
+        proxies: [
+            { name: '🇷🇺 Без VPN', type: 'direct' },
+            { name: 'Германия 🇩🇪', type: 'vless', server: 'de.example.com', port: 443 },
+            { name: 'Франция 🇫🇷', type: 'vless', server: 'fr.example.com', port: 443 },
+        ],
+        'proxy-groups': [
+            {
+                name: '🚫 Недоступные сайты',
+                type: 'select',
+                proxies: ['⚡ Авто-переключение', '🇷🇺 Без VPN', 'Германия 🇩🇪', 'Франция 🇫🇷'],
+            },
+            {
+                name: '⚡ Авто-переключение',
+                type: 'fallback',
+                proxies: ['Германия 🇩🇪', 'Франция 🇫🇷'],
+            },
+        ],
+        rules: ['MATCH,🚫 Недоступные сайты'],
+    });
+}
+
 function rawRequest(port, payload) {
     return new Promise((resolve, reject) => {
         const socket = net.connect({ host: '127.0.0.1', port }, () => socket.write(payload));
@@ -247,6 +272,50 @@ test('subscription endpoint uses single-flight fetch and fresh read-through cach
 
     const ready = await fetch(`${balancer.baseUrl}/ready`);
     assert.equal(ready.status, 200);
+});
+
+test('Mihomo YAML uses configured group names and preserves YAML content type in cache', async (t) => {
+    let upstreamHits = 0;
+    const upstream = http.createServer((req, res) => {
+        upstreamHits += 1;
+        res.writeHead(200, { 'Content-Type': 'text/yaml; charset=utf-8' });
+        res.end(validMihomoPayload());
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        strategy: 'leastPing',
+        fastest_group: true,
+        fastest_group_name: '🏁 Самые быстрые',
+        groups: {
+            '🇩🇪 Germany': ['Germany', 'Германия'],
+            '🇫🇷 France': ['France', 'Франция'],
+        },
+    });
+    const headers = { 'User-Agent': 'Mihomo/1.19.15' };
+
+    const first = await fetch(`${balancer.baseUrl}/mihomo-token`, { headers });
+    const firstDocument = YAML.parse(await first.text());
+    const firstGroups = new Map(firstDocument['proxy-groups'].map((group) => [group.name, group]));
+
+    assert.equal(first.status, 200);
+    assert.match(first.headers.get('content-type'), /^text\/yaml/);
+    assert.deepEqual(firstGroups.get('🚫 Недоступные сайты').proxies, [
+        '🏁 Самые быстрые',
+        '🇷🇺 Без VPN',
+        '🇩🇪 Germany',
+        '🇫🇷 France',
+    ]);
+    assert.equal(firstGroups.get('🏁 Самые быстрые').type, 'url-test');
+    assert.equal(firstGroups.has('⚡ Авто-переключение'), false);
+
+    const cached = await fetch(`${balancer.baseUrl}/mihomo-token`, { headers });
+    assert.equal(cached.status, 200);
+    assert.match(cached.headers.get('content-type'), /^text\/yaml/);
+    assert.equal(YAML.parse(await cached.text())['proxy-groups'][0].name, '🚫 Недоступные сайты');
+    assert.equal(upstreamHits, 1);
 });
 
 test('subscription cache and single-flight are isolated by client variant headers', async (t) => {
@@ -418,6 +487,8 @@ test('admin endpoints enforce explicit method allow lists', async (t) => {
         { API_TOKEN: 'integration-api-token' }
     );
     const headers = { 'X-Admin-Token': 'integration-admin-token' };
+    await waitFor(() => hostRequests >= 1);
+    const hostRequestsBeforeInvalidMethod = hostRequests;
 
     const refreshGet = await fetch(`${balancer.baseUrl}/admin/refresh-groups`, { headers });
     const refreshGetBody = await refreshGet.json();
@@ -425,7 +496,7 @@ test('admin endpoints enforce explicit method allow lists', async (t) => {
     assert.equal(refreshGet.status, 405);
     assert.equal(refreshGet.headers.get('allow'), 'POST');
     assert.equal(refreshGetBody.code, 'METHOD_NOT_ALLOWED');
-    assert.equal(hostRequests, 0);
+    assert.equal(hostRequests, hostRequestsBeforeInvalidMethod);
 
     const debugPost = await fetch(`${balancer.baseUrl}/admin/debug/stats`, {
         method: 'POST',
@@ -445,7 +516,149 @@ test('admin endpoints enforce explicit method allow lists', async (t) => {
 
     assert.equal(refreshPost.status, 200);
     assert.equal(refreshPostBody.status, 'ok');
-    assert.equal(hostRequests, 1);
+    assert.equal(hostRequests, hostRequestsBeforeInvalidMethod + 1);
+});
+
+test('admin hosts returns a sanitized panel host catalog', async (t) => {
+    const panel = http.createServer((req, res) => {
+        if (req.url !== '/api/hosts/') {
+            res.writeHead(404, { 'Content-Type': 'text/plain' });
+            res.end('not found');
+            return;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            response: [
+                {
+                    uuid: 'host-disabled',
+                    remark: 'Net CDN',
+                    address: 'shared.cdn.example',
+                    port: 80,
+                    isDisabled: true,
+                    secretInternalField: 'must-not-leak',
+                },
+                {
+                    uuid: 'host-active',
+                    remark: 'Germany',
+                    address: 'de.example.com',
+                    port: 443,
+                    isDisabled: false,
+                },
+            ],
+        }));
+    });
+    const panelPort = await listenOnRandomPort(panel);
+    t.after(() => closeServer(panel));
+
+    const balancer = await startBalancer(
+        t,
+        { remnawave_url: `http://127.0.0.1:${panelPort}` },
+        { API_TOKEN: 'integration-api-token' }
+    );
+    const response = await fetch(`${balancer.baseUrl}/admin/hosts`, {
+        headers: { 'X-Admin-Token': 'integration-admin-token' },
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get('cache-control'), /no-store/);
+    assert.equal(body.total, 2);
+    assert.equal(body.enabled, 1);
+    assert.deepEqual(body.hosts, [
+        {
+            uuid: 'host-active',
+            remark: 'Germany',
+            address: 'de.example.com',
+            port: 443,
+            is_disabled: false,
+        },
+        {
+            uuid: 'host-disabled',
+            remark: 'Net CDN',
+            address: 'shared.cdn.example',
+            port: 80,
+            is_disabled: true,
+        },
+    ]);
+    assert.equal(JSON.stringify(body).includes('must-not-leak'), false);
+
+    const methodResponse = await fetch(`${balancer.baseUrl}/admin/hosts`, {
+        method: 'POST',
+        headers: { 'X-Admin-Token': 'integration-admin-token' },
+    });
+    assert.equal(methodResponse.status, 405);
+    assert.equal(methodResponse.headers.get('allow'), 'GET');
+});
+
+test('host UUID binding survives a panel host rename and refreshes the admin display name', async (t) => {
+    let hostRemark = 'Germany Old';
+    let upstreamHits = 0;
+    const panel = http.createServer((req, res) => {
+        if (req.url !== '/api/hosts/') {
+            res.writeHead(404);
+            res.end();
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            response: [{
+                uuid: 'stable-host-uuid',
+                remark: hostRemark,
+                address: 'de.example.com',
+                port: 443,
+                isDisabled: false,
+            }],
+        }));
+    });
+    const upstream = http.createServer((req, res) => {
+        upstreamHits += 1;
+        res.writeHead(200, { 'Content-Type': 'text/yaml; charset=utf-8' });
+        res.end(YAML.stringify({
+            proxies: [
+                { name: 'Direct', type: 'direct' },
+                { name: hostRemark, type: 'vless', server: 'de.example.com', port: 443 },
+            ],
+            'proxy-groups': [{ name: 'Main', type: 'select', proxies: ['Direct', hostRemark] }],
+            rules: ['MATCH,Main'],
+        }));
+    });
+    const panelPort = await listenOnRandomPort(panel);
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => Promise.all([closeServer(panel), closeServer(upstream)]));
+
+    const balancer = await startBalancer(
+        t,
+        {
+            upstreamPort,
+            remnawave_url: `http://127.0.0.1:${panelPort}`,
+            groups: { Europe: [] },
+            group_hosts: { Europe: ['stable-host-uuid'] },
+            fastest_group: false,
+        },
+        { API_TOKEN: 'integration-api-token' },
+    );
+    const adminHeaders = { 'X-Admin-Token': 'integration-admin-token' };
+    await fetch(`${balancer.baseUrl}/admin/hosts`, { headers: adminHeaders });
+
+    const first = YAML.parse(await (await fetch(`${balancer.baseUrl}/rename-token`, {
+        headers: { 'User-Agent': 'Mihomo/1.19.15' },
+    })).text());
+    assert.deepEqual(first['proxy-groups'].find((group) => group.name === 'Europe').proxies, ['Europe · 1']);
+
+    hostRemark = 'Germany New';
+    const refreshedHosts = await (await fetch(`${balancer.baseUrl}/admin/hosts`, { headers: adminHeaders })).json();
+    assert.equal(refreshedHosts.hosts[0].uuid, 'stable-host-uuid');
+    assert.equal(refreshedHosts.hosts[0].remark, 'Germany New');
+
+    const second = YAML.parse(await (await fetch(`${balancer.baseUrl}/rename-token`, {
+        headers: { 'User-Agent': 'Mihomo/1.19.15' },
+    })).text());
+    assert.deepEqual(second['proxy-groups'].find((group) => group.name === 'Europe').proxies, ['Europe · 1']);
+    assert.equal(upstreamHits, 2);
+
+    const groups = await (await fetch(`${balancer.baseUrl}/admin/groups`, { headers: adminHeaders })).json();
+    assert.deepEqual(groups.group_hosts, { Europe: ['stable-host-uuid'] });
 });
 
 test('admin groups update invalidates subscription cache immediately', async (t) => {
@@ -775,6 +988,18 @@ test('leastPing uses latency fields from panel node stats', async (t) => {
         const body = await response.json();
         return body.cached_nodes >= 2 && body.node_stats_fresh ? body : null;
     }, 3000);
+
+    const metricsResponse = await fetch(`${balancer.baseUrl}/admin/health-metrics`, {
+        headers: { 'X-Admin-Token': 'integration-admin-token' },
+    });
+    const metrics = await metricsResponse.json();
+    assert.equal(metricsResponse.status, 200);
+    assert.equal(metrics['germany-a'].lastRttMs, 180);
+    assert.equal(metrics['germany-b'].lastRttMs, 20);
+    assert.equal(metrics['germany-b'].lossPercent, 0);
+
+    const unauthorizedMetrics = await fetch(`${balancer.baseUrl}/admin/health-metrics`);
+    assert.equal(unauthorizedMetrics.status, 401);
 
     const response = await fetch(`${balancer.baseUrl}/least-ping-token`, {
         headers: { 'User-Agent': 'Happ/1.0' },

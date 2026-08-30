@@ -1,7 +1,7 @@
 {
     "name": "xray-balancer-mw",
-    "version": "1.3.0",
-    "description": "Middleware для Remnawave — группировка серверов и интеллектуальная балансировка XRAY-JSON подписок",
+    "version": "1.4.0",
+    "description": "Middleware для Remnawave — группировка и балансировка XRAY-JSON и MIHOMO подписок",
     "main": "server.js",
     "scripts": {
         "start": "node server.js",
@@ -12,5 +12,8 @@
     "license": "SEE LICENSE IN LICENSE",
     "engines": {
         "node": ">=18"
+    },
+    "dependencies": {
+        "yaml": "^2.9.0"
     }
 }

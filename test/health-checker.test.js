@@ -28,3 +28,46 @@ test('health-checker calculates jitter across multiple probes', () => {
     assert.equal(m.avgRttMs, 53);
     assert.ok(m.jitterMs > 0);
 });
+
+test('health-checker clears transient penalties outside the bounded window', () => {
+    const checker = createHealthChecker({ maxHistory: 2 });
+    checker.recordProbeResult('Node-3', {
+        success: false,
+        isRst: true,
+        throttled: true,
+        partialBlock: true,
+    });
+    checker.recordProbeResult('Node-3', { success: true, rttMs: 30 });
+
+    const degraded = checker.getMetrics('Node-3');
+    assert.equal(degraded.lossPercent, 50);
+    assert.equal(degraded.rstCount, 1);
+    assert.equal(degraded.throttled, true);
+    assert.equal(degraded.partialBlock, true);
+
+    checker.recordProbeResult('Node-3', { success: true, rttMs: 20 });
+    const recovered = checker.getMetrics('Node-3');
+    assert.equal(recovered.lossPercent, 0);
+    assert.equal(recovered.rstCount, 0);
+    assert.equal(recovered.throttled, false);
+    assert.equal(recovered.partialBlock, false);
+});
+
+test('health-checker removes metrics for nodes missing from the panel', () => {
+    const checker = createHealthChecker();
+    checker.recordProbeResult('Node-4', { success: true, rttMs: 10 });
+    checker.recordProbeResult('Node-5', { success: true, rttMs: 20 });
+
+    checker.retainNodes(['Node-5']);
+
+    assert.equal(checker.getMetrics('Node-4'), null);
+    assert.equal(checker.getMetrics('Node-5').lastRttMs, 20);
+});
+
+test('health-checker does not turn missing latency into a zero RTT', () => {
+    const checker = createHealthChecker();
+    const metrics = checker.recordProbeResult('Node-6', { success: true, rttMs: null });
+
+    assert.equal(metrics.lastRttMs, null);
+    assert.equal(metrics.avgRttMs, null);
+});

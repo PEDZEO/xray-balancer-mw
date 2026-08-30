@@ -47,6 +47,32 @@ test('validateConfig rejects malformed groups', () => {
     assert.throws(() => validateConfig({ groups: { test: [] } }), /at least one pattern/);
 });
 
+test('validateConfig accepts host-only groups and rejects orphan host bindings', () => {
+    const config = {
+        groups: { Europe: [] },
+        group_hosts: { Europe: ['stable-host-uuid'] },
+    };
+    assert.deepEqual(validateConfig(config), config);
+    assert.throws(
+        () => validateConfig({ groups: {}, group_hosts: { Europe: ['stable-host-uuid'] } }),
+        /no matching group/,
+    );
+});
+
+test('validateConfig accepts bounded descriptions for existing groups', () => {
+    assert.doesNotThrow(() => validateConfig({
+        groups: { Europe: ['Germany'] },
+        group_descriptions: { Europe: 'Fast European servers' },
+    }));
+    assert.throws(
+        () => validateConfig({
+            groups: { Europe: ['Germany'] },
+            group_descriptions: { Missing: 'Unknown group' },
+        }),
+        /has no matching group/,
+    );
+});
+
 test('validateConfig accepts runtime and fastest-exclude options', () => {
     const cfg = {
         profile_mode: 'stable',
