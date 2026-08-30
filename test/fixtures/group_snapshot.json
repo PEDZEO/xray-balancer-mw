@@ -17,7 +17,10 @@
   "outbounds": [
     {
       "tag": "proxy",
-      "protocol": "vless"
+      "protocol": "loopback",
+      "settings": {
+        "inboundTag": "_Europe-proxy-in"
+      }
     },
     {
       "tag": "Germany-1",
@@ -73,6 +76,13 @@
       }
     ],
     "rules": [
+      {
+        "type": "field",
+        "inboundTag": [
+          "_Europe-proxy-in"
+        ],
+        "balancerTag": "_Europe-balancer"
+      },
       {
         "type": "field",
         "network": "udp",

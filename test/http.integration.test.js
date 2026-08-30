@@ -461,6 +461,74 @@ test('admin groups can switch strategy at runtime and responses are no-store', a
     assert.equal(subscription[0].routing.balancers[0].strategy.settings, undefined);
 });
 
+test('generated Xray groups preserve merged panel routing and DNS policy', async (t) => {
+    const upstream = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([
+            {
+                remarks: 'Germany',
+                serverDescription: 'XHTTP server description',
+                routing: {
+                    domainStrategy: 'AsIs',
+                    rules: [{ type: 'field', domain: ['geosite:ru'], ip: ['geoip:ru'], outboundTag: 'direct' }],
+                },
+                outbounds: [
+                    { tag: 'proxy', protocol: 'vless', settings: { vnext: [{ address: 'de.example.com', port: 443 }] } },
+                    { tag: 'direct', protocol: 'freedom', settings: { domainStrategy: 'UseIPv4' } },
+                ],
+            },
+            {
+                remarks: 'France',
+                dns: {
+                    servers: ['https://1.1.1.1/dns-query'],
+                    queryStrategy: 'UseIPv4',
+                },
+                routing: {
+                    rules: [
+                        { type: 'field', domain: ['geosite:category-ads-all'], outboundTag: 'block' },
+                        { type: 'field', network: 'tcp,udp', outboundTag: 'proxy' },
+                    ],
+                },
+                outbounds: [
+                    { tag: 'proxy', protocol: 'vless', settings: { vnext: [{ address: 'fr.example.com', port: 443 }] } },
+                    { tag: 'block', protocol: 'blackhole' },
+                ],
+            },
+        ]));
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        groups: { Europe: ['Germany', 'France'] },
+        fastest_group: false,
+    });
+
+    const response = await fetch(`${balancer.baseUrl}/profile-policy-token`, {
+        headers: { 'User-Agent': 'Happ/1.0' },
+    });
+    const configs = await response.json();
+    const europe = configs.find((config) => config.remarks === 'Europe');
+
+    assert.equal(response.status, 200);
+    assert.ok(europe);
+    assert.deepEqual(europe.dns, {
+        servers: ['https://1.1.1.1/dns-query'],
+        queryStrategy: 'UseIPv4',
+    });
+    assert.equal(europe.routing.domainStrategy, 'AsIs');
+    assert.ok(europe.routing.rules.some((rule) => rule.domain?.includes('geosite:ru') && rule.outboundTag === 'direct'));
+    assert.ok(europe.routing.rules.some((rule) => rule.domain?.includes('geosite:category-ads-all') && rule.outboundTag === 'block'));
+    assert.ok(europe.routing.rules.some((rule) => rule.network === 'tcp,udp' && rule.balancerTag === 'Europe-balancer'));
+    assert.equal(europe.routing.rules.some((rule) => rule.outboundTag === 'proxy'), false);
+    assert.deepEqual(europe.outbounds[0], {
+        tag: 'proxy',
+        protocol: 'loopback',
+        settings: { inboundTag: 'Europe-proxy-in' },
+    });
+    assert.equal(europe.serverDescription, undefined);
+});
+
 test('admin endpoints enforce explicit method allow lists', async (t) => {
     let hostRequests = 0;
     const panel = http.createServer((req, res) => {

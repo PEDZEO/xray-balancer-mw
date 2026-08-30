@@ -17,7 +17,7 @@ const { createCircuitBreaker, createKeyedRateLimiter, createRateLimiter, createT
 const { buildLogger } = require('./lib/log');
 const { resolveProfile } = require('./lib/profile');
 const { classifyUpstreamPayload } = require('./lib/upstream-contract');
-const { buildGroupConfig } = require('./lib/group-builder');
+const { buildGroupConfig, mergeProfileBaseConfigs } = require('./lib/group-builder');
 const { buildStickyTokenKey, createStickyStore } = require('./lib/sticky');
 const { createRequestGuard } = require('./lib/request-guard');
 const { readEffectiveRuntime } = require('./lib/runtime-config');
@@ -2821,7 +2821,7 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
-        const baseConfig = configArray[0];
+        const baseConfig = mergeProfileBaseConfigs(configArray);
 
         // Детектируем фейковые конфиги — когда Remnawave возвращает сообщение об ошибке
         // (лимит устройств, истекла подписка и т.д.) вместо реальных серверов.
