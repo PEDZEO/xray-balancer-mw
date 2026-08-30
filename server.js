@@ -24,6 +24,11 @@ const { readEffectiveRuntime } = require('./lib/runtime-config');
 const { createNodeProtectionManager } = require('./lib/node-protection');
 const { transformMihomoYaml } = require('./lib/mihomo');
 const { createHealthChecker } = require('./lib/health-checker');
+const {
+    nodeProbeKey,
+    parseTimeoutMs,
+    probeNodeLatencies,
+} = require('./lib/node-latency-probe');
 
 // ─── Загрузка конфига ───
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
@@ -1285,6 +1290,7 @@ function readNodeLatencyMs(node) {
         node?.rtt,
     ];
     for (const candidate of candidates) {
+        if (candidate === null || candidate === undefined || candidate === '') continue;
         const value = Number(candidate);
         if (Number.isFinite(value) && value >= 0) return value;
     }
@@ -1378,6 +1384,19 @@ async function fetchNodeStatsNow() {
         await updateAutoQuarantineFromNodes(nodes);
         await updateNodeProtectionFromNodes(nodes);
 
+        const runtime = getRuntimeConfig();
+        const nodesWithoutPanelLatency = nodes.filter((node) => (
+            node?.isConnected
+            && !node?.isDisabled
+            && readNodeLatencyMs(node) === null
+            && typeof node?.address === 'string'
+            && node.address.trim()
+        ));
+        const measuredLatencies = await probeNodeLatencies(nodesWithoutPanelLatency, {
+            concurrency: 8,
+            timeoutMs: parseTimeoutMs(runtime.probeTimeout, 3000),
+        });
+
         const newCache = {};
         const activeNodeNames = [];
         for (const node of nodes) {
@@ -1391,7 +1410,9 @@ async function fetchNodeStatsNow() {
             const cpuCount = node.cpuCount || 1;
             const isConnected = node.isConnected || false;
             const isDisabled = node.isDisabled || false;
-            const latencyMs = readNodeLatencyMs(node);
+            const panelLatencyMs = readNodeLatencyMs(node);
+            const measuredLatencyMs = measuredLatencies.get(nodeProbeKey(node));
+            const latencyMs = panelLatencyMs ?? measuredLatencyMs ?? null;
 
             const { ramLoad, cpuLoad, load } = computeNodeLoad(usersOnline, totalRamGb, cpuCount);
             const normalizedLoad = Math.round(load * 100) / 100;
