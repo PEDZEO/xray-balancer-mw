@@ -2,11 +2,19 @@
     "version": "1",
     "rules": [
         {
+            "name": "Browser Subscription",
+            "description": "System critical: do not delete or disable this rule.",
+            "enabled": true,
+            "operator": "AND",
+            "conditions": [{ "headerName": "accept", "operator": "CONTAINS", "value": "text/html", "caseSensitive": true }],
+            "responseType": "BROWSER"
+        },
+        {
             "name": "Mihomo Clients",
             "description": "Response with generated YAML config (Mihomo Template)",
             "enabled": true,
             "operator": "AND",
-            "conditions": [{ "headerName": "user-agent", "operator": "REGEX", "value": "^(?:FlClash|FlClashX|Flowvy|[Cc]lash-[Vv]erge|[Kk]oala-[Cc]lash|[Cc]lash-?[Mm]eta|[Mm]urge|[Cc]lashX [Mm]eta|[Mm]ihomo|[Cc]lash-nyanpasu|clash.meta|prizrak-box)", "caseSensitive": false }],
+            "conditions": [{ "headerName": "user-agent", "operator": "REGEX", "value": "^(?:FlClashX?|Flowvy|Murge|Mihomo|prizrak-box|Koala-Clash|Clash(?:-Verge|-Nyanpasu|X Meta|[-.]?Meta))", "caseSensitive": false }],
             "responseType": "MIHOMO"
         },
         {
@@ -22,24 +30,16 @@
             "description": "Response with generated JSON config (Singbox template)",
             "enabled": true,
             "operator": "AND",
-            "conditions": [{ "headerName": "user-agent", "operator": "REGEX", "value": "^sfa|sfi|sfm|sft|karing|singbox|rabbithole", "caseSensitive": false }],
+            "conditions": [{ "headerName": "user-agent", "operator": "REGEX", "value": "^(?:sfa|sfi|sfm|sft|karing|singbox|rabbithole)", "caseSensitive": false }],
             "responseType": "SINGBOX"
         },
         {
-            "name": "Happ / Incy / v2plus / Xray JSON Clients",
+            "name": "Happ / Incy / Xray JSON Clients",
             "description": "Response with generated JSON config (Xray JSON Template). Includes Happ, Incy, v2plus and V2RayTUN.",
             "enabled": true,
             "operator": "AND",
             "conditions": [{ "headerName": "user-agent", "operator": "REGEX", "value": "^(?:Happ|Incy|v2plus|Streisand|FoXray|V2Box|V2rayN|V2RayTUN|InvisibleMan|Xray)", "caseSensitive": false }],
             "responseType": "XRAY_JSON"
-        },
-        {
-            "name": "Browser Subscription",
-            "description": "System critical: do not delete or disable this rule.",
-            "enabled": true,
-            "operator": "AND",
-            "conditions": [{ "headerName": "accept", "operator": "CONTAINS", "value": "text/html", "caseSensitive": true }],
-            "responseType": "BROWSER"
         },
         {
             "name": "Clash Core Clients",

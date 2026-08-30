@@ -5,70 +5,71 @@
 #   SUB_PAGE_CONTAINER      — имя контейнера subscription page (например remnawave-subscription-page)
 #   SUB_PORT                — порт subscription page (например 3010)
 #
+# В .env middleware обязательно укажите CIDR Docker-сети:
+#   TRUST_X_FORWARDED_FOR=true
+#   TRUSTED_PROXY_CIDRS=172.18.0.0/16
+#
 # Xray-клиенты (Happ, Streisand, V2RayTUN и т.д.) → middleware (:4100)
 # Браузеры и остальные клиенты → subscription page
-
 {
-    servers {
-        protocols h1 h2 h3
-    }
+	servers {
+		protocols h1 h2 h3
+	}
 }
 
 https://{$SUB_DOMAIN} {
-    encode zstd gzip
+	encode zstd gzip
 
-    log {
-        output file /var/log/caddy/access.log {
-            roll_size 10mb
-            roll_keep 3
-        }
-    }
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 10mb
+			roll_keep 3
+		}
+	}
 
-    handle /health {
-        reverse_proxy {$SUB_PAGE_CONTAINER}:{$SUB_PORT}
-    }
+	handle /health {
+		reverse_proxy {$SUB_PAGE_CONTAINER}:{$SUB_PORT}
+	}
 
-    handle /mw-health {
-        reverse_proxy xray-balancer-mw:4100
-    }
+	handle /mw-health {
+		rewrite * /health
+		reverse_proxy xray-balancer-mw:4100
+	}
 
-    # Admin API is internal-only. The cabinet should use the Docker network.
-    handle /admin/* {
-        respond "Not Found" 404
-    }
+	# Admin API is internal-only. The cabinet should use the Docker network.
+	@admin path /admin /admin/*
+	handle @admin {
+		respond "Not Found" 404
+	}
 
-    @balanced_subscription_client {
-        header_regexp User-Agent "(?i)(happ|incy|v2plus|streisand|v2ray|v2raytun|neko|foxray|v2box|xray|invisibleman|flclash|flowvy|clash-verge|koala-clash|clash-?meta|murge|clashx[ ]meta|mihomo|clash-nyanpasu|clash[.]meta|prizrak-box)"
-        not path /health
-        not path /mw-health
-    }
-    handle @balanced_subscription_client {
-        reverse_proxy xray-balancer-mw:4100 {
-            header_up Host {host}
-            header_up X-Real-IP {remote_host}
-            header_up X-Forwarded-For {remote_host}
-            header_up X-Forwarded-Proto {scheme}
-            header_up X-Forwarded-Host {host}
-            header_up X-Forwarded-Port {server_port}
-            transport http {
-                dial_timeout 3s
-                response_header_timeout 15s
-            }
-        }
-    }
+	@balanced_subscription_client {
+		header_regexp User-Agent (?i)^(happ|incy|v2plus|streisand|foxray|v2box|v2rayn|v2raytun|invisibleman|xray|flclash|flowvy|clash-verge|koala-clash|clash-?meta|murge|clashx[[:space:]]meta|mihomo|clash-nyanpasu|clash[.]meta|prizrak-box)
+		not path /health
+		not path /mw-health
+	}
+	handle @balanced_subscription_client {
+		reverse_proxy xray-balancer-mw:4100 {
+			header_up Host {host}
+			header_up X-Real-IP {client_ip}
+			header_up X-Forwarded-For {client_ip}
+			header_up X-Forwarded-Port {server_port}
+			transport http {
+				dial_timeout 3s
+				response_header_timeout 15s
+			}
+		}
+	}
 
-    handle /* {
-        reverse_proxy {$SUB_PAGE_CONTAINER}:{$SUB_PORT} {
-            header_up Host {host}
-            header_up X-Real-IP {remote_host}
-            header_up X-Forwarded-For {remote_host}
-            header_up X-Forwarded-Proto {scheme}
-            header_up X-Forwarded-Host {host}
-            header_up X-Forwarded-Port {server_port}
-        }
-    }
+	handle {
+		reverse_proxy {$SUB_PAGE_CONTAINER}:{$SUB_PORT} {
+			header_up Host {host}
+			header_up X-Real-IP {client_ip}
+			header_up X-Forwarded-For {client_ip}
+			header_up X-Forwarded-Port {server_port}
+		}
+	}
 }
 
 http://{$SUB_DOMAIN} {
-    redir https://{$SUB_DOMAIN}{uri} permanent
+	redir https://{$SUB_DOMAIN}{uri} permanent
 }

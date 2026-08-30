@@ -54,7 +54,7 @@ Admin endpoints are also rate-limited (`admin_rate_limit_per_minute`, `admin_rat
 
 ### All clients appear as one IP behind proxy
 - Set `trust_x_forwarded_for: true` only when middleware is behind your trusted reverse proxy.
-- X-Forwarded-For is accepted only from loopback/private reverse-proxy addresses. If middleware is exposed directly, keep `trust_x_forwarded_for: false`.
+- Set `trusted_proxy_cidrs` or `TRUSTED_PROXY_CIDRS` to the explicit address/CIDR of the direct reverse proxy. Do not trust all private ranges or `0.0.0.0/0`.
 - For nginx, prefer `proxy_set_header X-Forwarded-For $remote_addr;` instead of appending `$proxy_add_x_forwarded_for`; the middleware resolves proxy chains from right to left, but replacing the header avoids preserving spoofed client prefixes.
 
 ### Wrong grouping or fallback to `Other`
