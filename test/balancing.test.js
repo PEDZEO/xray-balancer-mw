@@ -9,6 +9,7 @@ const {
     filterAndSortByLoad,
     filterHiddenOutbounds,
     getNodeStats,
+    computeNodeScore,
 } = require('../lib/balancing');
 
 test('matchGroup prefers the longest matching pattern', () => {
@@ -119,6 +120,20 @@ test('filterAndSortByLoad prioritizes latency for leastPing strategy', () => {
 
     const result = filterAndSortByLoad(outbounds, cache, { strategy: 'leastPing' });
     assert.deepEqual(result.map((item) => item.tag), ['B-node', 'A-node', 'C-node']);
+});
+
+test('computeNodeScore applies current health quality penalties', () => {
+    const healthy = computeNodeScore({ load: 0.2, ping_ms: 30 });
+    const degraded = computeNodeScore({
+        load: 0.2,
+        ping_ms: 30,
+        jitterMs: 80,
+        lossPercent: 50,
+        throttled: true,
+        partialBlock: true,
+    });
+
+    assert.ok(degraded.raw > healthy.raw);
 });
 
 test('filterAndSortByLoad preserves strategy order for random and roundRobin', () => {

@@ -23,12 +23,14 @@ const { createRequestGuard } = require('./lib/request-guard');
 const { readEffectiveRuntime } = require('./lib/runtime-config');
 const { createNodeProtectionManager } = require('./lib/node-protection');
 const { transformMihomoYaml } = require('./lib/mihomo');
+const { createHealthChecker } = require('./lib/health-checker');
 
 // ─── Загрузка конфига ───
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
 const CONFIG_RUNTIME_PATH = process.env.CONFIG_RUNTIME_PATH || '';
 const MUTABLE_CONFIG_KEYS = [
     'groups',
+    'group_descriptions',
     'group_hosts',
     'strategy',
     'fastest_group',
@@ -173,6 +175,7 @@ const REQUEST_TIMEOUT_MS = pickRuntimeInt('REQUEST_TIMEOUT_MS', 'request_timeout
 const MAX_REDIRECTS = pickRuntimeInt('MAX_REDIRECTS', 'max_redirects');
 const CIRCUIT_BREAKER_FAILURES = pickRuntimeInt('CIRCUIT_BREAKER_FAILURES', 'circuit_breaker_failures');
 const CIRCUIT_BREAKER_OPEN_SEC = pickRuntimeInt('CIRCUIT_BREAKER_OPEN_SEC', 'circuit_breaker_open_sec');
+let GROUP_DESCRIPTIONS = {};
 let FASTEST_EXCLUDE_GROUPS = [];
 let FASTEST_FALLBACK_GROUPS = [];
 let NODE_STATS_EXCLUDE_GROUPS = [];
@@ -206,6 +209,7 @@ function panelHeaders() {
 
 // Кэш статистики нод: { "Finland2": { usersOnline: 9, totalRamGb: 2.06, cpuCount: 1, ramLoad: 4.37, cpuLoad: 9, load: 0.23 }, ... }
 let nodeStatsCache = {};
+const nodeHealthChecker = createHealthChecker({ maxHistory: 10 });
 let hostCatalogCache = [];
 let rawHostCatalogCache = [];
 let lastHostCatalogRefreshAt = 0;
@@ -374,6 +378,7 @@ function applyMutableRuntimeConfig(nextConfig) {
     config = nextConfig;
     STRATEGY = normalizeStrategy(nextConfig.strategy) || 'leastLoad';
     GROUPS = nextConfig.groups || {};
+    GROUP_DESCRIPTIONS = nextConfig.group_descriptions || {};
     GROUP_HOSTS = nextConfig.group_hosts || {};
     const runtime = getRuntimeConfig();
     FASTEST_EXCLUDE_GROUPS = runtime.fastestExcludeGroups;
@@ -1210,8 +1215,11 @@ async function fetchNodeStatsNow() {
         await updateNodeProtectionFromNodes(nodes);
 
         const newCache = {};
+        const activeNodeNames = [];
         for (const node of nodes) {
             const name = node.name || '';
+            if (!name) continue;
+            activeNodeNames.push(name);
             const address = typeof node.address === 'string' ? node.address.trim() : '';
             const usersOnline = node.usersOnline || 0;
             const totalRamGb = parseRamGb(node.totalRam);
@@ -1222,6 +1230,12 @@ async function fetchNodeStatsNow() {
 
             const { ramLoad, cpuLoad, load } = computeNodeLoad(usersOnline, totalRamGb, cpuCount);
             const normalizedLoad = Math.round(load * 100) / 100;
+            const healthMetrics = nodeHealthChecker.recordProbeResult(name, {
+                success: isConnected && !isDisabled,
+                rttMs: latencyMs,
+                throttled: node.throttled === true,
+                partialBlock: node.partialBlock === true || node.partial_block === true,
+            });
 
             newCache[name] = {
                 usersOnline,
@@ -1235,6 +1249,7 @@ async function fetchNodeStatsNow() {
                 isAlias: false,
                 sourceNode: name,
                 ...(latencyMs === null ? {} : { latency_ms: latencyMs }),
+                ...healthMetrics,
             };
 
             if (address && address !== name) {
@@ -1258,6 +1273,7 @@ async function fetchNodeStatsNow() {
                 }
             }
         }
+        nodeHealthChecker.retainNodes(activeNodeNames);
 
         nodeStatsCache = newCache;
         const sorted = Object.entries(newCache)
@@ -1525,6 +1541,11 @@ function collectAllProxyOutbounds(configArray) {
                 }
             }
             cloned.tag = tag;
+            if (cfg.description && !cloned.description) cloned.description = cfg.description;
+            if (cfg.serverDescription && !cloned.serverDescription) cloned.serverDescription = cfg.serverDescription;
+            if (cfg.server_description && !cloned.server_description) cloned.server_description = cfg.server_description;
+            if (cfg.title && !cloned.title) cloned.title = cfg.title;
+            if (cfg.ps && !cloned.ps) cloned.ps = cfg.ps;
             seenTags.add(tag);
             allOutbounds.push(cloned);
         }
@@ -1978,6 +1999,7 @@ const server = http.createServer(async (req, res) => {
                 status: 'ok',
                 request_id: requestId,
                 groups: GROUPS,
+                group_descriptions: GROUP_DESCRIPTIONS,
                 group_hosts: GROUP_HOSTS,
                 strategy: STRATEGY,
                 fastest_group: config.fastest_group !== false,
@@ -2036,6 +2058,7 @@ const server = http.createServer(async (req, res) => {
         try {
             const payload = await readJsonBody(req);
             const incomingGroups = payload.groups;
+            const incomingGroupDescriptions = payload.group_descriptions;
             const incomingExclude = payload.fastest_exclude_groups;
             const incomingFastestFallback = payload.fastest_fallback;
             const incomingNodeStatsExclude = payload.node_stats_exclude;
@@ -2055,7 +2078,14 @@ const server = http.createServer(async (req, res) => {
                                 .filter(([groupName]) => Object.prototype.hasOwnProperty.call(incomingGroups, groupName)),
                         );
                     }
+                    if (incomingGroupDescriptions === undefined) {
+                        nextConfig.group_descriptions = Object.fromEntries(
+                            Object.entries(currentConfig.group_descriptions || {})
+                                .filter(([groupName]) => Object.prototype.hasOwnProperty.call(incomingGroups, groupName)),
+                        );
+                    }
                 }
+                if (incomingGroupDescriptions !== undefined) nextConfig.group_descriptions = incomingGroupDescriptions;
                 if (incomingExclude !== undefined) nextConfig.fastest_exclude_groups = incomingExclude;
                 if (incomingFastestFallback !== undefined) nextConfig.fastest_fallback = incomingFastestFallback;
                 if (incomingNodeStatsExclude !== undefined) nextConfig.node_stats_exclude = incomingNodeStatsExclude;
@@ -2198,6 +2228,19 @@ const server = http.createServer(async (req, res) => {
         );
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(enriched, null, 2));
+        return;
+    }
+
+    if (pathname === '/admin/health-metrics') {
+        if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
+            return;
+        }
+        if (req.method !== 'GET') {
+            sendMethodNotAllowed(res, requestId, ['GET']);
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(nodeHealthChecker.getAllMetrics()));
         return;
     }
 
@@ -3039,6 +3082,7 @@ const server = http.createServer(async (req, res) => {
                 probeConnectivity: runtime.probeConnectivityUrl,
                 probeHttpMethod: runtime.probeHttpMethod,
                 strategy: STRATEGY,
+                groupDescription: (GROUP_DESCRIPTIONS && GROUP_DESCRIPTIONS[fastestGroupName]) || '',
             });
             resultConfigs.push(fastestConfig);
             logger.info('group_fastest', {
@@ -3109,6 +3153,7 @@ const server = http.createServer(async (req, res) => {
                 probeConnectivity: runtime.probeConnectivityUrl,
                 probeHttpMethod: runtime.probeHttpMethod,
                 strategy: STRATEGY,
+                groupDescription: (GROUP_DESCRIPTIONS && (GROUP_DESCRIPTIONS[configName] || GROUP_DESCRIPTIONS[groupName])) || '',
             });
             resultConfigs.push(groupConfig);
 

@@ -1057,6 +1057,18 @@ test('leastPing uses latency fields from panel node stats', async (t) => {
         return body.cached_nodes >= 2 && body.node_stats_fresh ? body : null;
     }, 3000);
 
+    const metricsResponse = await fetch(`${balancer.baseUrl}/admin/health-metrics`, {
+        headers: { 'X-Admin-Token': 'integration-admin-token' },
+    });
+    const metrics = await metricsResponse.json();
+    assert.equal(metricsResponse.status, 200);
+    assert.equal(metrics['germany-a'].lastRttMs, 180);
+    assert.equal(metrics['germany-b'].lastRttMs, 20);
+    assert.equal(metrics['germany-b'].lossPercent, 0);
+
+    const unauthorizedMetrics = await fetch(`${balancer.baseUrl}/admin/health-metrics`);
+    assert.equal(unauthorizedMetrics.status, 401);
+
     const response = await fetch(`${balancer.baseUrl}/least-ping-token`, {
         headers: { 'User-Agent': 'Happ/1.0' },
     });

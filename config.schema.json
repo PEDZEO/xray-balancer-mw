@@ -145,6 +145,12 @@
         "maxItems": 100
       }
     },
+    "group_descriptions": {
+      "type": "object",
+      "maxProperties": 100,
+      "propertyNames": { "type": "string", "minLength": 1, "maxLength": 64 },
+      "additionalProperties": { "type": "string", "minLength": 1, "maxLength": 256 }
+    },
     "group_hosts": {
       "type": "object",
       "maxProperties": 100,
