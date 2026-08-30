@@ -517,6 +517,78 @@ test('admin endpoints enforce explicit method allow lists', async (t) => {
     assert.equal(hostRequests, 1);
 });
 
+test('admin hosts returns a sanitized panel host catalog', async (t) => {
+    const panel = http.createServer((req, res) => {
+        if (req.url !== '/api/hosts/') {
+            res.writeHead(404, { 'Content-Type': 'text/plain' });
+            res.end('not found');
+            return;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            response: [
+                {
+                    uuid: 'host-disabled',
+                    remark: 'Net CDN',
+                    address: 'shared.cdn.example',
+                    port: 80,
+                    isDisabled: true,
+                    secretInternalField: 'must-not-leak',
+                },
+                {
+                    uuid: 'host-active',
+                    remark: 'Germany',
+                    address: 'de.example.com',
+                    port: 443,
+                    isDisabled: false,
+                },
+            ],
+        }));
+    });
+    const panelPort = await listenOnRandomPort(panel);
+    t.after(() => closeServer(panel));
+
+    const balancer = await startBalancer(
+        t,
+        { remnawave_url: `http://127.0.0.1:${panelPort}` },
+        { API_TOKEN: 'integration-api-token' }
+    );
+    const response = await fetch(`${balancer.baseUrl}/admin/hosts`, {
+        headers: { 'X-Admin-Token': 'integration-admin-token' },
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get('cache-control'), /no-store/);
+    assert.equal(body.total, 2);
+    assert.equal(body.enabled, 1);
+    assert.deepEqual(body.hosts, [
+        {
+            uuid: 'host-active',
+            remark: 'Germany',
+            address: 'de.example.com',
+            port: 443,
+            is_disabled: false,
+        },
+        {
+            uuid: 'host-disabled',
+            remark: 'Net CDN',
+            address: 'shared.cdn.example',
+            port: 80,
+            is_disabled: true,
+        },
+    ]);
+    assert.equal(JSON.stringify(body).includes('must-not-leak'), false);
+
+    const methodResponse = await fetch(`${balancer.baseUrl}/admin/hosts`, {
+        method: 'POST',
+        headers: { 'X-Admin-Token': 'integration-admin-token' },
+    });
+    assert.equal(methodResponse.status, 405);
+    assert.equal(methodResponse.headers.get('allow'), 'GET');
+});
+
 test('admin groups update invalidates subscription cache immediately', async (t) => {
     let upstreamHits = 0;
     const upstream = http.createServer((req, res) => {

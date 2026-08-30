@@ -1502,6 +1502,27 @@ function applyNoStoreHeaders(res) {
     }
 }
 
+function buildAdminHostCatalog(hosts) {
+    return hosts
+        .map((host, index) => {
+            const remark = String(host?.remark || host?.tag || host?.address || '').trim();
+            if (!remark) return null;
+
+            return {
+                uuid: String(host?.uuid || host?.id || `host-${index}`),
+                remark,
+                address: String(host?.address || '').trim(),
+                port: Number.isFinite(Number(host?.port)) ? Number(host.port) : null,
+                is_disabled: host?.isDisabled === true,
+            };
+        })
+        .filter(Boolean)
+        .sort((left, right) => {
+            if (left.is_disabled !== right.is_disabled) return left.is_disabled ? 1 : -1;
+            return left.remark.localeCompare(right.remark, 'ru');
+        });
+}
+
 function sendMethodNotAllowed(res, requestId, allowedMethods) {
     res.writeHead(405, {
         'Content-Type': 'application/json',
@@ -1802,6 +1823,39 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({
             status: 'ok',
             request_id: requestId,
+        }));
+        return;
+    }
+
+    if (pathname === '/admin/hosts') {
+        if (!enforceAdminAccess(req, res, requestId, clientIp, pathname)) {
+            return;
+        }
+        if (req.method !== 'GET') {
+            sendMethodNotAllowed(res, requestId, ['GET']);
+            return;
+        }
+
+        const hostsResult = await fetchHostsFromApi();
+        if (!hostsResult.ok || !hostsResult.hosts) {
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                status: 'error',
+                code: 'HOST_CATALOG_UNAVAILABLE',
+                request_id: requestId,
+                message: hostsResult.error || 'Failed to fetch hosts',
+            }));
+            return;
+        }
+
+        const hosts = buildAdminHostCatalog(hostsResult.hosts);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            status: 'ok',
+            request_id: requestId,
+            hosts,
+            total: hosts.length,
+            enabled: hosts.filter((host) => !host.is_disabled).length,
         }));
         return;
     }
