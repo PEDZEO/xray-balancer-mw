@@ -140,7 +140,7 @@ test('rate limiter cleanup cursor eventually reaches stale tail entries', () => 
     assert.equal(limiter.size(), 1);
 });
 
-test('rate limiter keeps a bounded number of IP entries', () => {
+test('rate limiter rejects churn without evicting active IP counters', () => {
     const limiter = createRateLimiter(1, 1, {
         idleMs: 600000,
         maxEntries: 2,
@@ -149,15 +149,15 @@ test('rate limiter keeps a bounded number of IP entries', () => {
     assert.equal(limiter.allow('1.1.1.1', 1000), true);
     assert.equal(limiter.allow('1.1.1.1', 1001), false);
     assert.equal(limiter.allow('2.2.2.2', 1002), true);
-    assert.equal(limiter.allow('3.3.3.3', 1003), true);
+    assert.equal(limiter.allow('3.3.3.3', 1003), false);
     assert.equal(limiter.size(), 2);
 
-    assert.equal(limiter.allow('1.1.1.1', 1004), true);
+    assert.equal(limiter.allow('1.1.1.1', 1004), false);
     assert.equal(limiter.size(), 2);
 });
 
-test('keyed limiter keeps bounded number of token buckets', () => {
-    const limiter = createKeyedRateLimiter(100, 100, {
+test('keyed limiter rejects churn without evicting active token buckets', () => {
+    const limiter = createKeyedRateLimiter(1, 1, {
         idleMs: 600000,
         maxEntries: 3,
         cleanupBatch: 1,
@@ -168,8 +168,9 @@ test('keyed limiter keeps bounded number of token buckets', () => {
     assert.equal(limiter.allow('t3', 1002), true);
     assert.equal(limiter.size(), 3);
 
-    assert.equal(limiter.allow('t4', 1003), true);
+    assert.equal(limiter.allow('t4', 1003), false);
     assert.equal(limiter.size(), 3);
+    assert.equal(limiter.allow('t1', 1004), false);
 });
 
 test('keyed limiter performs cleanup only after cleanup interval', () => {

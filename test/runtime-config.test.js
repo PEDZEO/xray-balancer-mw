@@ -41,7 +41,7 @@ test('readEffectiveRuntime returns config-driven mutable settings', () => {
         protection_isolation_ttl_sec: 600,
         protection_latency_threshold_ms: 1200,
         protection_min_available_nodes: 2,
-        attack_nodes: [{ node: ' Germany-1 ', reason: 'ddos', source: 'admin', expires_at: '2030-01-01T00:00:00.000Z' }],
+        attack_nodes: [{ node: ' Germany-1 ', node_id: ' stable-node-uuid ', reason: 'ddos', source: 'admin', expires_at: '2030-01-01T00:00:00.000Z' }],
         emergency_fallback_enabled: true,
         emergency_fallback_max_nodes: 2,
         balancer_load_weight: 0.5,
@@ -85,7 +85,7 @@ test('readEffectiveRuntime returns config-driven mutable settings', () => {
     assert.equal(runtime.protectionIsolationTtlSec, 600);
     assert.equal(runtime.protectionLatencyThresholdMs, 1200);
     assert.equal(runtime.protectionMinAvailableNodes, 2);
-    assert.deepEqual(runtime.attackNodes, [{ node: 'Germany-1', reason: 'ddos', source: 'admin', mode: 'manual', expires_at: '2030-01-01T00:00:00.000Z' }]);
+    assert.deepEqual(runtime.attackNodes, [{ node: 'Germany-1', node_id: 'stable-node-uuid', reason: 'ddos', source: 'admin', mode: 'manual', expires_at: '2030-01-01T00:00:00.000Z' }]);
     assert.equal(runtime.emergencyFallbackEnabled, true);
     assert.equal(runtime.emergencyFallbackMaxNodes, 2);
     assert.equal(runtime.balancerLoadWeight, 0.5);

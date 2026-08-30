@@ -73,7 +73,12 @@ async function startBalancer(t, configOverrides = {}, envOverrides = {}) {
     const port = await getFreePort();
     const configPath = path.join(tempDir, 'config.json');
     const runtimePatch = configOverrides.testRuntimePatch;
-    const runtimePatchPath = runtimePatch ? path.join(tempDir, 'config.runtime.json') : '';
+    const runtimePatchRaw = configOverrides.testRuntimePatchRaw;
+    const runtimeBackup = configOverrides.testRuntimeBackup;
+    const hasRuntimeFixture = runtimePatch !== undefined
+        || runtimePatchRaw !== undefined
+        || runtimeBackup !== undefined;
+    const runtimePatchPath = hasRuntimeFixture ? path.join(tempDir, 'config.runtime.json') : '';
     const config = {
         port,
         sub_page_url: `http://127.0.0.1:${configOverrides.upstreamPort || 9}`,
@@ -94,8 +99,14 @@ async function startBalancer(t, configOverrides = {}, envOverrides = {}) {
     };
     delete config.upstreamPort;
     delete config.testRuntimePatch;
+    delete config.testRuntimePatchRaw;
+    delete config.testRuntimeBackup;
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-    if (runtimePatch) fs.writeFileSync(runtimePatchPath, JSON.stringify(runtimePatch, null, 2));
+    if (runtimePatch !== undefined) fs.writeFileSync(runtimePatchPath, JSON.stringify(runtimePatch, null, 2));
+    if (runtimePatchRaw !== undefined) fs.writeFileSync(runtimePatchPath, runtimePatchRaw);
+    if (runtimeBackup !== undefined) {
+        fs.writeFileSync(`${runtimePatchPath}.bak`, JSON.stringify(runtimeBackup, null, 2));
+    }
 
     let output = '';
     const childState = { exited: false, exitInfo: '' };
@@ -122,6 +133,7 @@ async function startBalancer(t, configOverrides = {}, envOverrides = {}) {
             TOKEN_RATE_LIMIT_BURST_10S: '',
             REQUEST_TIMEOUT_MS: '',
             MAX_REDIRECTS: '',
+            TRUSTED_PROXY_CIDRS: '',
             ...envOverrides,
         },
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -151,7 +163,12 @@ async function startBalancer(t, configOverrides = {}, envOverrides = {}) {
     });
 
     await waitForHealth(port, childState, () => output);
-    return { port, baseUrl: `http://127.0.0.1:${port}`, output: () => output };
+    return {
+        port,
+        baseUrl: `http://127.0.0.1:${port}`,
+        output: () => output,
+        runtimePatchPath,
+    };
 }
 
 function validXrayPayload() {
@@ -249,6 +266,54 @@ test('runtime patch applies only mutable keys', async (t) => {
         headers: { 'X-Admin-Token': 'integration-admin-token' },
     });
     assert.equal(admin.status, 200);
+    assert.deepEqual(
+        JSON.parse(fs.readFileSync(`${balancer.runtimePatchPath}.bak`, 'utf8')),
+        JSON.parse(fs.readFileSync(balancer.runtimePatchPath, 'utf8')),
+    );
+});
+
+test('runtime backup restores groups and UUID host bindings after primary corruption', async (t) => {
+    const persisted = {
+        groups: { Persisted: ['Persisted'] },
+        group_hosts: { Persisted: ['stable-host-uuid'] },
+        strategy: 'leastPing',
+    };
+    const balancer = await startBalancer(t, {
+        testRuntimePatchRaw: '{broken-json',
+        testRuntimeBackup: persisted,
+    });
+
+    const response = await fetch(`${balancer.baseUrl}/admin/groups`, {
+        headers: { 'X-Admin-Token': 'integration-admin-token' },
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(body.groups, persisted.groups);
+    assert.deepEqual(body.group_hosts, persisted.group_hosts);
+    assert.equal(body.strategy, 'leastPing');
+    assert.deepEqual(JSON.parse(fs.readFileSync(balancer.runtimePatchPath, 'utf8')), persisted);
+    assert.match(balancer.output(), /Runtime config restored from backup/);
+});
+
+test('runtime backup also recovers from a semantically invalid primary config', async (t) => {
+    const persisted = {
+        groups: { Persisted: ['Persisted'] },
+        group_hosts: { Persisted: ['stable-host-uuid'] },
+    };
+    const balancer = await startBalancer(t, {
+        testRuntimePatch: { groups: { Broken: [] }, group_hosts: {} },
+        testRuntimeBackup: persisted,
+    });
+
+    const response = await fetch(`${balancer.baseUrl}/admin/groups`, {
+        headers: { 'X-Admin-Token': 'integration-admin-token' },
+    });
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.deepEqual(body.groups, persisted.groups);
+    assert.deepEqual(body.group_hosts, persisted.group_hosts);
+    assert.deepEqual(JSON.parse(fs.readFileSync(balancer.runtimePatchPath, 'utf8')), persisted);
 });
 
 test('subscription endpoint uses single-flight fetch and fresh read-through cache', async (t) => {
@@ -303,6 +368,39 @@ test('subscription endpoint uses single-flight fetch and fresh read-through cach
 
     const ready = await fetch(`${balancer.baseUrl}/ready`);
     assert.equal(ready.status, 200);
+});
+
+test('single-flight counts one circuit failure per physical upstream request', async (t) => {
+    let upstreamHits = 0;
+    const upstream = http.createServer(async (req, res) => {
+        upstreamHits += 1;
+        await wait(100);
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end('temporary failure');
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        circuit_breaker_failures: 2,
+        circuit_breaker_open_sec: 10,
+    });
+
+    const concurrent = await Promise.all([
+        fetch(`${balancer.baseUrl}/shared-circuit-token`),
+        fetch(`${balancer.baseUrl}/shared-circuit-token`),
+        fetch(`${balancer.baseUrl}/shared-circuit-token`),
+    ]);
+    assert.deepEqual(concurrent.map((response) => response.status), [500, 500, 500]);
+    assert.equal(upstreamHits, 1);
+
+    const secondFailure = await fetch(`${balancer.baseUrl}/second-circuit-token`);
+    assert.equal(secondFailure.status, 500);
+    assert.equal(upstreamHits, 2);
+
+    const blocked = await fetch(`${balancer.baseUrl}/blocked-circuit-token`);
+    assert.equal(blocked.status, 503);
+    assert.equal(upstreamHits, 2);
 });
 
 test('Mihomo YAML uses configured group names and preserves YAML content type in cache', async (t) => {
@@ -490,6 +588,67 @@ test('trusted proxy client IP resolution ignores spoofed X-Forwarded-For prefix'
     assert.equal(second.status, 429);
     assert.equal(secondBody.code, 'RATE_LIMITED');
     assert.equal(upstreamHits, 1);
+});
+
+test('X-Forwarded-For is ignored when the direct peer is outside trusted proxy CIDRs', async (t) => {
+    let upstreamHits = 0;
+    const upstream = http.createServer((req, res) => {
+        upstreamHits += 1;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(validXrayPayload());
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        rate_limit_per_minute: 100,
+        rate_limit_burst_10s: 1,
+    }, {
+        TRUST_X_FORWARDED_FOR: 'true',
+        TRUSTED_PROXY_CIDRS: '10.0.0.0/8',
+    });
+
+    const first = await fetch(`${balancer.baseUrl}/untrusted-xff-a`, {
+        headers: { 'X-Forwarded-For': '1.1.1.1' },
+    });
+    const second = await fetch(`${balancer.baseUrl}/untrusted-xff-b`, {
+        headers: { 'X-Forwarded-For': '2.2.2.2' },
+    });
+
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 429);
+    assert.equal(upstreamHits, 1);
+});
+
+test('rate limiter table saturation rejects new IPs without resetting active counters', async (t) => {
+    let upstreamHits = 0;
+    const upstream = http.createServer((req, res) => {
+        upstreamHits += 1;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(validXrayPayload());
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        rate_limit_per_minute: 100,
+        rate_limit_burst_10s: 1,
+        ip_limiter_max_entries: 2,
+    }, {
+        TRUST_X_FORWARDED_FOR: 'true',
+        TRUSTED_PROXY_CIDRS: '127.0.0.1/32,::1/128',
+    });
+    const request = (token, ip) => fetch(`${balancer.baseUrl}/${token}`, {
+        headers: { 'X-Forwarded-For': ip },
+    });
+
+    assert.equal((await request('churn-a1', '1.1.1.1')).status, 200);
+    assert.equal((await request('churn-a2', '1.1.1.1')).status, 429);
+    assert.equal((await request('churn-b1', '2.2.2.2')).status, 200);
+    assert.equal((await request('churn-c1', '3.3.3.3')).status, 429);
+    assert.equal((await request('churn-a3', '1.1.1.1')).status, 429);
+    assert.equal(upstreamHits, 2);
 });
 
 test('admin groups can switch strategy at runtime and responses are no-store', async (t) => {
@@ -1032,6 +1191,46 @@ test('repeated upstream socket resets return a retryable gateway error', async (
     assert.equal(upstreamHits, 2);
 });
 
+test('subscription circuit breaker permits one HALF_OPEN probe per upstream', async (t) => {
+    let upstreamHits = 0;
+    const upstream = http.createServer(async (req, res) => {
+        upstreamHits += 1;
+        if (upstreamHits === 1) {
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            res.end('temporary failure');
+            return;
+        }
+        await wait(150);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(validXrayPayload());
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        circuit_breaker_failures: 1,
+        circuit_breaker_open_sec: 1,
+    });
+
+    const failed = await fetch(`${balancer.baseUrl}/circuit-fail`);
+    const blocked = await fetch(`${balancer.baseUrl}/circuit-blocked`);
+    assert.equal(failed.status, 500);
+    assert.equal(blocked.status, 503);
+    assert.equal((await blocked.json()).code, 'UPSTREAM_CIRCUIT_OPEN');
+
+    await wait(1100);
+    const probes = await Promise.all([
+        fetch(`${balancer.baseUrl}/half-open-a`),
+        fetch(`${balancer.baseUrl}/half-open-b`),
+    ]);
+    assert.deepEqual(probes.map((response) => response.status).sort(), [200, 503]);
+    assert.equal(upstreamHits, 2);
+
+    const recovered = await fetch(`${balancer.baseUrl}/circuit-recovered`);
+    assert.equal(recovered.status, 200);
+    assert.equal(upstreamHits, 3);
+});
+
 test('background refresh loop skips overlapping auto-groups runs', async (t) => {
     let hostRequests = 0;
     let inFlight = 0;
@@ -1554,12 +1753,13 @@ test('subscription fails closed when every outbound is isolated', async (t) => {
 });
 
 test('automatic protection isolates a repeatedly disconnected node but preserves reserve capacity', async (t) => {
+    let attackedNodeName = 'Germany-1';
     const upstream = http.createServer((req, res) => {
         if (req.url === '/api/nodes/') {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ response: [
-                { name: 'Germany-1', isConnected: false, isDisabled: false, usersOnline: 0, totalRam: '2 GB', cpuCount: 1 },
-                { name: 'Germany-2', isConnected: true, isDisabled: false, usersOnline: 1, totalRam: '2 GB', cpuCount: 1 },
+                { uuid: 'stable-node-uuid', name: attackedNodeName, isConnected: false, isDisabled: false, usersOnline: 0, totalRam: '2 GB', cpuCount: 1 },
+                { uuid: 'reserve-node-uuid', name: 'Germany-2', isConnected: true, isDisabled: false, usersOnline: 1, totalRam: '2 GB', cpuCount: 1 },
             ] }));
             return;
         }
@@ -1567,7 +1767,7 @@ test('automatic protection isolates a repeatedly disconnected node but preserves
         res.end(JSON.stringify([{
             remarks: 'nodes',
             outbounds: [
-                { tag: 'Germany-1', protocol: 'vless', settings: { vnext: [{ address: 'de1.example.com', port: 443 }] } },
+                { tag: attackedNodeName, protocol: 'vless', settings: { vnext: [{ address: 'de1.example.com', port: 443 }] } },
                 { tag: 'Germany-2', protocol: 'vless', settings: { vnext: [{ address: 'de2.example.com', port: 443 }] } },
             ],
         }]));
@@ -1584,6 +1784,7 @@ test('automatic protection isolates a repeatedly disconnected node but preserves
         protection_release_successes: 2,
         protection_isolation_ttl_sec: 60,
         protection_min_available_nodes: 1,
+        testRuntimePatch: {},
     }, {
         NODE_STATS: 'true',
         API_TOKEN: 'panel-token',
@@ -1597,17 +1798,29 @@ test('automatic protection isolates a repeatedly disconnected node but preserves
         assert.equal(refresh.status, 200);
     }
 
+    attackedNodeName = 'Germany-Renamed';
+    const renameRefresh = await fetch(`${balancer.baseUrl}/admin/refresh-stats`, {
+        method: 'POST',
+        headers: { 'x-admin-token': 'integration-admin-token' },
+    });
+    assert.equal(renameRefresh.status, 200);
+
     const attackStatus = await fetch(`${balancer.baseUrl}/admin/attack-mode`, {
         headers: { 'x-admin-token': 'integration-admin-token' },
     });
     const attackBody = await attackStatus.json();
     assert.equal(attackBody.summary.automatic, 1);
-    assert.equal(attackBody.nodes[0].normalizedNode, 'germany-1');
+    assert.equal(attackBody.nodes[0].normalizedNode, 'germany-renamed');
+    assert.equal(attackBody.nodes[0].nodeId, 'stable-node-uuid');
+    assert.equal(
+        JSON.parse(fs.readFileSync(balancer.runtimePatchPath, 'utf8')).attack_nodes[0].node_id,
+        'stable-node-uuid',
+    );
 
     const response = await fetch(`${balancer.baseUrl}/auto-protection-token`);
     assert.equal(response.status, 200);
     const body = await response.text();
-    assert.doesNotMatch(body, /Germany-1/);
+    assert.doesNotMatch(body, /Germany-Renamed/);
     assert.match(body, /Germany-2/);
 });
 

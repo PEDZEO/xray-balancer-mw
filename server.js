@@ -13,7 +13,7 @@ const {
     getNodeStats,
     matchGroup,
 } = require('./lib/balancing');
-const { createCircuitBreaker, createKeyedRateLimiter, createRateLimiter, createTokenCache } = require('./lib/runtime');
+const { createCircuitBreakerRegistry, createKeyedRateLimiter, createRateLimiter, createTokenCache } = require('./lib/runtime');
 const { buildLogger } = require('./lib/log');
 const { resolveProfile } = require('./lib/profile');
 const { classifyUpstreamPayload } = require('./lib/upstream-contract');
@@ -28,6 +28,7 @@ const { createHealthChecker } = require('./lib/health-checker');
 // ─── Загрузка конфига ───
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
 const CONFIG_RUNTIME_PATH = process.env.CONFIG_RUNTIME_PATH || '';
+const CONFIG_RUNTIME_BACKUP_PATH = CONFIG_RUNTIME_PATH ? `${CONFIG_RUNTIME_PATH}.bak` : '';
 const MUTABLE_CONFIG_KEYS = [
     'groups',
     'group_descriptions',
@@ -78,28 +79,106 @@ const MUTABLE_CONFIG_KEYS = [
     'balancer_smoothing_alpha',
     'balancer_hysteresis_delta',
 ];
+
+function writeTextFileAtomically(targetPath, content) {
+    const targetDir = path.dirname(targetPath);
+    if (!fs.existsSync(targetDir)) {
+        fs.mkdirSync(targetDir, { recursive: true });
+    }
+
+    const tempPath = `${targetPath}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    let fd = null;
+    try {
+        fd = fs.openSync(tempPath, 'wx', 0o600);
+        fs.writeFileSync(fd, content, 'utf8');
+        fs.fsyncSync(fd);
+        fs.closeSync(fd);
+        fd = null;
+        fs.renameSync(tempPath, targetPath);
+        fs.chmodSync(targetPath, 0o600);
+    } catch (err) {
+        if (fd !== null) {
+            try { fs.closeSync(fd); } catch (_) { /* best effort */ }
+        }
+        try { fs.unlinkSync(tempPath); } catch (_) { /* best effort */ }
+        throw err;
+    }
+}
+
+function readRuntimePatchFile(filePath) {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    if (!raw.trim()) return {};
+    const patch = JSON.parse(raw);
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+        throw new Error(`${filePath} must contain a JSON object`);
+    }
+    return patch;
+}
+
+function validateRuntimePatch(baseConfig, patch) {
+    const mutablePatch = Object.fromEntries(
+        Object.entries(patch).filter(([key]) => MUTABLE_CONFIG_KEYS.includes(key))
+    );
+    validateConfig({ ...baseConfig, ...mutablePatch });
+}
+
+function loadRuntimePatch(baseConfig) {
+    if (!CONFIG_RUNTIME_PATH) return null;
+
+    let primaryError = null;
+    if (fs.existsSync(CONFIG_RUNTIME_PATH)) {
+        try {
+            const patch = readRuntimePatchFile(CONFIG_RUNTIME_PATH);
+            validateRuntimePatch(baseConfig, patch);
+            try {
+                writeTextFileAtomically(CONFIG_RUNTIME_BACKUP_PATH, JSON.stringify(patch, null, 2));
+            } catch (backupErr) {
+                console.warn(`[config] Failed to refresh runtime backup: ${backupErr.message}`);
+            }
+            return patch;
+        } catch (err) {
+            primaryError = err;
+            console.warn(`[config] Runtime config is invalid, trying backup: ${err.message}`);
+        }
+    }
+
+    if (fs.existsSync(CONFIG_RUNTIME_BACKUP_PATH)) {
+        try {
+            const patch = readRuntimePatchFile(CONFIG_RUNTIME_BACKUP_PATH);
+            validateRuntimePatch(baseConfig, patch);
+            try {
+                writeTextFileAtomically(CONFIG_RUNTIME_PATH, JSON.stringify(patch, null, 2));
+                console.warn('[config] Runtime config restored from backup');
+            } catch (restoreErr) {
+                console.warn(`[config] Runtime backup loaded but primary restore failed: ${restoreErr.message}`);
+            }
+            return patch;
+        } catch (backupErr) {
+            throw new Error(`runtime config recovery failed: ${backupErr.message}`);
+        }
+    }
+
+    if (primaryError) throw primaryError;
+    return null;
+}
+
 let config;
 try {
     config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-    if (CONFIG_RUNTIME_PATH && fs.existsSync(CONFIG_RUNTIME_PATH)) {
-        const runtimePatchRaw = fs.readFileSync(CONFIG_RUNTIME_PATH, 'utf8');
-        if (runtimePatchRaw.trim()) {
-            const runtimePatch = JSON.parse(runtimePatchRaw);
-            if (runtimePatch && typeof runtimePatch === 'object' && !Array.isArray(runtimePatch)) {
-                const mutablePatch = Object.fromEntries(
-                    Object.entries(runtimePatch).filter(([key]) => MUTABLE_CONFIG_KEYS.includes(key))
-                );
-                const ignoredKeys = Object.keys(runtimePatch).filter((key) => !MUTABLE_CONFIG_KEYS.includes(key));
-                if (ignoredKeys.length > 0) {
-                    console.warn(`[config] Ignored immutable runtime keys: ${ignoredKeys.join(', ')}`);
-                }
-                config = { ...config, ...mutablePatch };
-            }
+    const runtimePatch = loadRuntimePatch(config);
+    if (runtimePatch) {
+        const mutablePatch = Object.fromEntries(
+            Object.entries(runtimePatch).filter(([key]) => MUTABLE_CONFIG_KEYS.includes(key))
+        );
+        const ignoredKeys = Object.keys(runtimePatch).filter((key) => !MUTABLE_CONFIG_KEYS.includes(key));
+        if (ignoredKeys.length > 0) {
+            console.warn(`[config] Ignored immutable runtime keys: ${ignoredKeys.join(', ')}`);
         }
+        config = { ...config, ...mutablePatch };
     }
     validateConfig(config);
 } catch (err) {
-    console.error(`❌ Ошибка чтения ${CONFIG_PATH}:`, err.message);
+    console.error('❌ Ошибка загрузки конфигурации:', err.message);
     process.exit(1);
 }
 
@@ -175,6 +254,15 @@ const ADMIN_LIMITER_MAX_ENTRIES = pickPositiveInt('ADMIN_LIMITER_MAX_ENTRIES', '
 const MAX_UPSTREAM_CONCURRENCY = pickPositiveInt('MAX_UPSTREAM_CONCURRENCY', 'max_upstream_concurrency', 32);
 const NEGATIVE_CACHE_TTL_SEC = pickPositiveInt('NEGATIVE_CACHE_TTL_SEC', 'negative_cache_ttl_sec', 30);
 const TRUST_X_FORWARDED_FOR = pickRuntimeBool('TRUST_X_FORWARDED_FOR', 'trust_x_forwarded_for');
+let TRUSTED_PROXY_CIDRS;
+let trustedProxyBlockList;
+try {
+    TRUSTED_PROXY_CIDRS = parseTrustedProxyCidrs(process.env.TRUSTED_PROXY_CIDRS, config.trusted_proxy_cidrs);
+    trustedProxyBlockList = createTrustedProxyBlockList(TRUSTED_PROXY_CIDRS);
+} catch (err) {
+    console.error('❌ Ошибка TRUSTED_PROXY_CIDRS:', err.message);
+    process.exit(1);
+}
 const ADMIN_RATE_LIMIT_PER_MINUTE = parseInt(process.env.ADMIN_RATE_LIMIT_PER_MINUTE, 10) || config.admin_rate_limit_per_minute || 60;
 const ADMIN_RATE_LIMIT_BURST_10S = parseInt(process.env.ADMIN_RATE_LIMIT_BURST_10S, 10) || config.admin_rate_limit_burst_10s || 20;
 const READY_SUCCESS_WINDOW_SEC = pickRuntimeInt('READY_SUCCESS_WINDOW_SEC', 'ready_success_window_sec');
@@ -251,7 +339,9 @@ const tokenRateLimiter = createKeyedRateLimiter(TOKEN_RATE_LIMIT_PER_MINUTE, TOK
 const adminRateLimiter = createRateLimiter(ADMIN_RATE_LIMIT_PER_MINUTE, ADMIN_RATE_LIMIT_BURST_10S, {
     maxEntries: ADMIN_LIMITER_MAX_ENTRIES,
 });
-const circuitBreaker = createCircuitBreaker(CIRCUIT_BREAKER_FAILURES, CIRCUIT_BREAKER_OPEN_SEC);
+const circuitBreakers = createCircuitBreakerRegistry(CIRCUIT_BREAKER_FAILURES, CIRCUIT_BREAKER_OPEN_SEC, {
+    halfOpenLeaseMs: REQUEST_TIMEOUT_MS,
+});
 const runtimeStats = {
     started_at: Date.now(),
     requests_total: 0,
@@ -285,7 +375,7 @@ const logger = buildLogger();
 const requestGuard = createRequestGuard({
     ipLimiter: rateLimiter,
     tokenLimiter: tokenRateLimiter,
-    circuitBreaker,
+    circuitBreaker: circuitBreakers,
     stats: runtimeStats,
 });
 const autoDrainState = new Map();
@@ -325,8 +415,10 @@ function ensureNodeProtectionManager() {
     const seeds = new Map();
 
     for (const node of previousProtected) {
-        seeds.set(node.normalizedNode, {
+        const seedKey = node.nodeId ? `id:${node.nodeId.toLowerCase()}` : `name:${node.normalizedNode}`;
+        seeds.set(seedKey, {
             node: node.nodeName,
+            nodeId: node.nodeId,
             reason: node.isolation?.reason,
             source: node.isolation?.source,
             mode: node.isolation?.mode,
@@ -334,8 +426,10 @@ function ensureNodeProtectionManager() {
         });
     }
     for (const node of runtime.attackNodes) {
-        seeds.set(normalizeNodeName(node.node), {
+        const seedKey = node.node_id ? `id:${node.node_id.toLowerCase()}` : `name:${normalizeNodeName(node.node)}`;
+        seeds.set(seedKey, {
             node: node.node,
+            nodeId: node.node_id,
             reason: node.reason,
             source: node.source,
             mode: node.mode,
@@ -351,10 +445,11 @@ function ensureNodeProtectionManager() {
             source: seed.source,
             ttlSec: Math.max(1, Math.ceil((seed.expiresAt - now) / 1000)),
         };
+        const nodeRef = seed.nodeId ? { id: seed.nodeId, name: seed.node } : seed.node;
         if (seed.mode === 'automatic') {
-            nextManager.isolateAutomatic(seed.node, details, now);
+            nextManager.isolateAutomatic(nodeRef, details, now);
         } else {
-            nextManager.isolateManual(seed.node, details, now);
+            nextManager.isolateManual(nodeRef, details, now);
         }
     }
     nextManager.drainEvents();
@@ -581,7 +676,7 @@ async function fetchUrlWithSocketRetry(targetUrl, headers, requestId) {
     }
 }
 
-async function fetchUpstreamSingleFlight(cacheKey, token, targetUrl, headers, requestId) {
+async function fetchUpstreamSingleFlight(cacheKey, token, targetUrl, headers, requestId, upstreamKey) {
     const existing = inFlightUpstreamFetches.get(cacheKey);
     if (existing) {
         runtimeStats.upstream_singleflight_joined_total += 1;
@@ -600,7 +695,20 @@ async function fetchUpstreamSingleFlight(cacheKey, token, targetUrl, headers, re
     }
 
     activeUpstreamFetches += 1;
-    const promise = fetchUrlWithSocketRetry(targetUrl, headers, requestId);
+    const promise = fetchUrlWithSocketRetry(targetUrl, headers, requestId).then(
+        (upstream) => {
+            if (isServiceFailureStatus(upstream.status)) {
+                circuitBreakers.recordFailure(upstreamKey);
+            } else {
+                circuitBreakers.recordSuccess(upstreamKey);
+            }
+            return upstream;
+        },
+        (err) => {
+            circuitBreakers.recordFailure(upstreamKey);
+            throw err;
+        },
+    );
     inFlightUpstreamFetches.set(cacheKey, promise);
     try {
         return await promise;
@@ -633,27 +741,41 @@ function sanitizeAdminPath(pathname) {
 }
 
 function normalizeIpAddress(value) {
-    const ip = (value || '').toString().trim();
+    let ip = (value || '').toString().trim();
+    if (ip.toLowerCase().startsWith('::ffff:')) {
+        const mapped = ip.slice(7);
+        if (net.isIP(mapped) === 4) ip = mapped;
+    }
     return net.isIP(ip) ? ip : null;
+}
+
+function parseTrustedProxyCidrs(envValue, configValue) {
+    const fromEnv = typeof envValue === 'string' && envValue.trim()
+        ? envValue.split(',').map((item) => item.trim()).filter(Boolean)
+        : null;
+    const cidrs = fromEnv || (Array.isArray(configValue) && configValue.length > 0
+        ? configValue.map((item) => item.trim())
+        : ['127.0.0.1/32', '::1/128']);
+    validateConfig({ trusted_proxy_cidrs: cidrs });
+    return cidrs;
+}
+
+function createTrustedProxyBlockList(cidrs) {
+    const blockList = new net.BlockList();
+    for (const cidr of cidrs) {
+        const separator = cidr.lastIndexOf('/');
+        const address = cidr.slice(0, separator).trim();
+        const prefix = Number(cidr.slice(separator + 1));
+        blockList.addSubnet(address, prefix, net.isIP(address) === 4 ? 'ipv4' : 'ipv6');
+    }
+    return blockList;
 }
 
 function isTrustedProxyAddress(ip) {
     const normalized = normalizeIpAddress(ip);
     if (!normalized) return false;
-    if (normalized === '::1' || normalized === '127.0.0.1' || normalized === '::ffff:127.0.0.1') return true;
-
-    if (net.isIP(normalized) === 4) {
-        const parts = normalized.split('.').map((part) => Number(part));
-        if (parts[0] === 10) return true;
-        if (parts[0] === 127) return true;
-        if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
-        if (parts[0] === 192 && parts[1] === 168) return true;
-        if (parts[0] === 169 && parts[1] === 254) return true;
-        return false;
-    }
-
-    const lower = normalized.toLowerCase();
-    return lower.startsWith('fc') || lower.startsWith('fd') || lower.startsWith('fe80:');
+    const version = net.isIP(normalized);
+    return trustedProxyBlockList.check(normalized, version === 4 ? 'ipv4' : 'ipv6');
 }
 
 function parseForwardedForHeader(value) {
@@ -707,15 +829,12 @@ function writeConfigFile(nextConfig) {
     const payload = CONFIG_RUNTIME_PATH
         ? Object.fromEntries(MUTABLE_CONFIG_KEYS.map((key) => [key, nextConfig[key]]).filter(([_, value]) => value !== undefined))
         : nextConfig;
+    const serialized = JSON.stringify(payload, null, 2);
 
-    const targetDir = path.dirname(targetPath);
-    if (!fs.existsSync(targetDir)) {
-        fs.mkdirSync(targetDir, { recursive: true });
+    if (CONFIG_RUNTIME_BACKUP_PATH) {
+        writeTextFileAtomically(CONFIG_RUNTIME_BACKUP_PATH, serialized);
     }
-
-    const tempPath = `${targetPath}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-    fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2), { mode: 0o600 });
-    fs.renameSync(tempPath, targetPath);
+    writeTextFileAtomically(targetPath, serialized);
 }
 
 function persistConfigIfPossible(nextConfig, requestId) {
@@ -873,6 +992,7 @@ function serializeProtectedNodes() {
         .list({ protectedOnly: true })
         .map((node) => ({
             node: node.nodeName,
+            ...(node.nodeId ? { node_id: node.nodeId } : {}),
             reason: node.isolation?.reason || 'protection',
             source: node.isolation?.source || 'system',
             mode: node.isolation?.mode || 'automatic',
@@ -882,7 +1002,8 @@ function serializeProtectedNodes() {
 
 function protectionStateChanged(events) {
     return events.some((event) => (
-        event.type === 'isolation_updated'
+        event.type === 'identity_updated'
+        || event.type === 'isolation_updated'
         || (event.to === 'isolated' && event.from !== 'recovering')
         || (event.to === 'healthy' && (event.from === 'isolated' || event.from === 'recovering'))
     ));
@@ -951,6 +1072,8 @@ async function updateNodeProtectionFromNodes(nodes) {
         for (const node of nodes) {
             const nodeName = (node.name || '').toString().trim();
             if (!nodeName) continue;
+            const nodeId = String(node.uuid || node.id || '').trim();
+            const nodeRef = nodeId ? { id: nodeId, name: nodeName } : nodeName;
             const latencyMs = readNodeLatencyMs(node);
             const reasons = [];
             if (!Boolean(node.isConnected)) reasons.push('panel_disconnected');
@@ -960,12 +1083,12 @@ async function updateNodeProtectionFromNodes(nodes) {
             }
 
             if (reasons.length === 0) {
-                manager.recordSuccess(nodeName, { reason: 'health_check_recovered', source: 'panel_stats' });
+                manager.recordSuccess(nodeRef, { reason: 'health_check_recovered', source: 'panel_stats' });
                 continue;
             }
 
-            const current = manager.get(nodeName);
-            const alreadyProtected = manager.isIsolated(nodeName);
+            const current = manager.get(nodeRef);
+            const alreadyProtected = manager.isIsolated(nodeRef);
             const wouldIsolate = !alreadyProtected
                 && ((current?.failureCount || 0) + 1 >= runtime.protectionFailures);
             if (wouldIsolate && protectedCount >= maxProtected) {
@@ -979,7 +1102,7 @@ async function updateNodeProtectionFromNodes(nodes) {
                 continue;
             }
 
-            const result = manager.recordFailure(nodeName, {
+            const result = manager.recordFailure(nodeRef, {
                 reason: reasons.join(','),
                 source: 'panel_stats',
                 ttlSec: runtime.protectionIsolationTtlSec,
@@ -1260,6 +1383,7 @@ async function fetchNodeStatsNow() {
         for (const node of nodes) {
             const name = node.name || '';
             if (!name) continue;
+            const nodeId = String(node.uuid || node.id || '').trim();
             activeNodeNames.push(name);
             const address = typeof node.address === 'string' ? node.address.trim() : '';
             const usersOnline = node.usersOnline || 0;
@@ -1289,6 +1413,7 @@ async function fetchNodeStatsNow() {
                 isDisabled,
                 isAlias: false,
                 sourceNode: name,
+                ...(nodeId ? { sourceNodeId: nodeId } : {}),
                 ...(latencyMs === null ? {} : { latency_ms: latencyMs }),
                 ...healthMetrics,
             };
@@ -2296,7 +2421,9 @@ const server = http.createServer(async (req, res) => {
                 {
                     ...stats,
                     quarantined: isNodeQuarantined(name, quarantineSet, stats?.sourceNode),
-                    protection: protectionManager.get(stats?.sourceNode || name),
+                    protection: protectionManager.get(stats?.sourceNodeId
+                        ? { id: stats.sourceNodeId, name: stats?.sourceNode || name }
+                        : (stats?.sourceNode || name)),
                 },
             ]),
         );
@@ -2366,7 +2493,14 @@ const server = http.createServer(async (req, res) => {
             }
 
             const manager = ensureNodeProtectionManager();
-            const result = manager.isolateManual(nodeName, {
+            const matchingStats = Object.values(nodeStatsCache).find((stats) => (
+                normalizeNodeName(stats?.sourceNode) === normalizeNodeName(nodeName)
+                && stats?.sourceNodeId
+            ));
+            const nodeRef = matchingStats?.sourceNodeId
+                ? { id: matchingStats.sourceNodeId, name: nodeName }
+                : nodeName;
+            const result = manager.isolateManual(nodeRef, {
                 reason,
                 source: 'admin',
                 ttlSec,
@@ -2600,7 +2734,7 @@ const server = http.createServer(async (req, res) => {
         const runtime = getRuntimeConfig();
         const currentStickyStore = ensureStickyStore();
         const currentProtectionManager = ensureNodeProtectionManager();
-        const cb = circuitBreaker.status();
+        const cb = circuitBreakers.status();
         const nodeStatsAgeMs = getNodeStatsAgeMs();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -2700,7 +2834,7 @@ const server = http.createServer(async (req, res) => {
                 token_rate_limit_per_minute: TOKEN_RATE_LIMIT_PER_MINUTE,
                 token_rate_limit_burst_10s: TOKEN_RATE_LIMIT_BURST_10S,
             },
-            circuit_breaker: circuitBreaker.status(),
+            circuit_breaker: circuitBreakers.status(),
             sticky: {
                 enabled: runtime.stickyEnabled,
                 assigned_nodes: runtime.stickyEnabled
@@ -2728,6 +2862,7 @@ const server = http.createServer(async (req, res) => {
     const targetUrl = SUB_PAGE_URL
         ? `${SUB_PAGE_URL}/${token}`
         : `${REMNAWAVE_URL}${REMNAWAVE_SUB_PATH}/${token}`;
+    const upstreamKey = new URL(targetUrl).origin;
 
     applyNoStoreHeaders(res);
     if (req.method !== 'GET') {
@@ -2740,7 +2875,7 @@ const server = http.createServer(async (req, res) => {
     const cacheKey = buildSubscriptionCacheKey(token, forwardHeaders);
     const safePath = redactTokenPath(pathname);
     runtimeStats.requests_total += 1;
-    const guardDecision = requestGuard.evaluate(clientIp, token);
+    const guardDecision = requestGuard.evaluateRateLimits(clientIp, token);
     if (!guardDecision.ok) {
         if (guardDecision.code === 'RATE_LIMITED') {
             logger.warn('rate_limited', { request_id: requestId, ip: clientIp, path: safePath });
@@ -2833,9 +2968,26 @@ const server = http.createServer(async (req, res) => {
             return;
         }
     }
-    const cacheGeneration = subscriptionCacheGeneration;
-    let upstreamRequestFailed = true;
 
+    const circuitDecision = requestGuard.evaluateCircuit(upstreamKey);
+    if (!circuitDecision.ok) {
+        const fallback = getCachedFallback(cacheKey);
+        if (fallback) {
+            runtimeStats.cache_fallback_total += 1;
+            if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
+            logger.warn('cache_fallback_circuit_open', { request_id: requestId, cache_kind: fallback.kind });
+            res.writeHead(200, forwardResponseHeaders(
+                fallback.item.headers,
+                getResponseContentType(fallback.item.headers)
+            ));
+            res.end(fallback.item.body);
+            return;
+        }
+        res.writeHead(circuitDecision.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'error', code: circuitDecision.code, request_id: requestId }));
+        return;
+    }
+    const cacheGeneration = subscriptionCacheGeneration;
     try {
         // Пробрасываем ВСЕ заголовки от клиента, кроме тех что ломают проксирование
         // Дефолтный User-Agent если клиент не прислал
@@ -2848,8 +3000,7 @@ const server = http.createServer(async (req, res) => {
             os: clientMeta.os,
         });
 
-        const upstream = await fetchUpstreamSingleFlight(cacheKey, token, targetUrl, forwardHeaders, requestId);
-        upstreamRequestFailed = false;
+        const upstream = await fetchUpstreamSingleFlight(cacheKey, token, targetUrl, forwardHeaders, requestId, upstreamKey);
         logger.info('upstream_response', {
             request_id: requestId,
             status: upstream.status,
@@ -2862,7 +3013,6 @@ const server = http.createServer(async (req, res) => {
             }
             if (isServiceFailureStatus(upstream.status)) {
                 lastUpstreamError = `upstream_status_${upstream.status}`;
-                circuitBreaker.recordFailure();
             }
 
             if (canFallbackForStatus(upstream.status)) {
@@ -2883,7 +3033,6 @@ const server = http.createServer(async (req, res) => {
             res.end(upstream.body);
             return;
         }
-
         const classified = classifyUpstreamPayload(upstream.body);
         const effectiveGroups = getEffectiveGroups();
         if (classified.type === 'non_json') {
@@ -2930,7 +3079,6 @@ const server = http.createServer(async (req, res) => {
 
             if (mihomo?.kind === 'mihomo') {
                 runtimeStats.mihomo_transformed_total += 1;
-                circuitBreaker.recordSuccess();
                 lastUpstreamSuccessAt = Date.now();
                 lastUpstreamError = null;
                 const contentType = getResponseContentType(upstream.headers, 'text/yaml; charset=utf-8');
@@ -2954,7 +3102,6 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
 
-            circuitBreaker.recordSuccess();
             lastUpstreamSuccessAt = Date.now();
             lastUpstreamError = null;
             logger.info('upstream_non_json_passthrough', {
@@ -2983,7 +3130,6 @@ const server = http.createServer(async (req, res) => {
         // Признак: все прокси-outbound'ы имеют адрес 0.0.0.0 и порт 1.
         if (classified.type === 'fake_config') {
             runtimeStats.fake_config_passthrough_total += 1;
-            circuitBreaker.recordSuccess();
             lastUpstreamSuccessAt = Date.now();
             lastUpstreamError = null;
             logger.info('fake_config_passthrough', { request_id: requestId });
@@ -3301,7 +3447,6 @@ const server = http.createServer(async (req, res) => {
         logger.info('response_built', { request_id: requestId, groups: resultConfigs.length, servers: allOutbounds.length });
 
         const responseBody = JSON.stringify(resultConfigs, null, 2);
-        circuitBreaker.recordSuccess();
         lastUpstreamSuccessAt = Date.now();
         lastUpstreamError = null;
         if (cacheGeneration === subscriptionCacheGeneration) {
@@ -3322,8 +3467,8 @@ const server = http.createServer(async (req, res) => {
     } catch (err) {
         runtimeStats.request_failures += 1;
         lastUpstreamError = err.message;
-        if (upstreamRequestFailed && err.code !== 'EUPSTREAMBUSY') {
-            circuitBreaker.recordFailure();
+        if (err.code === 'EUPSTREAMBUSY') {
+            circuitBreakers.cancelProbe(upstreamKey);
         }
         logger.error('request_failed', { request_id: requestId, message: err.message });
         const fallback = getCachedFallback(cacheKey);
@@ -3469,6 +3614,7 @@ async function start() {
         );
         console.log(`⏱️ Upstream: timeout=${REQUEST_TIMEOUT_MS}ms redirects=${MAX_REDIRECTS} concurrency=${MAX_UPSTREAM_CONCURRENCY}`);
         console.log(`🧱 Circuit breaker: fails=${CIRCUIT_BREAKER_FAILURES} open=${CIRCUIT_BREAKER_OPEN_SEC}s`);
+        console.log(`🔗 Trusted proxy CIDRs: ${TRUST_X_FORWARDED_FOR ? TRUSTED_PROXY_CIDRS.join(', ') : 'disabled'}`);
         console.log(`🚫 Quarantine: ${QUARANTINE_NODES.length} nodes`);
         console.log(`💾 Runtime config: ${CONFIG_RUNTIME_PATH || CONFIG_PATH}`);
         console.log(`🛡️ Admin routes: ${ADMIN_TOKEN ? '🔒 enabled' : '⚠️ disabled (set ADMIN_TOKEN)'}`);

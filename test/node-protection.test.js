@@ -234,3 +234,19 @@ test('returned snapshots do not expose mutable internal state', () => {
 
     assert.equal(manager.get('Node-A', 1000).isolation.reason, 'ddos');
 });
+
+test('stable node ID preserves automatic protection across display-name changes', () => {
+    const manager = createNodeProtectionManager({ failureThreshold: 1, recoverySuccessThreshold: 3 });
+    const originalRef = { id: 'stable-node-uuid', name: 'Germany Old' };
+    const renamedRef = { id: 'stable-node-uuid', name: 'Germany New' };
+
+    manager.recordFailure(originalRef, { ttlSec: 60 }, 1000);
+    const afterRename = manager.recordSuccess(renamedRef, {}, 2000);
+
+    assert.equal(afterRename.node.nodeId, 'stable-node-uuid');
+    assert.equal(afterRename.node.nodeName, 'Germany New');
+    assert.equal(afterRename.node.normalizedNode, 'germany new');
+    assert.equal(afterRename.node.state, NODE_STATES.RECOVERING);
+    assert.equal(manager.summary(2000).total, 1);
+    assert.equal(manager.isIsolated(renamedRef, 2000), true);
+});

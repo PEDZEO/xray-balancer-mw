@@ -44,6 +44,7 @@
     "admin_rate_limit_per_minute": 60,
     "admin_rate_limit_burst_10s": 20,
     "trust_x_forwarded_for": false,
+    "trusted_proxy_cidrs": ["127.0.0.1/32", "::1/128"],
     "auto_quarantine_enabled": false,
     "auto_quarantine_failures": 3,
     "auto_quarantine_release_successes": 2,

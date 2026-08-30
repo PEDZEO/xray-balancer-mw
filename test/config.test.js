@@ -108,7 +108,7 @@ test('validateConfig accepts runtime and fastest-exclude options', () => {
         protection_min_available_nodes: 1,
         emergency_fallback_enabled: true,
         emergency_fallback_max_nodes: 1,
-        attack_nodes: [{ node: 'Germany-1', reason: 'ddos', source: 'admin', expires_at: '2030-01-01T00:00:00.000Z' }],
+        attack_nodes: [{ node: 'Germany-1', node_id: 'stable-node-uuid', reason: 'ddos', source: 'admin', expires_at: '2030-01-01T00:00:00.000Z' }],
     };
 
     assert.deepEqual(validateConfig(cfg), cfg);
@@ -179,5 +179,14 @@ test('validateConfig rejects malformed protection settings', () => {
     assert.throws(() => validateConfig({ probe_connectivity_url: 'connectivity.test' }), /probe_connectivity_url/);
     assert.throws(() => validateConfig({ protection_failures: 0 }), /protection_failures/);
     assert.throws(() => validateConfig({ attack_nodes: [{ node: '' }] }), /attack_nodes/);
+    assert.throws(() => validateConfig({ attack_nodes: [{ node: 'A', node_id: '' }] }), /node_id/);
     assert.throws(() => validateConfig({ attack_nodes: [{ node: 'A', expires_at: 'tomorrow' }] }), /expires_at/);
+});
+
+test('validateConfig accepts explicit trusted proxy CIDRs and rejects malformed ranges', () => {
+    assert.deepEqual(validateConfig({ trusted_proxy_cidrs: ['127.0.0.1/32', 'fd00::/8'] }), {
+        trusted_proxy_cidrs: ['127.0.0.1/32', 'fd00::/8'],
+    });
+    assert.throws(() => validateConfig({ trusted_proxy_cidrs: ['10.0.0.0/99'] }), /invalid CIDR/);
+    assert.throws(() => validateConfig({ trusted_proxy_cidrs: ['10.0.0.1'] }), /invalid CIDR/);
 });
