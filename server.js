@@ -22,6 +22,7 @@ const { buildStickyTokenKey, createStickyStore } = require('./lib/sticky');
 const { createRequestGuard } = require('./lib/request-guard');
 const { readEffectiveRuntime } = require('./lib/runtime-config');
 const { createNodeProtectionManager } = require('./lib/node-protection');
+const { transformMihomoYaml } = require('./lib/mihomo');
 
 // ─── Загрузка конфига ───
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
@@ -245,6 +246,7 @@ const runtimeStats = {
     rate_limited_ip_total: 0,
     rate_limited_token_total: 0,
     upstream_non_json_total: 0,
+    mihomo_transformed_total: 0,
     fake_config_passthrough_total: 0,
     quarantine_filtered_total: 0,
     protection_isolations_total: 0,
@@ -1563,6 +1565,13 @@ function forwardResponseHeaders(upstreamHeaders, contentType) {
     return result;
 }
 
+function getResponseContentType(headers = {}, fallback = 'application/json; charset=utf-8') {
+    for (const [key, value] of Object.entries(headers)) {
+        if (key.toLowerCase() === 'content-type' && value) return value;
+    }
+    return fallback;
+}
+
 function sanitizeHeadersForCache(upstreamHeaders = {}) {
     const result = {};
     for (const [key, val] of Object.entries(upstreamHeaders)) {
@@ -2459,7 +2468,10 @@ const server = http.createServer(async (req, res) => {
                 runtimeStats.cache_fallback_total += 1;
                 if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
                 logger.warn('cache_fallback_circuit_open', { request_id: requestId, cache_kind: fallback.kind });
-                res.writeHead(200, forwardResponseHeaders(fallback.item.headers, 'application/json; charset=utf-8'));
+                res.writeHead(200, forwardResponseHeaders(
+                    fallback.item.headers,
+                    getResponseContentType(fallback.item.headers)
+                ));
                 res.end(fallback.item.body);
                 return;
             }
@@ -2475,7 +2487,10 @@ const server = http.createServer(async (req, res) => {
     if (cachedSubscription) {
         runtimeStats.cache_hits_total += 1;
         logger.info('cache_hit', { request_id: requestId, token: redactTokenPath(`/${token}`).slice(1) });
-        res.writeHead(200, forwardResponseHeaders(cachedSubscription.headers, 'application/json; charset=utf-8'));
+        res.writeHead(200, forwardResponseHeaders(
+            cachedSubscription.headers,
+            getResponseContentType(cachedSubscription.headers)
+        ));
         res.end(cachedSubscription.body);
         return;
     }
@@ -2527,7 +2542,10 @@ const server = http.createServer(async (req, res) => {
                     runtimeStats.cache_fallback_total += 1;
                     if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
                     logger.warn('cache_fallback_by_status', { request_id: requestId, status: upstream.status, cache_kind: fallback.kind });
-                    res.writeHead(200, forwardResponseHeaders(fallback.item.headers, 'application/json; charset=utf-8'));
+                    res.writeHead(200, forwardResponseHeaders(
+                        fallback.item.headers,
+                        getResponseContentType(fallback.item.headers)
+                    ));
                     res.end(fallback.item.body);
                     return;
                 }
@@ -2540,10 +2558,79 @@ const server = http.createServer(async (req, res) => {
         const classified = classifyUpstreamPayload(upstream.body);
         if (classified.type === 'non_json') {
             runtimeStats.upstream_non_json_total += 1;
+            const runtime = getRuntimeConfig();
+            const excludedNodes = new Set([
+                ...buildQuarantineSet(),
+                ...buildProtectionSet(),
+            ]);
+            const mihomo = transformMihomoYaml(upstream.body, {
+                groups: GROUPS,
+                strategy: STRATEGY,
+                fastestEnabled: config.fastest_group !== false,
+                fastestName: config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME,
+                fastestExcludeGroups: FASTEST_EXCLUDE_GROUPS,
+                fastestFallbackGroups: FASTEST_FALLBACK_GROUPS,
+                expandGroupsToNodes: EXPAND_GROUPS_TO_NODES,
+                hiddenGroups: HIDDEN_GROUPS,
+                hiddenNodes: HIDDEN_NODES,
+                excludedNodes,
+                probeUrl: PROBE_URL,
+                fastestProbeUrl: runtime.fastestProbeUrl,
+                probeInterval: runtime.probeInterval,
+                probeTimeout: runtime.probeTimeout,
+            });
+
+            if (mihomo?.kind === 'empty') {
+                runtimeStats.all_nodes_unavailable_total += 1;
+                logger.error('mihomo_all_nodes_unavailable', {
+                    request_id: requestId,
+                    removed: mihomo.removed,
+                });
+                res.writeHead(503, {
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Retry-After': '30',
+                });
+                res.end(JSON.stringify({
+                    status: 'error',
+                    code: 'NO_HEALTHY_NODES',
+                    request_id: requestId,
+                }));
+                return;
+            }
+
+            if (mihomo?.kind === 'mihomo') {
+                runtimeStats.mihomo_transformed_total += 1;
+                circuitBreaker.recordSuccess();
+                lastUpstreamSuccessAt = Date.now();
+                lastUpstreamError = null;
+                const contentType = getResponseContentType(upstream.headers, 'text/yaml; charset=utf-8');
+                const cachedHeaders = sanitizeHeadersForCache(upstream.headers);
+                cachedHeaders['content-type'] = contentType;
+                if (cacheGeneration === subscriptionCacheGeneration) {
+                    subscriptionCache.set(cacheKey, mihomo.body, cachedHeaders);
+                } else {
+                    logger.info('subscription_cache_store_skipped_after_invalidation', {
+                        request_id: requestId,
+                        cache_generation: cacheGeneration,
+                        current_generation: subscriptionCacheGeneration,
+                    });
+                }
+                logger.info('mihomo_response_built', {
+                    request_id: requestId,
+                    ...mihomo.stats,
+                });
+                res.writeHead(200, forwardResponseHeaders(upstream.headers, contentType));
+                res.end(mihomo.body);
+                return;
+            }
+
             circuitBreaker.recordSuccess();
             lastUpstreamSuccessAt = Date.now();
             lastUpstreamError = null;
-            logger.info('upstream_non_json_passthrough', { request_id: requestId });
+            logger.info('upstream_non_json_passthrough', {
+                request_id: requestId,
+                reason: mihomo?.kind === 'fake' ? 'fake_mihomo_config' : (mihomo?.kind || 'unsupported_payload'),
+            });
             res.writeHead(200, forwardResponseHeaders(upstream.headers, upstream.headers['content-type'] || 'text/plain'));
             res.end(upstream.body);
             return;
@@ -2912,7 +2999,10 @@ const server = http.createServer(async (req, res) => {
             runtimeStats.cache_fallback_total += 1;
             if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
             logger.warn('cache_fallback_by_error', { request_id: requestId, cache_kind: fallback.kind });
-            res.writeHead(200, forwardResponseHeaders(fallback.item.headers, 'application/json; charset=utf-8'));
+            res.writeHead(200, forwardResponseHeaders(
+                fallback.item.headers,
+                getResponseContentType(fallback.item.headers)
+            ));
             res.end(fallback.item.body);
             return;
         }

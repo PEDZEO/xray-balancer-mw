@@ -4,7 +4,8 @@ WORKDIR /app
 
 # Копируем только код — config.json монтируется через volume
 COPY server.js .
-COPY package.json .
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts
 COPY lib ./lib
 RUN mkdir -p /app/runtime && chown -R node:node /app/runtime
 

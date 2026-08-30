@@ -13,19 +13,20 @@
 
 3. Upstream Layer
 - Subscription page / panel API.
-- Classified as `xray_json`, `fake_config`, or `non_json`.
+- JSON is classified as `xray_json` or `fake_config`; structured Mihomo YAML is detected inside the non-JSON branch.
 
 ## Request Flow
 1. Request enters middleware.
 2. `request-guard` decides allow/deny/fallback.
 3. If allowed, fetch upstream with profile-based timeout/redirects.
 4. Classify upstream payload.
-5. Apply node filtering: load stats and quarantine.
-6. Apply manual/automatic node protection and fail closed when no healthy outbound remains.
-7. Apply sticky fastest selection for the current token when enabled.
-8. Add an observed emergency fallback outbound to normal groups when enabled.
-9. Build grouped response (or passthrough).
-10. Update cache and runtime stats.
+5. For Mihomo YAML, build native fastest/country groups and rewrite proxy references.
+6. Apply node filtering: load stats and quarantine.
+7. Apply manual/automatic node protection and fail closed when no healthy outbound remains.
+8. Apply sticky fastest selection for the current token when enabled.
+9. Add an observed emergency fallback outbound to normal Xray groups when enabled.
+10. Build grouped response (or passthrough).
+11. Update cache and runtime stats while preserving the response format content type.
 
 ## Node Protection
 - States: `healthy`, `suspect`, `isolated`, `recovering`.

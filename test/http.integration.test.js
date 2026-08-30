@@ -8,6 +8,7 @@ const http = require('node:http');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
+const YAML = require('yaml');
 
 const repoRoot = path.join(__dirname, '..');
 
@@ -168,6 +169,30 @@ function validXrayPayload() {
     ]);
 }
 
+function validMihomoPayload() {
+    return YAML.stringify({
+        profile: { 'store-selected': true },
+        proxies: [
+            { name: '🇷🇺 Без VPN', type: 'direct' },
+            { name: 'Германия 🇩🇪', type: 'vless', server: 'de.example.com', port: 443 },
+            { name: 'Франция 🇫🇷', type: 'vless', server: 'fr.example.com', port: 443 },
+        ],
+        'proxy-groups': [
+            {
+                name: '🚫 Недоступные сайты',
+                type: 'select',
+                proxies: ['⚡ Авто-переключение', '🇷🇺 Без VPN', 'Германия 🇩🇪', 'Франция 🇫🇷'],
+            },
+            {
+                name: '⚡ Авто-переключение',
+                type: 'fallback',
+                proxies: ['Германия 🇩🇪', 'Франция 🇫🇷'],
+            },
+        ],
+        rules: ['MATCH,🚫 Недоступные сайты'],
+    });
+}
+
 function rawRequest(port, payload) {
     return new Promise((resolve, reject) => {
         const socket = net.connect({ host: '127.0.0.1', port }, () => socket.write(payload));
@@ -247,6 +272,50 @@ test('subscription endpoint uses single-flight fetch and fresh read-through cach
 
     const ready = await fetch(`${balancer.baseUrl}/ready`);
     assert.equal(ready.status, 200);
+});
+
+test('Mihomo YAML uses configured group names and preserves YAML content type in cache', async (t) => {
+    let upstreamHits = 0;
+    const upstream = http.createServer((req, res) => {
+        upstreamHits += 1;
+        res.writeHead(200, { 'Content-Type': 'text/yaml; charset=utf-8' });
+        res.end(validMihomoPayload());
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        strategy: 'leastPing',
+        fastest_group: true,
+        fastest_group_name: '🏁 Самые быстрые',
+        groups: {
+            '🇩🇪 Germany': ['Germany', 'Германия'],
+            '🇫🇷 France': ['France', 'Франция'],
+        },
+    });
+    const headers = { 'User-Agent': 'Mihomo/1.19.15' };
+
+    const first = await fetch(`${balancer.baseUrl}/mihomo-token`, { headers });
+    const firstDocument = YAML.parse(await first.text());
+    const firstGroups = new Map(firstDocument['proxy-groups'].map((group) => [group.name, group]));
+
+    assert.equal(first.status, 200);
+    assert.match(first.headers.get('content-type'), /^text\/yaml/);
+    assert.deepEqual(firstGroups.get('🚫 Недоступные сайты').proxies, [
+        '🏁 Самые быстрые',
+        '🇷🇺 Без VPN',
+        '🇩🇪 Germany',
+        '🇫🇷 France',
+    ]);
+    assert.equal(firstGroups.get('🏁 Самые быстрые').type, 'url-test');
+    assert.equal(firstGroups.has('⚡ Авто-переключение'), false);
+
+    const cached = await fetch(`${balancer.baseUrl}/mihomo-token`, { headers });
+    assert.equal(cached.status, 200);
+    assert.match(cached.headers.get('content-type'), /^text\/yaml/);
+    assert.equal(YAML.parse(await cached.text())['proxy-groups'][0].name, '🚫 Недоступные сайты');
+    assert.equal(upstreamHits, 1);
 });
 
 test('subscription cache and single-flight are isolated by client variant headers', async (t) => {
