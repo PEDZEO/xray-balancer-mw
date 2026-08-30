@@ -155,3 +155,27 @@ test('short country patterns do not classify unrelated .ru server hostnames', ()
         server: 'noda.example.ru',
     }), '🇩🇪 Germany');
 });
+
+test('cleartext XHTTP on port 80 uses HTTP/1.1 without overriding explicit ALPN', () => {
+    const body = YAML.stringify({
+        proxies: [
+            { name: 'CDN', type: 'vless', server: 'cdn.example.com', port: 80, network: 'xhttp' },
+            { name: 'Explicit H2', type: 'vless', server: 'h2.example.com', port: 80, network: 'xhttp', alpn: ['h2'] },
+            { name: 'TLS XHTTP', type: 'vless', server: 'tls.example.com', port: 443, network: 'xhttp', tls: true },
+            { name: 'Plain TCP', type: 'vless', server: 'tcp.example.com', port: 80, network: 'tcp' },
+        ],
+        'proxy-groups': [
+            { name: 'PROXY', type: 'select', proxies: ['CDN', 'Explicit H2', 'TLS XHTTP', 'Plain TCP'] },
+        ],
+    });
+
+    const result = transformMihomoYaml(body, transformOptions({ groups: {} }));
+    const document = YAML.parse(result.body);
+    const proxies = new Map(document.proxies.map((proxy) => [proxy.name, proxy]));
+
+    assert.deepEqual(proxies.get('CDN').alpn, ['http/1.1']);
+    assert.deepEqual(proxies.get('Explicit H2').alpn, ['h2']);
+    assert.equal(proxies.get('TLS XHTTP').alpn, undefined);
+    assert.equal(proxies.get('Plain TCP').alpn, undefined);
+    assert.equal(result.stats.compatibilityFixes, 1);
+});
