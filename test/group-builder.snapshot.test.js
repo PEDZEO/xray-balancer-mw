@@ -29,7 +29,7 @@ test('buildGroupConfig output matches snapshot fixture', () => {
     assert.deepEqual(out, expected);
 });
 
-test('buildGroupConfig exposes a real node first and keeps loopback routing for the fallback pool', () => {
+test('buildGroupConfig exposes a Happ-compatible proxy outbound and preserves the fallback pool', () => {
     const base = {
         inbounds: [
             { tag: 'socks', port: 10808, protocol: 'socks' },
@@ -48,13 +48,9 @@ test('buildGroupConfig exposes a real node first and keeps loopback routing for 
     });
 
     assert.deepEqual(out.inbounds.map((inbound) => inbound.port), [10808, 10809]);
-    assert.equal(out.outbounds[0].tag, '__xrb_01__:Main-1');
+    assert.equal(out.outbounds[0].tag, 'proxy');
     assert.equal(out.outbounds[0].protocol, 'vless');
-    assert.deepEqual(out.outbounds[1], {
-        tag: 'proxy',
-        protocol: 'loopback',
-        settings: { inboundTag: '_Fastest-proxy-in' },
-    });
+    assert.equal(out.outbounds[1].tag, '__xrb_01__:Main-1');
     assert.deepEqual(out.burstObservatory.subjectSelector, [
         '__xrb_01__:Main-1',
         '__xrb_02__:LTE-1',
@@ -77,11 +73,6 @@ test('buildGroupConfig exposes a real node first and keeps loopback routing for 
         },
     );
     assert.deepEqual(out.routing.rules[0], {
-        type: 'field',
-        inboundTag: ['_Fastest-proxy-in'],
-        balancerTag: '_Fastest-balancer',
-    });
-    assert.deepEqual(out.routing.rules[1], {
         type: 'field',
         inboundTag: ['_Fastest-fallback-in'],
         balancerTag: '_Fastest-fallback-balancer',
@@ -118,10 +109,9 @@ test('buildGroupConfig preserves panel routing rules and remaps proxy to the gen
 
     assert.equal(out.routing.domainStrategy, 'AsIs');
     assert.equal(out.routing.domainMatcher, 'hybrid');
-    assert.deepEqual(out.outbounds[1], {
+    assert.deepEqual(out.outbounds[0], {
         tag: 'proxy',
-        protocol: 'loopback',
-        settings: { inboundTag: 'Europe-proxy-in' },
+        protocol: 'vless',
     });
     assert.deepEqual(out.outbounds.find((outbound) => outbound.tag === 'direct').settings, {
         domainStrategy: 'UseIPv4',
@@ -154,7 +144,7 @@ test('buildGroupConfig emits prefix-safe node selectors and keeps system tags re
     }
     assert.equal(out.outbounds.find((item) => item.tag === 'direct').protocol, 'freedom');
     assert.equal(out.outbounds.find((item) => item.tag === 'block').protocol, 'blackhole');
-    assert.equal(out.outbounds.find((item) => item.tag === 'proxy').protocol, 'loopback');
+    assert.equal(out.outbounds.find((item) => item.tag === 'proxy').protocol, 'vless');
 });
 
 test('buildGroupConfig moves a panel catch-all behind specialized routing rules', () => {
@@ -320,6 +310,7 @@ test('every observed balancer fallback resolves to a safe outbound', () => {
                 assert.equal(balancerTags.has(balancer.fallbackTag), false, 'fallbackTag must not resolve to a balancer');
                 assert.notEqual(balancer.fallbackTag, 'direct', 'fallback must not leak traffic directly');
                 assert.notEqual(balancer.fallbackTag, 'block', 'fallback must not silently block traffic');
+                assert.notEqual(balancer.fallbackTag, out.outbounds[0].tag, 'fallback must resolve explicitly');
                 assert.notEqual(outboundsByTag.get(balancer.fallbackTag).protocol, 'freedom');
                 assert.notEqual(outboundsByTag.get(balancer.fallbackTag).protocol, 'blackhole');
             }
@@ -369,9 +360,9 @@ test('buildGroupConfig does not inherit per-server title/description fields from
     assert.equal(out.serverDescription, undefined);
     assert.equal(out.server_description, undefined);
     assert.deepEqual(out.extraField, { x: 1 });
-    assert.equal(out.outbounds[0].tag, '__xrb_01__:Germany-1');
+    assert.equal(out.outbounds[0].tag, 'proxy');
     assert.equal(out.outbounds[0].title, 'Germany-1 Title');
-    assert.equal(out.outbounds[1].tag, 'proxy');
+    assert.equal(out.outbounds[1].tag, '__xrb_01__:Germany-1');
 });
 
 test('buildGroupConfig applies custom groupDescription when provided in options', () => {

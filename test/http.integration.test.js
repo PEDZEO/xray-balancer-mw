@@ -754,15 +754,16 @@ test('generated Xray groups preserve merged panel routing and DNS policy', async
     assert.equal(europe.routing.balancers[0].selector.includes('route-again'), false);
     assert.ok(europe.outbounds.some((outbound) => outbound.tag === 'route-again' && outbound.protocol === 'loopback'));
     assert.deepEqual(europe.outbounds[0], {
-        tag: '__xrb_01__:Germany',
+        tag: 'proxy',
         protocol: 'vless',
         settings: { vnext: [{ address: 'de.example.com', port: 443 }] },
         serverDescription: 'XHTTP server description',
     });
     assert.deepEqual(europe.outbounds[1], {
-        tag: 'proxy',
-        protocol: 'loopback',
-        settings: { inboundTag: 'Europe-proxy-in' },
+        tag: '__xrb_01__:Germany',
+        protocol: 'vless',
+        settings: { vnext: [{ address: 'de.example.com', port: 443 }] },
+        serverDescription: 'XHTTP server description',
     });
     assert.equal(europe.serverDescription, undefined);
 });
