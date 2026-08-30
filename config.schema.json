@@ -141,8 +141,19 @@
       "additionalProperties": {
         "type": "array",
         "items": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "minItems": 1,
+        "minItems": 0,
         "maxItems": 100
+      }
+    },
+    "group_hosts": {
+      "type": "object",
+      "maxProperties": 100,
+      "propertyNames": { "type": "string", "minLength": 1, "maxLength": 64 },
+      "additionalProperties": {
+        "type": "array",
+        "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "maxItems": 500,
+        "uniqueItems": true
       }
     }
   }

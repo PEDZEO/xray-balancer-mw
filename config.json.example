@@ -86,5 +86,8 @@
         "🇩🇪 Germany": ["German"],
         "🇳🇱 Netherlands": ["Netherlands"],
         "📱 LTE Reserve": ["MOBILE-RESERVE"]
+    },
+    "group_hosts": {
+        "🇩🇪 Germany": ["replace-with-panel-host-uuid"]
     }
 }

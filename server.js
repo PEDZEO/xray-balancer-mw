@@ -29,6 +29,7 @@ const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json
 const CONFIG_RUNTIME_PATH = process.env.CONFIG_RUNTIME_PATH || '';
 const MUTABLE_CONFIG_KEYS = [
     'groups',
+    'group_hosts',
     'strategy',
     'fastest_group',
     'fastest_group_name',
@@ -106,9 +107,12 @@ const SUB_PAGE_URL = process.env.SUB_PAGE_URL || config.sub_page_url || '';
 const SUB_DOMAIN = process.env.SUB_DOMAIN || config.sub_domain || '';
 
 let GROUPS = config.groups || {};
+let GROUP_HOSTS = config.group_hosts || {};
 
 const AUTO_GROUPS = config.auto_groups === true;
 const AUTO_GROUPS_INTERVAL = (config.auto_groups_interval_sec || 300) * 1000;
+const HOST_CATALOG_REFRESH_INTERVAL = 60 * 1000;
+const HOST_CATALOG_TTL = 30 * 1000;
 
 let STRATEGY = normalizeStrategy(config.strategy) || 'leastLoad';
 const PROBE_URL = config.probe_url || 'https://www.gstatic.com/generate_204';
@@ -202,6 +206,12 @@ function panelHeaders() {
 
 // Кэш статистики нод: { "Finland2": { usersOnline: 9, totalRamGb: 2.06, cpuCount: 1, ramLoad: 4.37, cpuLoad: 9, load: 0.23 }, ... }
 let nodeStatsCache = {};
+let hostCatalogCache = [];
+let rawHostCatalogCache = [];
+let lastHostCatalogRefreshAt = 0;
+let lastHostCatalogAttemptAt = 0;
+let lastHostCatalogError = null;
+let hostCatalogRefreshInFlight = null;
 let lastUpstreamSuccessAt = 0;
 let lastUpstreamError = null;
 let lastNodeStatsRefreshAt = 0;
@@ -364,6 +374,7 @@ function applyMutableRuntimeConfig(nextConfig) {
     config = nextConfig;
     STRATEGY = normalizeStrategy(nextConfig.strategy) || 'leastLoad';
     GROUPS = nextConfig.groups || {};
+    GROUP_HOSTS = nextConfig.group_hosts || {};
     const runtime = getRuntimeConfig();
     FASTEST_EXCLUDE_GROUPS = runtime.fastestExcludeGroups;
     FASTEST_FALLBACK_GROUPS = runtime.fastestFallbackGroups;
@@ -1350,15 +1361,97 @@ async function fetchHostsFromApi() {
         if (!hosts) return { ok: false, error: 'Panel API response does not contain hosts', hosts: null };
         return { ok: true, error: null, hosts };
     } catch (err) {
-        console.error('[auto-groups] Ошибка:', err.message);
+        console.error('[host-catalog] Ошибка:', err.message);
         return { ok: false, error: err.message, hosts: null };
     }
+}
+
+function updateHostCatalog(hosts, requestId = 'host-catalog') {
+    const nextCatalog = buildAdminHostCatalog(hosts);
+    const previousBindingState = JSON.stringify(hostCatalogCache.map(({ uuid, remark }) => ({ uuid, remark })));
+    const nextBindingState = JSON.stringify(nextCatalog.map(({ uuid, remark }) => ({ uuid, remark })));
+    const changed = previousBindingState !== nextBindingState;
+
+    hostCatalogCache = nextCatalog;
+    lastHostCatalogRefreshAt = Date.now();
+    lastHostCatalogError = null;
+    if (changed) {
+        clearSubscriptionCache('host_catalog_changed', requestId);
+    }
+    return { changed, hosts: hostCatalogCache };
+}
+
+async function refreshHostCatalog(opts = {}) {
+    if (!API_TOKEN) return { ok: false, error: 'API token is missing', hosts: hostCatalogCache };
+    const fresh = lastHostCatalogRefreshAt > 0
+        && (Date.now() - lastHostCatalogRefreshAt) < HOST_CATALOG_TTL;
+    if (opts.force !== true && fresh) {
+        return { ok: true, error: null, hosts: hostCatalogCache, rawHosts: rawHostCatalogCache, cached: true };
+    }
+    const recentlyAttempted = lastHostCatalogAttemptAt > 0
+        && (Date.now() - lastHostCatalogAttemptAt) < HOST_CATALOG_TTL;
+    if (opts.force !== true && recentlyAttempted) {
+        return {
+            ok: hostCatalogCache.length > 0,
+            error: lastHostCatalogError,
+            hosts: hostCatalogCache,
+            rawHosts: rawHostCatalogCache,
+            cached: true,
+            stale: true,
+        };
+    }
+    if (hostCatalogRefreshInFlight) return hostCatalogRefreshInFlight;
+
+    hostCatalogRefreshInFlight = (async () => {
+        lastHostCatalogAttemptAt = Date.now();
+        const result = await fetchHostsFromApi();
+        if (!result.ok || !result.hosts) {
+            lastHostCatalogError = result.error || 'Failed to fetch hosts';
+            return {
+                ok: false,
+                error: lastHostCatalogError,
+                hosts: hostCatalogCache,
+                rawHosts: rawHostCatalogCache,
+            };
+        }
+        rawHostCatalogCache = result.hosts;
+        const updated = updateHostCatalog(result.hosts, opts.requestId);
+        return {
+            ok: true,
+            error: null,
+            hosts: updated.hosts,
+            rawHosts: rawHostCatalogCache,
+            changed: updated.changed,
+        };
+    })().finally(() => {
+        hostCatalogRefreshInFlight = null;
+    });
+    return hostCatalogRefreshInFlight;
+}
+
+function resolveConfiguredGroups(groups, groupHosts, hosts) {
+    const hostsById = new Map(hosts.map((host) => [host.uuid, host]));
+    return Object.fromEntries(Object.entries(groups).map(([groupName, patterns]) => {
+        const resolvedPatterns = [...patterns];
+        const seen = new Set(resolvedPatterns.map((pattern) => pattern.trim().toLowerCase()));
+        for (const hostId of groupHosts[groupName] || []) {
+            const remark = hostsById.get(hostId)?.remark?.trim();
+            if (!remark || seen.has(remark.toLowerCase())) continue;
+            resolvedPatterns.push(remark);
+            seen.add(remark.toLowerCase());
+        }
+        return [groupName, resolvedPatterns];
+    }));
+}
+
+function getEffectiveGroups() {
+    return resolveConfiguredGroups(GROUPS, GROUP_HOSTS, hostCatalogCache);
 }
 
 function buildGroupsFromHosts(hosts) {
     const groups = {};
     const seen = new Set();
-    for (const host of hosts.filter(h => !h.isDisabled)) {
+    for (const host of hosts.filter(h => !h.isDisabled && !h.is_disabled)) {
         const remark = host.remark || host.tag || host.address || '';
         const detected = detectCountryFromRemark(remark);
         if (detected && !seen.has(detected.country)) {
@@ -1370,9 +1463,9 @@ function buildGroupsFromHosts(hosts) {
 }
 
 async function refreshGroups(opts = {}) {
-    const hostsResult = await fetchHostsFromApi();
-    if (!hostsResult.ok || !hostsResult.hosts) return { ok: false, error: hostsResult.error || 'Failed to fetch hosts' };
-    const hosts = hostsResult.hosts;
+    const hostsResult = await refreshHostCatalog({ force: true, requestId: opts.requestId || 'refresh-groups' });
+    if (!hostsResult.ok || !hostsResult.rawHosts) return { ok: false, error: hostsResult.error || 'Failed to fetch hosts' };
+    const hosts = hostsResult.rawHosts;
     const newGroups = buildGroupsFromHosts(hosts);
     if (Object.keys(newGroups).length === 0) return { ok: false, error: 'No groups detected from enabled hosts' };
     if (opts.persist === true) {
@@ -1504,16 +1597,17 @@ function applyNoStoreHeaders(res) {
 
 function buildAdminHostCatalog(hosts) {
     return hosts
-        .map((host, index) => {
+        .map((host) => {
+            const uuid = String(host?.uuid || host?.id || '').trim();
             const remark = String(host?.remark || host?.tag || host?.address || '').trim();
-            if (!remark) return null;
+            if (!uuid || !remark) return null;
 
             return {
-                uuid: String(host?.uuid || host?.id || `host-${index}`),
+                uuid,
                 remark,
                 address: String(host?.address || '').trim(),
                 port: Number.isFinite(Number(host?.port)) ? Number(host.port) : null,
-                is_disabled: host?.isDisabled === true,
+                is_disabled: host?.isDisabled === true || host?.is_disabled === true,
             };
         })
         .filter(Boolean)
@@ -1766,6 +1860,18 @@ function setNonOverlappingInterval(taskName, task, intervalMs) {
 function scheduleStartupTasks() {
     setNonOverlappingInterval('expire_protection_nodes', () => expireProtectionNodes(), 30000);
 
+    if (API_TOKEN) {
+        runManagedBackgroundTask('initial_refresh_host_catalog', () => refreshHostCatalog({ force: true })).finally(() => {
+            if (!shuttingDown) {
+                setNonOverlappingInterval(
+                    'refresh_host_catalog',
+                    () => refreshHostCatalog({ force: true }),
+                    HOST_CATALOG_REFRESH_INTERVAL,
+                );
+            }
+        });
+    }
+
     if (AUTO_GROUPS && API_TOKEN) {
         runManagedBackgroundTask('initial_refresh_groups', () => refreshGroups()).finally(() => {
             if (!shuttingDown) {
@@ -1836,8 +1942,8 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
-        const hostsResult = await fetchHostsFromApi();
-        if (!hostsResult.ok || !hostsResult.hosts) {
+        const hostsResult = await refreshHostCatalog({ force: true, requestId });
+        if (!hostsResult.ok) {
             res.writeHead(502, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
                 status: 'error',
@@ -1848,7 +1954,7 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
-        const hosts = buildAdminHostCatalog(hostsResult.hosts);
+        const hosts = hostsResult.hosts;
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
             status: 'ok',
@@ -1872,6 +1978,7 @@ const server = http.createServer(async (req, res) => {
                 status: 'ok',
                 request_id: requestId,
                 groups: GROUPS,
+                group_hosts: GROUP_HOSTS,
                 strategy: STRATEGY,
                 fastest_group: config.fastest_group !== false,
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
@@ -1940,7 +2047,15 @@ const server = http.createServer(async (req, res) => {
 
             const mutationResult = await mutateRuntimeConfig(requestId, (currentConfig) => {
                 const nextConfig = { ...currentConfig };
-                if (incomingGroups !== undefined) nextConfig.groups = incomingGroups;
+                if (incomingGroups !== undefined) {
+                    nextConfig.groups = incomingGroups;
+                    if (payload.group_hosts === undefined) {
+                        nextConfig.group_hosts = Object.fromEntries(
+                            Object.entries(currentConfig.group_hosts || {})
+                                .filter(([groupName]) => Object.prototype.hasOwnProperty.call(incomingGroups, groupName)),
+                        );
+                    }
+                }
                 if (incomingExclude !== undefined) nextConfig.fastest_exclude_groups = incomingExclude;
                 if (incomingFastestFallback !== undefined) nextConfig.fastest_fallback = incomingFastestFallback;
                 if (incomingNodeStatsExclude !== undefined) nextConfig.node_stats_exclude = incomingNodeStatsExclude;
@@ -1986,6 +2101,7 @@ const server = http.createServer(async (req, res) => {
                 status: 'ok',
                 request_id: requestId,
                 groups: GROUPS,
+                group_hosts: GROUP_HOSTS,
                 strategy: STRATEGY,
                 fastest_group: config.fastest_group !== false,
                 fastest_group_name: (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME),
@@ -2505,7 +2621,6 @@ const server = http.createServer(async (req, res) => {
 
     const forwardHeaders = buildForwardHeaders(req, clientIp);
     const cacheKey = buildSubscriptionCacheKey(token, forwardHeaders);
-    const cacheGeneration = subscriptionCacheGeneration;
     const safePath = redactTokenPath(pathname);
     runtimeStats.requests_total += 1;
     const guardDecision = requestGuard.evaluate(clientIp, token);
@@ -2536,6 +2651,11 @@ const server = http.createServer(async (req, res) => {
         return;
     }
     logger.info('request_start', { request_id: requestId, method: req.method, path: safePath, ip: clientIp });
+
+    if (Object.values(GROUP_HOSTS).some((hostIds) => Array.isArray(hostIds) && hostIds.length > 0)) {
+        await refreshHostCatalog({ requestId });
+    }
+    const cacheGeneration = subscriptionCacheGeneration;
 
     const cachedSubscription = subscriptionCache.get(cacheKey);
     if (cachedSubscription) {
@@ -2610,6 +2730,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         const classified = classifyUpstreamPayload(upstream.body);
+        const effectiveGroups = getEffectiveGroups();
         if (classified.type === 'non_json') {
             runtimeStats.upstream_non_json_total += 1;
             const runtime = getRuntimeConfig();
@@ -2618,7 +2739,7 @@ const server = http.createServer(async (req, res) => {
                 ...buildProtectionSet(),
             ]);
             const mihomo = transformMihomoYaml(upstream.body, {
-                groups: GROUPS,
+                groups: effectiveGroups,
                 strategy: STRATEGY,
                 fastestEnabled: config.fastest_group !== false,
                 fastestName: config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME,
@@ -2734,7 +2855,7 @@ const server = http.createServer(async (req, res) => {
             const statsEligible = [];
             const statsExcluded = [];
             for (const outbound of allOutbounds) {
-                const groupName = matchGroup(GROUPS, outbound.tag);
+                const groupName = matchGroup(effectiveGroups, outbound.tag);
                 if (groupName && excludedGroupSet.has(normalizeNodeName(groupName))) {
                     statsExcluded.push(outbound);
                 } else {
@@ -2800,7 +2921,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         const beforeHiddenFilter = allOutbounds.length;
-        allOutbounds = filterHiddenOutbounds(allOutbounds, GROUPS, HIDDEN_GROUPS, HIDDEN_NODES);
+        allOutbounds = filterHiddenOutbounds(allOutbounds, effectiveGroups, HIDDEN_GROUPS, HIDDEN_NODES);
         const hiddenRemoved = beforeHiddenFilter - allOutbounds.length;
         if (hiddenRemoved > 0) {
             logger.info('outbounds_hidden_by_config', {
@@ -2834,7 +2955,7 @@ const server = http.createServer(async (req, res) => {
         // ─── Группируем ───
         const grouped = {};
         const ungrouped = [];
-        const configuredGroupOrder = Object.keys(GROUPS);
+        const configuredGroupOrder = Object.keys(effectiveGroups);
 
         // Preserve explicit admin order even if some groups are empty.
         for (const groupName of configuredGroupOrder) {
@@ -2842,7 +2963,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         for (const ob of allOutbounds) {
-            const group = matchGroup(GROUPS, ob.tag);
+            const group = matchGroup(effectiveGroups, ob.tag);
             if (group) {
                 if (!grouped[group]) grouped[group] = [];
                 grouped[group].push(ob);

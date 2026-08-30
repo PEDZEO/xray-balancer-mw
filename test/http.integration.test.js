@@ -487,6 +487,8 @@ test('admin endpoints enforce explicit method allow lists', async (t) => {
         { API_TOKEN: 'integration-api-token' }
     );
     const headers = { 'X-Admin-Token': 'integration-admin-token' };
+    await waitFor(() => hostRequests >= 1);
+    const hostRequestsBeforeInvalidMethod = hostRequests;
 
     const refreshGet = await fetch(`${balancer.baseUrl}/admin/refresh-groups`, { headers });
     const refreshGetBody = await refreshGet.json();
@@ -494,7 +496,7 @@ test('admin endpoints enforce explicit method allow lists', async (t) => {
     assert.equal(refreshGet.status, 405);
     assert.equal(refreshGet.headers.get('allow'), 'POST');
     assert.equal(refreshGetBody.code, 'METHOD_NOT_ALLOWED');
-    assert.equal(hostRequests, 0);
+    assert.equal(hostRequests, hostRequestsBeforeInvalidMethod);
 
     const debugPost = await fetch(`${balancer.baseUrl}/admin/debug/stats`, {
         method: 'POST',
@@ -514,7 +516,7 @@ test('admin endpoints enforce explicit method allow lists', async (t) => {
 
     assert.equal(refreshPost.status, 200);
     assert.equal(refreshPostBody.status, 'ok');
-    assert.equal(hostRequests, 1);
+    assert.equal(hostRequests, hostRequestsBeforeInvalidMethod + 1);
 });
 
 test('admin hosts returns a sanitized panel host catalog', async (t) => {
@@ -587,6 +589,76 @@ test('admin hosts returns a sanitized panel host catalog', async (t) => {
     });
     assert.equal(methodResponse.status, 405);
     assert.equal(methodResponse.headers.get('allow'), 'GET');
+});
+
+test('host UUID binding survives a panel host rename and refreshes the admin display name', async (t) => {
+    let hostRemark = 'Germany Old';
+    let upstreamHits = 0;
+    const panel = http.createServer((req, res) => {
+        if (req.url !== '/api/hosts/') {
+            res.writeHead(404);
+            res.end();
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            response: [{
+                uuid: 'stable-host-uuid',
+                remark: hostRemark,
+                address: 'de.example.com',
+                port: 443,
+                isDisabled: false,
+            }],
+        }));
+    });
+    const upstream = http.createServer((req, res) => {
+        upstreamHits += 1;
+        res.writeHead(200, { 'Content-Type': 'text/yaml; charset=utf-8' });
+        res.end(YAML.stringify({
+            proxies: [
+                { name: 'Direct', type: 'direct' },
+                { name: hostRemark, type: 'vless', server: 'de.example.com', port: 443 },
+            ],
+            'proxy-groups': [{ name: 'Main', type: 'select', proxies: ['Direct', hostRemark] }],
+            rules: ['MATCH,Main'],
+        }));
+    });
+    const panelPort = await listenOnRandomPort(panel);
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => Promise.all([closeServer(panel), closeServer(upstream)]));
+
+    const balancer = await startBalancer(
+        t,
+        {
+            upstreamPort,
+            remnawave_url: `http://127.0.0.1:${panelPort}`,
+            groups: { Europe: [] },
+            group_hosts: { Europe: ['stable-host-uuid'] },
+            fastest_group: false,
+        },
+        { API_TOKEN: 'integration-api-token' },
+    );
+    const adminHeaders = { 'X-Admin-Token': 'integration-admin-token' };
+    await fetch(`${balancer.baseUrl}/admin/hosts`, { headers: adminHeaders });
+
+    const first = YAML.parse(await (await fetch(`${balancer.baseUrl}/rename-token`, {
+        headers: { 'User-Agent': 'Mihomo/1.19.15' },
+    })).text());
+    assert.deepEqual(first['proxy-groups'].find((group) => group.name === 'Europe').proxies, ['Europe · 1']);
+
+    hostRemark = 'Germany New';
+    const refreshedHosts = await (await fetch(`${balancer.baseUrl}/admin/hosts`, { headers: adminHeaders })).json();
+    assert.equal(refreshedHosts.hosts[0].uuid, 'stable-host-uuid');
+    assert.equal(refreshedHosts.hosts[0].remark, 'Germany New');
+
+    const second = YAML.parse(await (await fetch(`${balancer.baseUrl}/rename-token`, {
+        headers: { 'User-Agent': 'Mihomo/1.19.15' },
+    })).text());
+    assert.deepEqual(second['proxy-groups'].find((group) => group.name === 'Europe').proxies, ['Europe · 1']);
+    assert.equal(upstreamHits, 2);
+
+    const groups = await (await fetch(`${balancer.baseUrl}/admin/groups`, { headers: adminHeaders })).json();
+    assert.deepEqual(groups.group_hosts, { Europe: ['stable-host-uuid'] });
 });
 
 test('admin groups update invalidates subscription cache immediately', async (t) => {
