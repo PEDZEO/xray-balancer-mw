@@ -86,7 +86,14 @@ try {
         if (runtimePatchRaw.trim()) {
             const runtimePatch = JSON.parse(runtimePatchRaw);
             if (runtimePatch && typeof runtimePatch === 'object' && !Array.isArray(runtimePatch)) {
-                config = { ...config, ...runtimePatch };
+                const mutablePatch = Object.fromEntries(
+                    Object.entries(runtimePatch).filter(([key]) => MUTABLE_CONFIG_KEYS.includes(key))
+                );
+                const ignoredKeys = Object.keys(runtimePatch).filter((key) => !MUTABLE_CONFIG_KEYS.includes(key));
+                if (ignoredKeys.length > 0) {
+                    console.warn(`[config] Ignored immutable runtime keys: ${ignoredKeys.join(', ')}`);
+                }
+                config = { ...config, ...mutablePatch };
             }
         }
     }
@@ -173,6 +180,7 @@ const ADMIN_RATE_LIMIT_BURST_10S = parseInt(process.env.ADMIN_RATE_LIMIT_BURST_1
 const READY_SUCCESS_WINDOW_SEC = pickRuntimeInt('READY_SUCCESS_WINDOW_SEC', 'ready_success_window_sec');
 const REQUEST_TIMEOUT_MS = pickRuntimeInt('REQUEST_TIMEOUT_MS', 'request_timeout_ms');
 const MAX_REDIRECTS = pickRuntimeInt('MAX_REDIRECTS', 'max_redirects');
+const SOCKET_RETRY_BACKOFF_MS = 100;
 const CIRCUIT_BREAKER_FAILURES = pickRuntimeInt('CIRCUIT_BREAKER_FAILURES', 'circuit_breaker_failures');
 const CIRCUIT_BREAKER_OPEN_SEC = pickRuntimeInt('CIRCUIT_BREAKER_OPEN_SEC', 'circuit_breaker_open_sec');
 let GROUP_DESCRIPTIONS = {};
@@ -336,7 +344,8 @@ function ensureNodeProtectionManager() {
     }
 
     for (const seed of seeds.values()) {
-        if (!seed.node || !Number.isFinite(seed.expiresAt) || seed.expiresAt <= now) continue;
+        if (!seed.node || !Number.isFinite(seed.expiresAt)) continue;
+        if (seed.mode !== 'automatic' && seed.expiresAt <= now) continue;
         const details = {
             reason: seed.reason,
             source: seed.source,
@@ -454,7 +463,12 @@ function applyStickySelection(token, scope, outbounds, runtime, currentStickySto
 function isSocketHangupError(err) {
     const msg = String(err && err.message ? err.message : err || '');
     const code = String(err && err.code ? err.code : '');
-    return /socket hang up|ECONNRESET|EPIPE|EOF/i.test(msg) || /ECONNRESET|EPIPE/i.test(code);
+    return /socket hang up|ECONNRESET|EPIPE|EOF|aborted|premature close/i.test(msg)
+        || /ECONNRESET|EPIPE|ERR_STREAM_PREMATURE_CLOSE/i.test(code);
+}
+
+function isTimeoutError(err) {
+    return String(err && err.code ? err.code : '') === 'ETIMEDOUT';
 }
 
 function createTimeoutError() {
@@ -495,6 +509,14 @@ function fetchUrl(targetUrl, headers = {}, maxRedirects = MAX_REDIRECTS, deadlin
 
         req = mod.request(opts, (res) => {
             res.on('error', fail);
+            const failIncompleteResponse = () => {
+                if (res.complete) return;
+                const err = new Error('Upstream response aborted');
+                err.code = 'ECONNRESET';
+                fail(err);
+            };
+            res.on('aborted', failIncompleteResponse);
+            res.on('close', failIncompleteResponse);
             if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307) && res.headers.location) {
                 res.resume();
                 if (maxRedirects <= 0) {
@@ -550,6 +572,11 @@ async function fetchUrlWithSocketRetry(targetUrl, headers, requestId) {
             throw err;
         }
         logger.warn('upstream_retry_after_socket_hangup', { request_id: requestId, message: err.message });
+        const remainingMs = deadlineAt - Date.now();
+        if (remainingMs <= SOCKET_RETRY_BACKOFF_MS) {
+            throw createTimeoutError();
+        }
+        await new Promise((resolve) => setTimeout(resolve, SOCKET_RETRY_BACKOFF_MS));
         return fetchUrl(targetUrl, headers, MAX_REDIRECTS, deadlineAt);
     }
 }
@@ -687,7 +714,7 @@ function writeConfigFile(nextConfig) {
     }
 
     const tempPath = `${targetPath}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-    fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2));
+    fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2), { mode: 0o600 });
     fs.renameSync(tempPath, targetPath);
 }
 
@@ -781,7 +808,7 @@ async function upsertQuarantineNode(nodeName, requestId, opts = {}) {
         const existing = new Set(currentNodes.map(normalizeNodeName));
         if (existing.has(normalized)) return { changed: false };
 
-        if (currentNodes.length >= runtime.autoQuarantineMaxNodes) {
+        if (opts.auto === true && currentAutoNodes.length >= runtime.autoQuarantineMaxNodes) {
             return {
                 changed: false,
                 nextConfig: null,
@@ -905,6 +932,9 @@ async function syncProtectionTransitions(events, requestId) {
             request_id: requestId,
             error: result.error,
         });
+        nodeProtectionManager = null;
+        nodeProtectionManagerConfig = null;
+        ensureNodeProtectionManager();
     }
     return { changed: true, persisted: result.persisted, error: result.error };
 }
@@ -1065,16 +1095,21 @@ function readJsonBody(req, maxBytes = 512 * 1024) {
     return new Promise((resolve, reject) => {
         let raw = '';
         let size = 0;
+        let rejected = false;
         req.on('data', (chunk) => {
+            if (rejected) return;
             size += chunk.length;
             if (size > maxBytes) {
-                reject(new Error('Payload too large'));
-                req.destroy();
+                rejected = true;
+                const err = new Error('Payload too large');
+                err.code = 'PAYLOAD_TOO_LARGE';
+                reject(err);
                 return;
             }
             raw += chunk;
         });
         req.on('end', () => {
+            if (rejected) return;
             if (!raw.trim()) {
                 resolve({});
                 return;
@@ -1087,6 +1122,12 @@ function readJsonBody(req, maxBytes = 512 * 1024) {
         });
         req.on('error', reject);
     });
+}
+
+function adminBodyErrorStatus(err) {
+    if (err?.code === 'PAYLOAD_TOO_LARGE') return 413;
+    if (err?.message === 'Invalid JSON body') return 400;
+    return 422;
 }
 
 // ─── Парсинг RAM ───
@@ -1460,6 +1501,17 @@ function resolveConfiguredGroups(groups, groupHosts, hosts) {
     }));
 }
 
+function findUnresolvedGroupHostIds(groupHosts, hosts) {
+    const knownIds = new Set(hosts.map((host) => host.uuid));
+    const unresolved = [];
+    for (const [groupName, hostIds] of Object.entries(groupHosts || {})) {
+        for (const hostId of hostIds || []) {
+            if (!knownIds.has(hostId)) unresolved.push({ groupName, hostId });
+        }
+    }
+    return unresolved;
+}
+
 function getEffectiveGroups() {
     return resolveConfiguredGroups(GROUPS, GROUP_HOSTS, hostCatalogCache);
 }
@@ -1513,40 +1565,61 @@ async function refreshGroups(opts = {}) {
 // ─── Собрать все прокси-outbound'ы из XRAY-JSON массива ───
 
 function collectAllProxyOutbounds(configArray) {
-    const systemProtocols = new Set(['freedom', 'blackhole', 'dns']);
+    const systemProtocols = new Set(['freedom', 'blackhole', 'dns', 'loopback']);
     const allOutbounds = [];
-    const seenTags = new Set();
+    const seenTags = new Set(['proxy', 'direct', 'block']);
+
+    for (const cfg of configArray) {
+        for (const outbound of cfg.outbounds || []) {
+            if (outbound?.tag && systemProtocols.has(outbound.protocol)) {
+                seenTags.add(outbound.tag);
+            }
+        }
+    }
 
     for (let i = 0; i < configArray.length; i++) {
         const cfg = configArray[i];
-        const outbounds = cfg.outbounds || [];
+        const outbounds = (cfg.outbounds || []).filter((outbound) => (
+            outbound?.tag && !systemProtocols.has(outbound.protocol)
+        ));
         const remarks = cfg.remarks || `connection-${i}`;
+        const tagMap = new Map();
+        const assignedTags = [];
 
-        for (const ob of outbounds) {
-            if (systemProtocols.has(ob.protocol)) continue;
-            if (!ob.tag) continue;
-
-            const cloned = { ...ob };
-
-            let tag = cloned.tag;
+        for (const outbound of outbounds) {
+            let tag = outbound.tag;
             if (tag === 'proxy' && remarks) {
                 tag = remarks;
             }
             if (seenTags.has(tag)) {
                 const baseTag = tag;
-                let suffix = i;
+                let suffix = 2;
                 while (seenTags.has(tag)) {
                     tag = `${baseTag}-${suffix}`;
                     suffix += 1;
                 }
             }
-            cloned.tag = tag;
+            seenTags.add(tag);
+            tagMap.set(outbound.tag, tag);
+            assignedTags.push(tag);
+        }
+
+        for (let index = 0; index < outbounds.length; index += 1) {
+            const cloned = structuredClone(outbounds[index]);
+            cloned.tag = assignedTags[index];
             if (cfg.description && !cloned.description) cloned.description = cfg.description;
             if (cfg.serverDescription && !cloned.serverDescription) cloned.serverDescription = cfg.serverDescription;
             if (cfg.server_description && !cloned.server_description) cloned.server_description = cfg.server_description;
             if (cfg.title && !cloned.title) cloned.title = cfg.title;
             if (cfg.ps && !cloned.ps) cloned.ps = cfg.ps;
-            seenTags.add(tag);
+            const proxyTag = cloned.proxySettings?.tag;
+            if (typeof proxyTag === 'string' && tagMap.has(proxyTag)) {
+                cloned.proxySettings.tag = tagMap.get(proxyTag);
+            }
+            const dialerProxy = cloned.streamSettings?.sockopt?.dialerProxy;
+            if (typeof dialerProxy === 'string' && tagMap.has(dialerProxy)) {
+                cloned.streamSettings.sockopt.dialerProxy = tagMap.get(dialerProxy);
+            }
             allOutbounds.push(cloned);
         }
     }
@@ -1602,6 +1675,7 @@ const CACHE_VARIANT_HEADERS = new Set([
     'x-device-os',
     'x-platform',
     'x-app-version',
+    'x-forwarded-for',
 ]);
 
 const NO_STORE_HEADERS = {
@@ -2183,7 +2257,7 @@ const server = http.createServer(async (req, res) => {
             return;
         } catch (err) {
             logger.error('admin_groups_update_failed', { request_id: requestId, error: err.message });
-            const code = err.message === 'Invalid JSON body' ? 400 : 422;
+            const code = adminBodyErrorStatus(err);
             res.writeHead(code, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'error', request_id: requestId, message: err.message }));
             return;
@@ -2309,7 +2383,7 @@ const server = http.createServer(async (req, res) => {
             }));
             return;
         } catch (err) {
-            const code = err.message === 'Invalid JSON body' ? 400 : 422;
+            const code = adminBodyErrorStatus(err);
             res.writeHead(code, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'error', request_id: requestId, message: err.message }));
             return;
@@ -2410,7 +2484,7 @@ const server = http.createServer(async (req, res) => {
             }));
             return;
         } catch (err) {
-            const code = err.message === 'Invalid JSON body' ? 400 : 422;
+            const code = adminBodyErrorStatus(err);
             res.writeHead(code, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'error', request_id: requestId, message: err.message }));
             return;
@@ -2695,11 +2769,6 @@ const server = http.createServer(async (req, res) => {
     }
     logger.info('request_start', { request_id: requestId, method: req.method, path: safePath, ip: clientIp });
 
-    if (Object.values(GROUP_HOSTS).some((hostIds) => Array.isArray(hostIds) && hostIds.length > 0)) {
-        await refreshHostCatalog({ requestId });
-    }
-    const cacheGeneration = subscriptionCacheGeneration;
-
     const cachedSubscription = subscriptionCache.get(cacheKey);
     if (cachedSubscription) {
         runtimeStats.cache_hits_total += 1;
@@ -2725,6 +2794,48 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    const hasHostBindings = Object.values(GROUP_HOSTS)
+        .some((hostIds) => Array.isArray(hostIds) && hostIds.length > 0);
+    if (hasHostBindings) {
+        await refreshHostCatalog({ requestId });
+        const unresolvedHostIds = findUnresolvedGroupHostIds(GROUP_HOSTS, hostCatalogCache);
+        if (unresolvedHostIds.length > 0) {
+            const fallback = getCachedFallback(cacheKey);
+            if (fallback) {
+                runtimeStats.cache_fallback_total += 1;
+                if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
+                logger.warn('cache_fallback_host_catalog_unavailable', {
+                    request_id: requestId,
+                    cache_kind: fallback.kind,
+                    unresolved_host_ids: unresolvedHostIds.length,
+                });
+                res.writeHead(200, forwardResponseHeaders(
+                    fallback.item.headers,
+                    getResponseContentType(fallback.item.headers)
+                ));
+                res.end(fallback.item.body);
+                return;
+            }
+
+            logger.error('host_catalog_bindings_unresolved', {
+                request_id: requestId,
+                unresolved_host_ids: unresolvedHostIds.length,
+            });
+            res.writeHead(503, {
+                'Content-Type': 'application/json; charset=utf-8',
+                'Retry-After': '30',
+            });
+            res.end(JSON.stringify({
+                status: 'error',
+                code: 'HOST_CATALOG_UNAVAILABLE',
+                request_id: requestId,
+            }));
+            return;
+        }
+    }
+    const cacheGeneration = subscriptionCacheGeneration;
+    let upstreamRequestFailed = true;
+
     try {
         // Пробрасываем ВСЕ заголовки от клиента, кроме тех что ломают проксирование
         // Дефолтный User-Agent если клиент не прислал
@@ -2738,6 +2849,7 @@ const server = http.createServer(async (req, res) => {
         });
 
         const upstream = await fetchUpstreamSingleFlight(cacheKey, token, targetUrl, forwardHeaders, requestId);
+        upstreamRequestFailed = false;
         logger.info('upstream_response', {
             request_id: requestId,
             status: upstream.status,
@@ -3210,7 +3322,7 @@ const server = http.createServer(async (req, res) => {
     } catch (err) {
         runtimeStats.request_failures += 1;
         lastUpstreamError = err.message;
-        if (err.code !== 'EUPSTREAMBUSY') {
+        if (upstreamRequestFailed && err.code !== 'EUPSTREAMBUSY') {
             circuitBreaker.recordFailure();
         }
         logger.error('request_failed', { request_id: requestId, message: err.message });
@@ -3236,15 +3348,31 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
             if (isSocketHangupError(err)) {
-                res.writeHead(404, {
-                    'Content-Type': 'text/plain; charset=utf-8',
-                    'Cache-Control': 'no-store',
+                res.writeHead(502, {
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Retry-After': '5',
                 });
-                res.end('Not Found');
+                res.end(JSON.stringify({ status: 'error', code: 'UPSTREAM_CONNECTION_RESET', request_id: requestId }));
                 return;
             }
-            res.writeHead(502, { 'Content-Type': 'text/plain' });
-            res.end('Bad Gateway: ' + err.message);
+            if (isTimeoutError(err)) {
+                res.writeHead(502, {
+                    'Content-Type': 'application/json; charset=utf-8',
+                    'Retry-After': '5',
+                });
+                res.end(JSON.stringify({
+                    status: 'error',
+                    code: 'UPSTREAM_TIMEOUT',
+                    message: 'Timeout',
+                    request_id: requestId,
+                }));
+                return;
+            }
+            res.writeHead(502, {
+                'Content-Type': 'application/json; charset=utf-8',
+                'Retry-After': '5',
+            });
+            res.end(JSON.stringify({ status: 'error', code: 'UPSTREAM_FETCH_FAILED', request_id: requestId }));
         }
     }
 });

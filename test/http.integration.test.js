@@ -72,6 +72,8 @@ async function startBalancer(t, configOverrides = {}, envOverrides = {}) {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xray-balancer-'));
     const port = await getFreePort();
     const configPath = path.join(tempDir, 'config.json');
+    const runtimePatch = configOverrides.testRuntimePatch;
+    const runtimePatchPath = runtimePatch ? path.join(tempDir, 'config.runtime.json') : '';
     const config = {
         port,
         sub_page_url: `http://127.0.0.1:${configOverrides.upstreamPort || 9}`,
@@ -91,7 +93,9 @@ async function startBalancer(t, configOverrides = {}, envOverrides = {}) {
         ...configOverrides,
     };
     delete config.upstreamPort;
+    delete config.testRuntimePatch;
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    if (runtimePatch) fs.writeFileSync(runtimePatchPath, JSON.stringify(runtimePatch, null, 2));
 
     let output = '';
     const childState = { exited: false, exitInfo: '' };
@@ -100,7 +104,7 @@ async function startBalancer(t, configOverrides = {}, envOverrides = {}) {
         env: {
             ...process.env,
             CONFIG_PATH: configPath,
-            CONFIG_RUNTIME_PATH: '',
+            CONFIG_RUNTIME_PATH: runtimePatchPath,
             PORT: String(port),
             REMNAWAVE_URL: '',
             SUB_PAGE_URL: '',
@@ -218,6 +222,33 @@ test('health endpoint ignores malformed Host header', async (t) => {
 
     assert.match(response, /^HTTP\/1\.1 200 /);
     assert.match(response, /"status":"ok"/);
+});
+
+test('runtime patch applies only mutable keys', async (t) => {
+    const upstream = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(validXrayPayload());
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        testRuntimePatch: {
+            groups: { Runtime: ['Germany'] },
+            sub_page_url: 'http://127.0.0.1:9',
+            admin_token: 'replaced-admin-token',
+        },
+    });
+
+    const response = await fetch(`${balancer.baseUrl}/runtime-patch-token`);
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(body[0].remarks, 'Runtime');
+
+    const admin = await fetch(`${balancer.baseUrl}/admin/groups`, {
+        headers: { 'X-Admin-Token': 'integration-admin-token' },
+    });
+    assert.equal(admin.status, 200);
 });
 
 test('subscription endpoint uses single-flight fetch and fresh read-through cache', async (t) => {
@@ -373,6 +404,39 @@ test('subscription cache and single-flight are isolated by client variant header
     assert.equal(upstreamHits, 2);
 });
 
+test('subscription cache is isolated by forwarded client IP when upstream receives it', async (t) => {
+    let upstreamHits = 0;
+    const upstream = http.createServer((req, res) => {
+        upstreamHits += 1;
+        const clientIp = req.headers['x-forwarded-for'] || 'missing';
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([{
+            remarks: 'valid',
+            outbounds: [{
+                protocol: 'vless',
+                tag: `Germany-${clientIp}`,
+                settings: { vnext: [{ address: 'node.example.com', port: 443 }] },
+            }],
+        }]));
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        trust_x_forwarded_for: true,
+    });
+
+    const first = await fetch(`${balancer.baseUrl}/ip-variant`, {
+        headers: { 'X-Forwarded-For': '198.51.100.10' },
+    });
+    const second = await fetch(`${balancer.baseUrl}/ip-variant`, {
+        headers: { 'X-Forwarded-For': '198.51.100.11' },
+    });
+    assert.match(await first.text(), /198\.51\.100\.10/);
+    assert.match(await second.text(), /198\.51\.100\.11/);
+    assert.equal(upstreamHits, 2);
+});
+
 test('subscription endpoint rejects non-GET methods without hitting upstream', async (t) => {
     let upstreamHits = 0;
     const upstream = http.createServer((req, res) => {
@@ -475,6 +539,7 @@ test('generated Xray groups preserve merged panel routing and DNS policy', async
                 outbounds: [
                     { tag: 'proxy', protocol: 'vless', settings: { vnext: [{ address: 'de.example.com', port: 443 }] } },
                     { tag: 'direct', protocol: 'freedom', settings: { domainStrategy: 'UseIPv4' } },
+                    { tag: 'route-again', protocol: 'loopback', settings: { inboundTag: 'route-again-in' } },
                 ],
             },
             {
@@ -521,6 +586,8 @@ test('generated Xray groups preserve merged panel routing and DNS policy', async
     assert.ok(europe.routing.rules.some((rule) => rule.domain?.includes('geosite:category-ads-all') && rule.outboundTag === 'block'));
     assert.ok(europe.routing.rules.some((rule) => rule.network === 'tcp,udp' && rule.balancerTag === 'Europe-balancer'));
     assert.equal(europe.routing.rules.some((rule) => rule.outboundTag === 'proxy'), false);
+    assert.equal(europe.routing.balancers[0].selector.includes('route-again'), false);
+    assert.ok(europe.outbounds.some((outbound) => outbound.tag === 'route-again' && outbound.protocol === 'loopback'));
     assert.deepEqual(europe.outbounds[0], {
         tag: 'proxy',
         protocol: 'loopback',
@@ -585,6 +652,22 @@ test('admin endpoints enforce explicit method allow lists', async (t) => {
     assert.equal(refreshPost.status, 200);
     assert.equal(refreshPostBody.status, 'ok');
     assert.equal(hostRequests, hostRequestsBeforeInvalidMethod + 1);
+});
+
+test('admin JSON endpoints return 413 without resetting oversized requests', async (t) => {
+    const balancer = await startBalancer(t);
+    const response = await fetch(`${balancer.baseUrl}/admin/groups`, {
+        method: 'PUT',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Admin-Token': 'integration-admin-token',
+        },
+        body: JSON.stringify({ padding: 'x'.repeat(600 * 1024) }),
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 413);
+    assert.equal(body.message, 'Payload too large');
 });
 
 test('admin hosts returns a sanitized panel host catalog', async (t) => {
@@ -657,6 +740,42 @@ test('admin hosts returns a sanitized panel host catalog', async (t) => {
     });
     assert.equal(methodResponse.status, 405);
     assert.equal(methodResponse.headers.get('allow'), 'GET');
+});
+
+test('unresolved UUID host bindings fail closed instead of mixing nodes into the first group', async (t) => {
+    const panel = http.createServer((req, res) => {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'panel unavailable' }));
+    });
+    const panelPort = await listenOnRandomPort(panel);
+    t.after(() => closeServer(panel));
+
+    const upstream = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([{
+            remarks: 'nodes',
+            outbounds: [
+                { tag: 'Germany', protocol: 'vless', settings: { vnext: [{ address: 'de.example.com', port: 443 }] } },
+                { tag: 'France', protocol: 'vless', settings: { vnext: [{ address: 'fr.example.com', port: 443 }] } },
+            ],
+        }]));
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        groups: { Germany: [], France: [] },
+        group_hosts: { Germany: ['uuid-de'], France: ['uuid-fr'] },
+    }, {
+        API_TOKEN: 'integration-api-token',
+        REMNAWAVE_URL: `http://127.0.0.1:${panelPort}`,
+    });
+
+    const response = await fetch(`${balancer.baseUrl}/uuid-panel-down`);
+    const body = await response.json();
+    assert.equal(response.status, 503);
+    assert.equal(body.code, 'HOST_CATALOG_UNAVAILABLE');
 });
 
 test('host UUID binding survives a panel host rename and refreshes the admin display name', async (t) => {
@@ -858,12 +977,17 @@ test('socket retry shares the original upstream deadline', async (t) => {
     const upstream = http.createServer((req, res) => {
         upstreamHits += 1;
         if (upstreamHits === 1) {
-            setTimeout(() => req.socket.destroy(), 150);
+            res.writeHead(200, {
+                'Content-Type': 'application/json',
+                'Content-Length': '1000',
+                Connection: 'close',
+            });
+            res.end('{"partial":');
             return;
         }
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        const timer = setTimeout(() => res.end(validXrayPayload()), 700);
+        const timer = setTimeout(() => res.end(validXrayPayload()), 750);
         res.on('close', () => clearTimeout(timer));
     });
     const upstreamPort = await listenOnRandomPort(upstream);
@@ -883,6 +1007,29 @@ test('socket retry shares the original upstream deadline', async (t) => {
     assert.match(body, /Timeout/);
     assert.equal(upstreamHits, 2);
     assert.ok(Date.now() - started < 1500);
+});
+
+test('repeated upstream socket resets return a retryable gateway error', async (t) => {
+    let upstreamHits = 0;
+    const upstream = http.createServer((req, res) => {
+        upstreamHits += 1;
+        res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Content-Length': '1000',
+            Connection: 'close',
+        });
+        res.end('{"partial":');
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, { upstreamPort });
+
+    const response = await fetch(`${balancer.baseUrl}/reset-token`);
+    const body = await response.json();
+    assert.equal(response.status, 502);
+    assert.equal(response.headers.get('retry-after'), '5');
+    assert.equal(body.code, 'UPSTREAM_CONNECTION_RESET');
+    assert.equal(upstreamHits, 2);
 });
 
 test('background refresh loop skips overlapping auto-groups runs', async (t) => {
@@ -1078,7 +1225,7 @@ test('leastPing uses latency fields from panel node stats', async (t) => {
         .map((outbound) => outbound.tag);
 
     assert.equal(response.status, 200);
-    assert.deepEqual(tags, ['Germany-B', 'Germany-A']);
+    assert.deepEqual(tags, ['__xrb_01__:Germany-B', '__xrb_02__:Germany-A']);
 });
 
 test('stale node stats do not influence subscription ordering', async (t) => {
@@ -1250,7 +1397,7 @@ test('invalid NODE_STATS_STALE_SEC env falls back to positive default', async (t
 });
 
 test('parallel quarantine updates are serialized without losing nodes', async (t) => {
-    const balancer = await startBalancer(t);
+    const balancer = await startBalancer(t, { auto_quarantine_max_nodes: 1 });
     const headers = {
         'Content-Type': 'application/json',
         'X-Admin-Token': 'integration-admin-token',
@@ -1348,6 +1495,38 @@ test('manual attack mode immediately excludes and restores a node', async (t) =>
     assert.equal(restoredResponse.status, 200);
     assert.match(await restoredResponse.text(), /Germany-1/);
     assert.equal(upstreamHits, 3);
+});
+
+test('expired automatic isolation remains protected after restart until recovery succeeds', async (t) => {
+    const upstream = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([{
+            remarks: 'nodes',
+            outbounds: [
+                { tag: 'Germany-1', protocol: 'vless', settings: { vnext: [{ address: 'de.example.com', port: 443 }] } },
+            ],
+        }]));
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        protection_enabled: true,
+        testRuntimePatch: {
+            attack_nodes: [{
+                node: 'Germany-1',
+                mode: 'automatic',
+                reason: 'panel_disconnected',
+                source: 'panel_stats',
+                expires_at: new Date(Date.now() - 60_000).toISOString(),
+            }],
+        },
+    });
+
+    const response = await fetch(`${balancer.baseUrl}/restored-protection-token`);
+    const body = await response.json();
+    assert.equal(response.status, 503);
+    assert.equal(body.code, 'NO_HEALTHY_NODES');
 });
 
 test('subscription fails closed when every outbound is isolated', async (t) => {
@@ -1464,12 +1643,15 @@ test('fastest group keeps marked reserve nodes out of the primary pool', async (
     const configs = await response.json();
     const fastest = configs.find((item) => item.remarks === 'Fastest');
     assert.ok(fastest);
-    assert.deepEqual(fastest.routing.balancers[0].selector, ['Germany-1', 'Finland-1']);
-    assert.equal(fastest.routing.balancers[0].fallbackTag, 'Germany MOBILE-RESERVE #1');
+    assert.deepEqual(fastest.routing.balancers[0].selector, [
+        '__xrb_01__:Germany-1',
+        '__xrb_02__:Finland-1',
+    ]);
+    assert.equal(fastest.routing.balancers[0].fallbackTag, '__xrb_03__:Germany MOBILE-RESERVE #1');
     assert.deepEqual(fastest.burstObservatory.subjectSelector, [
-        'Germany-1',
-        'Finland-1',
-        'Germany MOBILE-RESERVE #1',
+        '__xrb_01__:Germany-1',
+        '__xrb_02__:Finland-1',
+        '__xrb_03__:Germany MOBILE-RESERVE #1',
     ]);
 
     const germany = configs.find((item) => item.remarks === 'Germany');
@@ -1503,8 +1685,8 @@ test('normal groups receive a cross-group emergency fallback', async (t) => {
     const configs = await response.json();
     const germany = configs.find((item) => item.remarks === 'Germany');
     assert.ok(germany);
-    assert.equal(germany.routing.balancers[0].fallbackTag, 'Finland-1');
-    assert.ok(germany.outbounds.some((outbound) => outbound.tag === 'Finland-1'));
+    assert.equal(germany.routing.balancers[0].fallbackTag, '__xrb_02__:Finland-1');
+    assert.ok(germany.outbounds.some((outbound) => outbound.tag === '__xrb_02__:Finland-1'));
 });
 
 test('negative subscription responses are cached briefly', async (t) => {

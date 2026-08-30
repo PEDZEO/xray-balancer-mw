@@ -83,9 +83,9 @@ test('Mihomo transformation publishes configured names instead of raw nodes', ()
     assert.deepEqual(outer.proxies, [
         '🏁 Самые быстрые',
         '🇷🇺 Без VPN',
-        '🇫🇷 France',
         '🇩🇪 Germany',
         '🇷🇺 Russia',
+        '🇫🇷 France',
         '🎬 YouTube / Instagram',
         '🌐 Другие серверы',
     ]);
@@ -178,4 +178,92 @@ test('cleartext XHTTP on port 80 uses HTTP/1.1 without overriding explicit ALPN'
     assert.equal(proxies.get('TLS XHTTP').alpn, undefined);
     assert.equal(proxies.get('Plain TCP').alpn, undefined);
     assert.equal(result.stats.compatibilityFixes, 1);
+});
+
+test('Mihomo transformation only renames the policy field in routing rules', () => {
+    const body = YAML.stringify({
+        proxies: [
+            { name: 'example.com', type: 'vless', server: 'node.example.com', port: 443 },
+        ],
+        'proxy-groups': [
+            { name: 'PROXY', type: 'select', proxies: ['example.com'] },
+        ],
+        rules: [
+            'DOMAIN,example.com,DIRECT',
+            'IP-CIDR,192.0.2.0/24,example.com,no-resolve',
+        ],
+    });
+
+    const result = transformMihomoYaml(body, transformOptions({ groups: { Europe: ['example.com'] } }));
+    const document = YAML.parse(result.body);
+    assert.equal(document.rules[0], 'DOMAIN,example.com,DIRECT');
+    assert.equal(document.rules[1], 'IP-CIDR,192.0.2.0/24,Europe · 1,no-resolve');
+});
+
+test('Mihomo preserved groups repair renamed proxy references and default selection', () => {
+    const body = YAML.stringify({
+        proxies: [
+            { name: 'Germany raw', type: 'vless', server: 'de.example.com', port: 443 },
+            { name: 'Chain', type: 'vless', server: 'chain.example.com', port: 443, 'dialer-proxy': 'Germany raw' },
+        ],
+        'proxy-groups': [
+            {
+                name: 'Select',
+                type: 'select',
+                proxies: ['Germany raw', 'DIRECT'],
+                'default-selected': 'Germany raw',
+                'empty-fallback': 'Germany raw',
+            },
+        ],
+        rules: ['MATCH,Select'],
+    });
+
+    const result = transformMihomoYaml(body, transformOptions({
+        groups: { Germany: ['Germany'], Chains: ['Chain'] },
+        fastestEnabled: false,
+    }));
+    const document = YAML.parse(result.body);
+    const preserved = document['proxy-groups'].find((group) => group.name === 'Select');
+    const chain = document.proxies.find((proxy) => proxy.name === 'Chains · 1');
+    assert.deepEqual(preserved.proxies, ['Germany', 'DIRECT']);
+    assert.equal(preserved['default-selected'], 'Germany');
+    assert.equal(preserved['empty-fallback'], 'Germany · 1');
+    assert.equal(chain['dialer-proxy'], 'Germany · 1');
+});
+
+test('Mihomo preserves provider-backed automatic groups', () => {
+    const body = YAML.stringify({
+        'proxy-providers': {
+            remote: { type: 'http', url: 'https://example.com/provider.yaml' },
+        },
+        proxies: [],
+        'proxy-groups': [
+            { name: '⚡ Авто-переключение', type: 'url-test', use: ['remote'], url: 'https://example.com/ping' },
+        ],
+        rules: ['MATCH,⚡ Авто-переключение'],
+    });
+
+    const result = transformMihomoYaml(body, transformOptions({ groups: {} }));
+    const document = YAML.parse(result.body);
+    assert.equal(document['proxy-groups'][0].name, '⚡ Авто-переключение');
+    assert.deepEqual(document['proxy-groups'][0].use, ['remote']);
+    assert.equal(document.rules[0], 'MATCH,⚡ Авто-переключение');
+});
+
+test('Mihomo maps roundRobin to a load-balance group', () => {
+    const body = YAML.stringify({
+        proxies: [
+            { name: 'Germany 1', type: 'vless', server: 'de1.example.com', port: 443 },
+            { name: 'Germany 2', type: 'vless', server: 'de2.example.com', port: 443 },
+        ],
+        'proxy-groups': [
+            { name: 'PROXY', type: 'select', proxies: ['Germany 1', 'Germany 2'] },
+        ],
+    });
+
+    const result = transformMihomoYaml(body, transformOptions({ strategy: 'roundRobin' }));
+    const document = YAML.parse(result.body);
+    const fastest = document['proxy-groups'].find((group) => group.name === '🏁 Самые быстрые');
+    assert.equal(fastest.type, 'load-balance');
+    assert.equal(fastest.strategy, 'round-robin');
 });

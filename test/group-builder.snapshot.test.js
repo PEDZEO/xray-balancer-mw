@@ -49,15 +49,19 @@ test('buildGroupConfig uses a loopback outbound to preserve the fallback pool', 
 
     assert.deepEqual(out.inbounds.map((inbound) => inbound.port), [10808, 10809]);
     assert.equal(out.outbounds[0].tag, 'proxy');
-    assert.deepEqual(out.burstObservatory.subjectSelector, ['Main-1', 'LTE-1', 'LTE-2']);
+    assert.deepEqual(out.burstObservatory.subjectSelector, [
+        '__xrb_01__:Main-1',
+        '__xrb_02__:LTE-1',
+        '__xrb_03__:LTE-2',
+    ]);
     assert.equal(out.burstObservatory.pingConfig.sampling, 1);
     assert.equal(out.burstObservatory.pingConfig.timeout, '3s');
     assert.equal(out.burstObservatory.pingConfig.connectivity, '');
     assert.equal(out.burstObservatory.pingConfig.httpMethod, 'HEAD');
     assert.equal(out.routing.balancers.length, 2);
     assert.equal(out.routing.balancers[0].fallbackTag, '_Fastest-fallback-dispatch');
-    assert.equal(out.routing.balancers[1].fallbackTag, 'LTE-1');
-    assert.deepEqual(out.routing.balancers[1].selector, ['LTE-1', 'LTE-2']);
+    assert.equal(out.routing.balancers[1].fallbackTag, '__xrb_02__:LTE-1');
+    assert.deepEqual(out.routing.balancers[1].selector, ['__xrb_02__:LTE-1', '__xrb_03__:LTE-2']);
     assert.deepEqual(
         out.outbounds.find((outbound) => outbound.tag === '_Fastest-fallback-dispatch'),
         {
@@ -125,6 +129,50 @@ test('buildGroupConfig preserves panel routing rules and remaps proxy to the gen
     assert.equal(out.routing.rules.some((rule) => rule.balancerTag === 'old-balancer'), false);
 });
 
+test('buildGroupConfig emits prefix-safe node selectors and keeps system tags reserved', () => {
+    const out = buildGroupConfig({}, 'Reserved tags', [
+        { tag: 'node', protocol: 'vless' },
+        { tag: 'node-backup', protocol: 'vless' },
+        { tag: 'direct', protocol: 'vless' },
+        { tag: 'block', protocol: 'vless' },
+    ], {
+        probeUrl: 'https://example.com/ping',
+        probeInterval: '1m',
+        strategy: 'leastPing',
+    });
+
+    const selectors = out.routing.balancers[0].selector;
+    const outboundTags = out.outbounds.map((outbound) => outbound.tag);
+    for (const selector of selectors) {
+        assert.deepEqual(outboundTags.filter((tag) => tag.startsWith(selector)), [selector]);
+    }
+    assert.equal(out.outbounds.find((item) => item.tag === 'direct').protocol, 'freedom');
+    assert.equal(out.outbounds.find((item) => item.tag === 'block').protocol, 'blackhole');
+    assert.equal(out.outbounds.find((item) => item.tag === 'proxy').protocol, 'loopback');
+});
+
+test('buildGroupConfig moves a panel catch-all behind specialized routing rules', () => {
+    const out = buildGroupConfig({
+        routing: {
+            rules: [
+                { type: 'field', network: 'tcp,udp', outboundTag: 'proxy' },
+                { type: 'field', domain: ['geosite:ru'], outboundTag: 'direct' },
+            ],
+        },
+    }, 'Routing order', [{ tag: 'node', protocol: 'vless' }], {
+        probeUrl: 'https://example.com/ping',
+        probeInterval: '1m',
+        strategy: 'leastPing',
+    });
+
+    const ruIndex = out.routing.rules.findIndex((rule) => rule.domain?.includes('geosite:ru'));
+    const catchAllIndex = out.routing.rules.findIndex((rule) => (
+        rule.network === 'tcp,udp' && rule.balancerTag === 'Routing_order-balancer'
+    ));
+    assert.ok(ruIndex >= 0);
+    assert.ok(catchAllIndex > ruIndex);
+});
+
 test('mergeProfileBaseConfigs merges DNS and routing policy from every upstream profile', () => {
     const merged = mergeProfileBaseConfigs([
         {
@@ -152,6 +200,7 @@ test('mergeProfileBaseConfigs merges DNS and routing policy from every upstream 
             dns: {
                 servers: ['https://1.1.1.1/dns-query', 'localhost'],
                 hosts: { 'domain:internal.example': '10.0.0.1' },
+                queryStrategy: 'UseIPv4',
             },
         },
     ]);
@@ -167,6 +216,18 @@ test('mergeProfileBaseConfigs merges DNS and routing policy from every upstream 
     });
     assert.equal(merged.routing.rules.length, 2);
     assert.deepEqual(merged.outbounds.map((outbound) => outbound.tag), ['direct', 'block', 'dns-out']);
+});
+
+test('mergeProfileBaseConfigs does not mix DNS servers with incompatible global policy', () => {
+    const merged = mergeProfileBaseConfigs([
+        { dns: { servers: ['1.1.1.1'], queryStrategy: 'UseIPv4' } },
+        { dns: { servers: ['2001:4860:4860::8888'], queryStrategy: 'UseIPv6' } },
+    ]);
+
+    assert.deepEqual(merged.dns, {
+        servers: ['1.1.1.1'],
+        queryStrategy: 'UseIPv4',
+    });
 });
 
 test('buildGroupConfig accepts custom burst observatory ping options', () => {
@@ -237,9 +298,9 @@ test('buildGroupConfig emits leastPing strategy without leastLoad settings', () 
         strategy: 'leastPing',
     });
 
-    assert.deepEqual(out.burstObservatory.subjectSelector, ['Germany-1', 'Germany-2']);
+    assert.deepEqual(out.burstObservatory.subjectSelector, ['__xrb_01__:Germany-1', '__xrb_02__:Germany-2']);
     assert.deepEqual(out.routing.balancers[0].strategy, { type: 'leastPing' });
-    assert.equal(out.routing.balancers[0].fallbackTag, 'Germany-1');
+    assert.equal(out.routing.balancers[0].fallbackTag, '__xrb_01__:Germany-1');
 });
 
 test('buildGroupConfig does not inherit per-server title/description fields from base config', () => {
@@ -271,7 +332,7 @@ test('buildGroupConfig does not inherit per-server title/description fields from
     assert.deepEqual(out.extraField, { x: 1 });
     assert.equal(out.outbounds[0].tag, 'proxy');
     assert.equal(out.outbounds[0].title, undefined);
-    assert.equal(out.outbounds[1].tag, 'Germany-1');
+    assert.equal(out.outbounds[1].tag, '__xrb_01__:Germany-1');
     assert.equal(out.outbounds[1].title, 'Germany-1 Title');
 });
 
@@ -294,5 +355,5 @@ test('buildGroupConfig does not inherit stale observatory from base config', () 
     });
 
     assert.equal(out.observatory, undefined);
-    assert.deepEqual(out.burstObservatory.subjectSelector, ['Germany-1']);
+    assert.deepEqual(out.burstObservatory.subjectSelector, ['__xrb_01__:Germany-1']);
 });

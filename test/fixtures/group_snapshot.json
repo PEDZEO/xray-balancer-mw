@@ -23,11 +23,11 @@
       }
     },
     {
-      "tag": "Germany-1",
+      "tag": "__xrb_01__:Germany-1",
       "protocol": "vless"
     },
     {
-      "tag": "USA-1",
+      "tag": "__xrb_02__:USA-1",
       "protocol": "vless"
     },
     {
@@ -41,8 +41,8 @@
   ],
   "burstObservatory": {
     "subjectSelector": [
-      "Germany-1",
-      "USA-1"
+      "__xrb_01__:Germany-1",
+      "__xrb_02__:USA-1"
     ],
     "pingConfig": {
       "destination": "https://example.com/ping",
@@ -59,8 +59,8 @@
       {
         "tag": "_Europe-balancer",
         "selector": [
-          "Germany-1",
-          "USA-1"
+          "__xrb_01__:Germany-1",
+          "__xrb_02__:USA-1"
         ],
         "strategy": {
           "type": "leastLoad",
@@ -72,7 +72,7 @@
             "tolerance": 0.8
           }
         },
-        "fallbackTag": "Germany-1"
+        "fallbackTag": "__xrb_01__:Germany-1"
       }
     ],
     "rules": [
