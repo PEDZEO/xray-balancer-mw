@@ -1727,6 +1727,57 @@ test('stale node stats do not influence subscription ordering', async (t) => {
     assert.ok(body.indexOf('Germany-A') < body.indexOf('Germany-B'));
 });
 
+test('current panel hardware fields avoid false quarantine and retain legacy capacity support', async (t) => {
+    const panel = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ response: [
+            { name: 'Germany-1', usersOnline: 30, isConnected: true, isDisabled: false,
+                system: { info: { cpus: 2, memoryTotal: 4 * 1024 ** 3 } } },
+            { name: 'Legacy', usersOnline: 30, isConnected: true, isDisabled: false,
+                cpuCount: 2, totalRam: '4GB' },
+            { name: 'Offline', usersOnline: 0, isConnected: false, isDisabled: false,
+                system: { info: { cpus: 2, memoryTotal: 4 * 1024 ** 3 } } },
+        ] }));
+    });
+    const upstream = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(validXrayPayload());
+    });
+    const panelPort = await listenOnRandomPort(panel);
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(panel));
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, {
+        upstreamPort,
+        remnawave_url: `http://127.0.0.1:${panelPort}`,
+        auto_drain_enabled: true,
+        auto_drain_failures: 1,
+        auto_quarantine_enabled: true,
+        auto_quarantine_failures: 1,
+        auto_quarantine_release_successes: 1,
+        quarantine_nodes: ['Germany-1', 'Manual'],
+        auto_quarantine_nodes: ['Germany-1'],
+    }, { API_TOKEN: 'integration-api-token' });
+    const headers = { 'X-Admin-Token': 'integration-admin-token' };
+    const refresh = await fetch(`${balancer.baseUrl}/admin/refresh-stats`, { method: 'POST', headers });
+    assert.equal(refresh.status, 200);
+    const stats = await (await fetch(`${balancer.baseUrl}/admin/node-stats`, { headers })).json();
+    for (const name of ['Germany-1', 'Legacy']) {
+        assert.equal(stats[name].cpuCount, 2);
+        assert.equal(stats[name].totalRamGb, 4);
+        assert.equal(stats[name].load, 0.38);
+        assert.equal(stats[name].quarantined, false);
+    }
+    assert.equal(stats.Offline.quarantined, true);
+    const groups = await (await fetch(`${balancer.baseUrl}/admin/groups`, { headers })).json();
+    assert.deepEqual([...groups.quarantine_nodes].sort(), ['Manual', 'Offline']);
+    const subscription = await fetch(`${balancer.baseUrl}/hardware-token`, { headers: { 'User-Agent': 'Happ/1.0' } });
+    assert.equal(subscription.status, 200);
+    assert.match(await subscription.text(), /node\.example\.com/);
+    const drains = balancer.output().split('\n').filter(line => line.includes('auto_drain_added')).map(line => JSON.parse(line));
+    assert.deepEqual(drains.map(entry => entry.node), ['Offline']);
+});
+
 test('concurrent admin stats refreshes share one upstream request', async (t) => {
     let nodeRequests = 0;
     const panel = http.createServer(async (req, res) => {
