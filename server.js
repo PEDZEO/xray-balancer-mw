@@ -1679,6 +1679,14 @@ function buildGroupsFromHosts(hosts) {
     return groups;
 }
 
+function appendDetectedGroups(configuredGroups, detectedGroups) {
+    const merged = { ...configuredGroups };
+    for (const [name, patterns] of Object.entries(detectedGroups)) {
+        if (!Object.prototype.hasOwnProperty.call(merged, name)) merged[name] = patterns;
+    }
+    return merged;
+}
+
 async function refreshGroups(opts = {}) {
     const hostsResult = await refreshHostCatalog({ force: true, requestId: opts.requestId || 'refresh-groups' });
     if (!hostsResult.ok || !hostsResult.rawHosts) return { ok: false, error: hostsResult.error || 'Failed to fetch hosts' };
@@ -1687,7 +1695,7 @@ async function refreshGroups(opts = {}) {
     if (Object.keys(newGroups).length === 0) return { ok: false, error: 'No groups detected from enabled hosts' };
     if (opts.persist === true) {
         const mutationResult = await mutateRuntimeConfig(opts.requestId || 'refresh-groups', (currentConfig) => {
-            const mergedGroups = { ...newGroups, ...(currentConfig.groups || {}) };
+            const mergedGroups = appendDetectedGroups(currentConfig.groups || {}, newGroups);
             return {
                 changed: true,
                 nextConfig: {
@@ -1701,7 +1709,7 @@ async function refreshGroups(opts = {}) {
         }
     } else {
         const previousGroupsJson = JSON.stringify(GROUPS);
-        const mergedGroups = { ...newGroups, ...(config.groups || {}) };
+        const mergedGroups = appendDetectedGroups(config.groups || {}, newGroups);
         GROUPS = mergedGroups;
         if (JSON.stringify(GROUPS) !== previousGroupsJson) {
             clearSubscriptionCache('refresh_groups', opts.requestId || 'refresh-groups');

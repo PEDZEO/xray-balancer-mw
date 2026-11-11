@@ -71,6 +71,32 @@ function transformOptions(overrides = {}) {
     };
 }
 
+test('Mihomo resolves configured and upstream group name collisions without bypassing filtering', () => {
+    const body = YAML.stringify({
+        proxies: [
+            { name: 'Germany raw', type: 'vless', server: 'de.example', port: 443 },
+            { name: 'Hidden raw', type: 'vless', server: 'hidden.example', port: 443 },
+        ],
+        'proxy-groups': [{ name: 'Europe', type: 'select', proxies: ['Germany raw', 'Hidden raw'] }],
+        rules: ['MATCH,Europe'],
+        dns: { nameserver: ['https://dns.example/dns-query#Europe'] },
+    });
+    const result = transformMihomoYaml(body, transformOptions({
+        groups: { Europe: ['Germany'] },
+        hiddenNodes: ['Hidden raw'],
+    }));
+    assert.equal(result.kind, 'mihomo');
+    const document = result.document;
+    const names = document['proxy-groups'].map(group => group.name);
+    assert.equal(new Set(names).size, names.length);
+    assert.equal(document.proxies.some(proxy => proxy.server === 'hidden.example'), false);
+    const preserved = document['proxy-groups'].find(group => group.type === 'select');
+    assert.notEqual(preserved.name, 'Europe');
+    assert.equal(document.rules[0], `MATCH,${preserved.name}`);
+    assert.equal(document.dns.nameserver[0], `https://dns.example/dns-query#${preserved.name}`);
+    assert.ok(names.includes('Europe'));
+});
+
 test('Mihomo transformation publishes configured names instead of raw nodes', () => {
     const result = transformMihomoYaml(liveLikeMihomoYaml(), transformOptions());
     assert.equal(result.kind, 'mihomo');
@@ -104,6 +130,25 @@ test('Mihomo transformation publishes configured names instead of raw nodes', ()
     const publishedProxyNames = document.proxies.map((proxy) => proxy.name);
     assert.equal(publishedProxyNames.includes('Германия 🇩🇪'), false);
     assert.equal(publishedProxyNames.includes('🇩🇪 Germany · 1'), true);
+});
+
+test('Mihomo removes deleted proxy references and repairs default selection and rules', () => {
+    const result = transformMihomoYaml(YAML.stringify({
+        proxies: [{ name: 'Germany live', type: 'vless', server: 'live.example', port: 443 }],
+        'proxy-groups': [
+            { name: 'Select', type: 'select', proxies: ['Removed', 'Germany live'], 'default-selected': 'Removed' },
+            { name: 'Old', type: 'select', proxies: ['Removed'] },
+        ],
+        rules: ['MATCH,Removed'],
+    }), transformOptions({ groups: { Europe: ['Germany'] }, fastestEnabled: false }));
+    assert.equal(result.kind, 'mihomo');
+    const document = result.document;
+    assert.equal(JSON.stringify(document).includes('Removed'), false);
+    const select = document['proxy-groups'].find(group => group.name === 'Select');
+    assert.deepEqual(select.proxies, ['Europe']);
+    assert.equal(select['default-selected'], 'Europe');
+    assert.deepEqual(document['proxy-groups'].find(group => group.name === 'Old').proxies, ['Europe']);
+    assert.equal(document.rules[0], 'MATCH,Europe');
 });
 
 test('Mihomo transformation applies hidden and fastest exclusion settings', () => {
