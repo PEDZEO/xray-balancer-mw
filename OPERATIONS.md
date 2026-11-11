@@ -68,6 +68,13 @@ Admin endpoints are also rate-limited (`admin_rate_limit_per_minute`, `admin_rat
 - Stored group settings are preserved so temporarily removed hosts can be restored. Remove obsolete UUIDs from group settings when convenient.
 - If no host catalog has ever loaded successfully, the service still uses a safe cached response or returns `HOST_CATALOG_UNAVAILABLE` instead of guessing group bindings.
 
+### Changing group names and membership
+- Group updates invalidate processed subscription caches immediately; both Happ/Xray and Mihomo use the new settings on the next request.
+- Automatic group refresh keeps the configured order and patterns, appending newly detected groups at the end.
+- Mihomo preserves an upstream routing group that conflicts with a configured name under a unique ` (panel)` name, repairing its references instead of bypassing filtering.
+- Deleted static Mihomo members are removed and invalid defaults fall back to a remaining member. Provider-backed/dynamic groups retain their runtime members.
+- Invalid admin updates leave the active configuration, persisted settings, and valid cache unchanged.
+
 ### Need to isolate a broken node quickly
 - Add node to quarantine via `/admin/quarantine`.
 - Verify `quarantine_count` in `/admin/quarantine` or `/admin/debug/stats`.

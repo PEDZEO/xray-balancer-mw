@@ -842,6 +842,30 @@ test('admin JSON endpoints return 413 without resetting oversized requests', asy
     assert.equal(body.message, 'Payload too large');
 });
 
+test('refreshing detected groups preserves administrator order and custom patterns', async (t) => {
+    const panel = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ response: [
+            { uuid: 'de', remark: 'Germany', isDisabled: false },
+            { uuid: 'fr', remark: 'France', isDisabled: false },
+            { uuid: 'se', remark: 'Sweden', isDisabled: false },
+        ] }));
+    });
+    const port = await listenOnRandomPort(panel);
+    t.after(() => closeServer(panel));
+    const balancer = await startBalancer(t, {
+        remnawave_url: `http://127.0.0.1:${port}`,
+        groups: { France: ['custom-fr'], Germany: ['custom-de'] },
+    }, { API_TOKEN: 'integration-api-token' });
+    const headers = { 'X-Admin-Token': 'integration-admin-token' };
+    const response = await fetch(`${balancer.baseUrl}/admin/refresh-groups`, { method: 'POST', headers });
+    const result = await response.json();
+    assert.equal(response.status, 200);
+    assert.deepEqual(Object.keys(result.groups).slice(0, 2), ['France', 'Germany']);
+    assert.deepEqual(result.groups.France, ['custom-fr']);
+    assert.deepEqual(result.groups.Germany, ['custom-de']);
+});
+
 test('admin hosts returns a sanitized panel host catalog', async (t) => {
     const panel = http.createServer((req, res) => {
         if (req.url !== '/api/hosts/') {
@@ -1117,6 +1141,71 @@ test('host UUID binding survives a panel host rename and refreshes the admin dis
     const groups = await (await fetch(`${balancer.baseUrl}/admin/groups`, { headers: adminHeaders })).json();
     assert.deepEqual(groups.group_hosts, { Europe: ['stable-host-uuid'] });
 });
+
+for (const format of ['Xray', 'Mihomo']) {
+    test(`renaming and moving host bindings refreshes cached ${format} subscriptions atomically`, async (t) => {
+        let upstreamHits = 0;
+        const panel = http.createServer((req, res) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ response: [{ uuid: 'stable-host', remark: 'Germany-1' }] }));
+        });
+        const upstream = http.createServer((req, res) => {
+            upstreamHits += 1;
+            res.writeHead(200, { 'Content-Type': format === 'Xray' ? 'application/json' : 'text/yaml' });
+            res.end(format === 'Xray' ? validXrayPayload() : YAML.stringify({
+                proxies: [{ name: 'Germany-1', type: 'vless', server: 'node.example.com', port: 443 }],
+                'proxy-groups': [{ name: 'Main', type: 'select', proxies: ['Germany-1'] }],
+                rules: ['MATCH,Main'],
+            }));
+        });
+        const panelPort = await listenOnRandomPort(panel);
+        const upstreamPort = await listenOnRandomPort(upstream);
+        t.after(() => closeServer(panel));
+        t.after(() => closeServer(upstream));
+        const balancer = await startBalancer(t, {
+            upstreamPort,
+            remnawave_url: `http://127.0.0.1:${panelPort}`,
+            groups: { Original: [] },
+            group_hosts: { Original: ['stable-host'] },
+            testRuntimePatch: {},
+        }, { API_TOKEN: 'integration-api-token' });
+        const headers = { 'User-Agent': format === 'Xray' ? 'Happ/1.0' : 'Mihomo/1.19.15' };
+        const adminHeaders = { 'X-Admin-Token': 'integration-admin-token', 'Content-Type': 'application/json' };
+        const readNames = async () => {
+            const response = await fetch(`${balancer.baseUrl}/move-token`, { headers });
+            assert.equal(response.status, 200);
+            const body = await response.text();
+            return format === 'Xray' ? JSON.parse(body).map(item => item.remarks)
+                : YAML.parse(body)['proxy-groups'].map(group => group.name);
+        };
+        assert.ok((await readNames()).includes('Original'));
+        await readNames();
+        assert.equal(upstreamHits, 1);
+        for (const name of ['Renamed', 'Destination']) {
+            const update = await fetch(`${balancer.baseUrl}/admin/groups`, {
+                method: 'PUT', headers: adminHeaders,
+                body: JSON.stringify({ groups: { [name]: [] }, group_hosts: { [name]: ['stable-host'] } }),
+            });
+            assert.equal(update.status, 200);
+            assert.equal((await update.json()).persisted, true);
+            const names = await readNames();
+            assert.ok(names.includes(name));
+            assert.equal(names.includes('Original'), false);
+            if (name === 'Destination') assert.equal(names.includes('Renamed'), false);
+        }
+        assert.equal(upstreamHits, 3);
+        const saved = fs.readFileSync(balancer.runtimePatchPath, 'utf8');
+        assert.deepEqual(JSON.parse(saved).group_hosts, { Destination: ['stable-host'] });
+        const invalid = await fetch(`${balancer.baseUrl}/admin/groups`, {
+            method: 'PUT', headers: adminHeaders,
+            body: JSON.stringify({ groups: { Broken: 'not-an-array' } }),
+        });
+        assert.equal(invalid.status, 422);
+        assert.equal(fs.readFileSync(balancer.runtimePatchPath, 'utf8'), saved);
+        assert.ok((await readNames()).includes('Destination'));
+        assert.equal(upstreamHits, 3);
+    });
+}
 
 test('admin groups update invalidates subscription cache immediately', async (t) => {
     let upstreamHits = 0;
