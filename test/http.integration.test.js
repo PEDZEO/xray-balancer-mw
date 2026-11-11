@@ -950,8 +950,97 @@ test('unresolved UUID host bindings fail closed instead of mixing nodes into the
     assert.equal(body.code, 'HOST_CATALOG_UNAVAILABLE');
 });
 
+for (const catalog of [[], {}]) {
+    test(`missing bindings handle ${Array.isArray(catalog) ? 'an empty' : 'a malformed'} panel catalog safely`, async (t) => {
+        const panel = http.createServer((req, res) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ response: catalog }));
+        });
+        const upstream = http.createServer((req, res) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(validXrayPayload());
+        });
+        const panelPort = await listenOnRandomPort(panel);
+        const upstreamPort = await listenOnRandomPort(upstream);
+        t.after(() => Promise.all([closeServer(panel), closeServer(upstream)]));
+        const balancer = await startBalancer(t, {
+            upstreamPort,
+            remnawave_url: `http://127.0.0.1:${panelPort}`,
+            groups: { RemovedGroup: [] },
+            group_hosts: { RemovedGroup: ['removed-id'] },
+        }, { API_TOKEN: 'integration-api-token' });
+        const response = await fetch(`${balancer.baseUrl}/missing-binding`, { headers: { 'User-Agent': 'Happ/1.0' } });
+        const body = await response.text();
+        if (Array.isArray(catalog)) {
+            assert.equal(response.status, 200, body);
+            assert.doesNotMatch(body, /RemovedGroup/);
+        } else {
+            assert.equal(response.status, 503, body);
+            assert.equal(JSON.parse(body).code, 'HOST_CATALOG_UNAVAILABLE');
+        }
+        assert.equal((await fetch(`${balancer.baseUrl}/health`)).status, 200);
+    });
+}
+
+for (const format of ['xray', 'mihomo']) {
+    test(`deleted host bindings do not block remaining ${format} subscriptions or retain cached hosts`, async (t) => {
+        let deleted = false;
+        let hits = 0;
+        const panel = http.createServer((req, res) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ response: [
+                ...(!deleted ? [{ uuid: 'removed-id', remark: 'Removed', address: 'removed.example', port: 443 }] : []),
+                { uuid: 'live-id', remark: 'Live', address: 'live.example', port: 443 },
+            ] }));
+        });
+        const upstream = http.createServer((req, res) => {
+            hits += 1;
+            const names = deleted ? ['Live'] : ['Removed', 'Live'];
+            if (format === 'mihomo') {
+                res.writeHead(200, { 'Content-Type': 'text/yaml' });
+                res.end(YAML.stringify({
+                    proxies: names.map((name) => ({ name, type: 'vless', server: `${name.toLowerCase()}.example`, port: 443 })),
+                    'proxy-groups': [{ name: 'Main', type: 'select', proxies: names }],
+                    rules: ['MATCH,Main'],
+                }));
+            } else {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify([{ remarks: 'nodes', outbounds: names.map((name) => ({
+                    tag: name, protocol: 'vless', settings: { vnext: [{ address: `${name.toLowerCase()}.example`, port: 443 }] },
+                })) }]));
+            }
+        });
+        const panelPort = await listenOnRandomPort(panel);
+        const upstreamPort = await listenOnRandomPort(upstream);
+        t.after(() => Promise.all([closeServer(panel), closeServer(upstream)]));
+        const balancer = await startBalancer(t, {
+            upstreamPort,
+            remnawave_url: `http://127.0.0.1:${panelPort}`,
+            groups: { RemovedGroup: [], LiveGroup: [] },
+            group_hosts: { RemovedGroup: ['removed-id'], LiveGroup: ['live-id'] },
+        }, { API_TOKEN: 'integration-api-token' });
+        const headers = { 'User-Agent': format === 'mihomo' ? 'Mihomo/1.19.15' : 'Happ/1.0' };
+        const first = await fetch(`${balancer.baseUrl}/deletion-token`, { headers });
+        assert.equal(first.status, 200);
+        assert.match(await first.text(), /removed\.example/);
+        deleted = true;
+        await fetch(`${balancer.baseUrl}/admin/hosts`, { headers: { 'X-Admin-Token': 'integration-admin-token' } });
+        const response = await fetch(`${balancer.baseUrl}/deletion-token`, { headers });
+        const body = await response.text();
+        assert.equal(response.status, 200, body);
+        assert.match(body, /live\.example/);
+        assert.doesNotMatch(body, /removed\.example|RemovedGroup/);
+        assert.equal(hits, 2);
+        // A new token has no cached fallback, so the successful response is rebuilt.
+        const fresh = await fetch(`${balancer.baseUrl}/fresh-after-delete`, { headers });
+        assert.equal(fresh.status, 200);
+        assert.doesNotMatch(await fresh.text(), /removed\.example|RemovedGroup/);
+    });
+}
+
 test('host UUID binding survives a panel host rename and refreshes the admin display name', async (t) => {
     let hostRemark = 'Germany Old';
+    let hostAddress = 'de.example.com';
     let upstreamHits = 0;
     const panel = http.createServer((req, res) => {
         if (req.url !== '/api/hosts/') {
@@ -964,7 +1053,7 @@ test('host UUID binding survives a panel host rename and refreshes the admin dis
             response: [{
                 uuid: 'stable-host-uuid',
                 remark: hostRemark,
-                address: 'de.example.com',
+                address: hostAddress,
                 port: 443,
                 isDisabled: false,
             }],
@@ -976,7 +1065,7 @@ test('host UUID binding survives a panel host rename and refreshes the admin dis
         res.end(YAML.stringify({
             proxies: [
                 { name: 'Direct', type: 'direct' },
-                { name: hostRemark, type: 'vless', server: 'de.example.com', port: 443 },
+                { name: hostRemark, type: 'vless', server: hostAddress, port: 443 },
             ],
             'proxy-groups': [{ name: 'Main', type: 'select', proxies: ['Direct', hostRemark] }],
             rules: ['MATCH,Main'],
@@ -1015,6 +1104,15 @@ test('host UUID binding survives a panel host rename and refreshes the admin dis
     })).text());
     assert.deepEqual(second['proxy-groups'].find((group) => group.name === 'Europe').proxies, ['Europe · 1']);
     assert.equal(upstreamHits, 2);
+
+    hostAddress = 'replacement.example.com';
+    await fetch(`${balancer.baseUrl}/admin/hosts`, { headers: adminHeaders });
+    const moved = await fetch(`${balancer.baseUrl}/rename-token`, {
+        headers: { 'User-Agent': 'Mihomo/1.19.15' },
+    });
+    assert.equal(moved.status, 200);
+    assert.match(await moved.text(), /replacement\.example\.com/);
+    assert.equal(upstreamHits, 3);
 
     const groups = await (await fetch(`${balancer.baseUrl}/admin/groups`, { headers: adminHeaders })).json();
     assert.deepEqual(groups.group_hosts, { Europe: ['stable-host-uuid'] });

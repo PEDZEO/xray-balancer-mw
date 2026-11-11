@@ -61,6 +61,13 @@ Admin endpoints are also rate-limited (`admin_rate_limit_per_minute`, `admin_rat
 - Adjust `groups` patterns.
 - Use `/admin/debug/token/{token}` to inspect payload type and cache behavior.
 
+### A panel host was removed or replaced
+- Missing UUID bindings are ignored after a successful host-catalog load. Groups with no remaining host bindings or patterns are omitted from subscription output.
+- Remaining authorized upstream nodes continue to be served; deleting a host does not require manually cleaning every group first.
+- Host deletion, address/port changes, and disabled-state changes invalidate cached subscriptions when the catalog refreshes (normally within 30 seconds). Refresh `/admin/hosts` to fetch the catalog immediately.
+- Stored group settings are preserved so temporarily removed hosts can be restored. Remove obsolete UUIDs from group settings when convenient.
+- If no host catalog has ever loaded successfully, the service still uses a safe cached response or returns `HOST_CATALOG_UNAVAILABLE` instead of guessing group bindings.
+
 ### Need to isolate a broken node quickly
 - Add node to quarantine via `/admin/quarantine`.
 - Verify `quarantine_count` in `/admin/quarantine` or `/admin/debug/stats`.

@@ -1561,7 +1561,7 @@ async function fetchHostsFromApi() {
         if (response.status !== 200) return { ok: false, error: `Panel API returned ${response.status}`, hosts: null };
         const data = JSON.parse(response.body);
         const hosts = data.response || (Array.isArray(data) ? data : null);
-        if (!hosts) return { ok: false, error: 'Panel API response does not contain hosts', hosts: null };
+        if (!Array.isArray(hosts)) return { ok: false, error: 'Panel API response does not contain hosts', hosts: null };
         return { ok: true, error: null, hosts };
     } catch (err) {
         console.error('[host-catalog] Ошибка:', err.message);
@@ -1571,8 +1571,11 @@ async function fetchHostsFromApi() {
 
 function updateHostCatalog(hosts, requestId = 'host-catalog') {
     const nextCatalog = buildAdminHostCatalog(hosts);
-    const previousBindingState = JSON.stringify(hostCatalogCache.map(({ uuid, remark }) => ({ uuid, remark })));
-    const nextBindingState = JSON.stringify(nextCatalog.map(({ uuid, remark }) => ({ uuid, remark })));
+    const bindingState = (catalog) => catalog.map(({ uuid, remark, address, port, is_disabled }) => (
+        { uuid, remark, address, port, is_disabled }
+    ));
+    const previousBindingState = JSON.stringify(bindingState(hostCatalogCache));
+    const nextBindingState = JSON.stringify(bindingState(nextCatalog));
     const changed = previousBindingState !== nextBindingState;
 
     hostCatalogCache = nextCatalog;
@@ -1644,7 +1647,7 @@ function resolveConfiguredGroups(groups, groupHosts, hosts) {
             seen.add(remark.toLowerCase());
         }
         return [groupName, resolvedPatterns];
-    }));
+    }).filter(([groupName, patterns]) => patterns.length > 0 || !(groupHosts[groupName]?.length > 0)));
 }
 
 function findUnresolvedGroupHostIds(groupHosts, hosts) {
@@ -2925,6 +2928,11 @@ const server = http.createServer(async (req, res) => {
     }
     logger.info('request_start', { request_id: requestId, method: req.method, path: safePath, ip: clientIp });
 
+    const hasHostBindings = Object.values(GROUP_HOSTS)
+        .some((hostIds) => Array.isArray(hostIds) && hostIds.length > 0);
+    // Refresh bindings before serving cache so host edits invalidate old responses.
+    if (hasHostBindings) await refreshHostCatalog({ requestId });
+
     const cachedSubscription = subscriptionCache.get(cacheKey);
     if (cachedSubscription) {
         runtimeStats.cache_hits_total += 1;
@@ -2950,12 +2958,10 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    const hasHostBindings = Object.values(GROUP_HOSTS)
-        .some((hostIds) => Array.isArray(hostIds) && hostIds.length > 0);
     if (hasHostBindings) {
-        await refreshHostCatalog({ requestId });
         const unresolvedHostIds = findUnresolvedGroupHostIds(GROUP_HOSTS, hostCatalogCache);
-        if (unresolvedHostIds.length > 0) {
+        // A successful catalog can legitimately omit hosts deleted in the panel.
+        if (unresolvedHostIds.length > 0 && lastHostCatalogRefreshAt === 0) {
             const fallback = getCachedFallback(cacheKey);
             if (fallback) {
                 runtimeStats.cache_fallback_total += 1;
