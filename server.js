@@ -1160,8 +1160,7 @@ async function updateAutoQuarantineFromNodes(nodes) {
         const isConnected = Boolean(node.isConnected);
         const isDisabled = Boolean(node.isDisabled);
         const usersOnline = node.usersOnline || 0;
-        const totalRamGb = parseRamGb(node.totalRam);
-        const cpuCount = node.cpuCount || 1;
+        const { totalRamGb, cpuCount } = readNodeCapacity(node);
         const { load } = computeNodeLoad(usersOnline, totalRamGb, cpuCount);
         const degraded = !isConnected || isDisabled || load > 1.0;
 
@@ -1269,6 +1268,16 @@ function parseRamGb(ramStr) {
     return val;
 }
 
+function readNodeCapacity(node) {
+    const memoryBytes = Number(node?.system?.info?.memoryTotal);
+    const cpus = Number(node?.system?.info?.cpus);
+    return {
+        totalRamGb: Number.isFinite(memoryBytes) && memoryBytes > 0
+            ? memoryBytes / (1024 ** 3) : parseRamGb(node.totalRam),
+        cpuCount: Number.isFinite(cpus) && cpus > 0 ? cpus : (node.cpuCount || 1),
+    };
+}
+
 function computeNodeLoad(usersOnline, totalRamGb, cpuCount) {
     const ramLoad = totalRamGb > 0 ? usersOnline / totalRamGb : 999;
     const cpuLoad = cpuCount > 0 ? usersOnline / cpuCount : 999;
@@ -1309,8 +1318,7 @@ function updateAutoDrainFromNodes(nodes) {
         activeNames.add(nodeName);
 
         const usersOnline = node.usersOnline || 0;
-        const totalRamGb = parseRamGb(node.totalRam);
-        const cpuCount = node.cpuCount || 1;
+        const { totalRamGb, cpuCount } = readNodeCapacity(node);
         const isConnected = Boolean(node.isConnected);
         const isDisabled = Boolean(node.isDisabled);
         const { load } = computeNodeLoad(usersOnline, totalRamGb, cpuCount);
@@ -1406,8 +1414,7 @@ async function fetchNodeStatsNow() {
             activeNodeNames.push(name);
             const address = typeof node.address === 'string' ? node.address.trim() : '';
             const usersOnline = node.usersOnline || 0;
-            const totalRamGb = parseRamGb(node.totalRam);
-            const cpuCount = node.cpuCount || 1;
+            const { totalRamGb, cpuCount } = readNodeCapacity(node);
             const isConnected = node.isConnected || false;
             const isDisabled = node.isDisabled || false;
             const panelLatencyMs = readNodeLatencyMs(node);
