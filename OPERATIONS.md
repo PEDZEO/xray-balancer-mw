@@ -67,6 +67,8 @@ Admin endpoints are also rate-limited (`admin_rate_limit_per_minute`, `admin_rat
 - Host deletion, address/port changes, and disabled-state changes invalidate cached subscriptions when the catalog refreshes (normally within 30 seconds). Refresh `/admin/hosts` to fetch the catalog immediately.
 - Stored group settings are preserved so temporarily removed hosts can be restored. Remove obsolete UUIDs from group settings when convenient.
 - If no host catalog has ever loaded successfully, the service still uses a safe cached response or returns `HOST_CATALOG_UNAVAILABLE` instead of guessing group bindings.
+- Validate the public HTTPS subscription as well as the middleware response. A post-processing proxy can otherwise reintroduce profiles after the middleware has removed them.
+- The optional compatibility overlay source is tracked in `ops/subscription-overlay.js`. It must not synthesize DNS comparison profiles; deleting them upstream takes effect on the next refresh. Deploy that file separately to the mounted overlay service when used.
 
 ### Changing group names and membership
 - Group updates invalidate processed subscription caches immediately; both Happ/Xray and Mihomo use the new settings on the next request.
