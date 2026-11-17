@@ -8,7 +8,6 @@ const { normalizeStrategy, validateConfig } = require('./lib/config');
 const { normalizeRequestId, redactTokenPath, sanitizeClientMetadata } = require('./lib/security');
 const {
     computePublishedGroupEntries,
-    filterHiddenOutbounds,
     filterAndSortByLoad,
     getNodeStats,
     matchGroup,
@@ -17,11 +16,17 @@ const { createCircuitBreakerRegistry, createKeyedRateLimiter, createRateLimiter,
 const { buildLogger } = require('./lib/log');
 const { resolveProfile } = require('./lib/profile');
 const { classifyUpstreamPayload } = require('./lib/upstream-contract');
-const { buildGroupConfig, mergeProfileBaseConfigs } = require('./lib/group-builder');
+const { buildGroupConfig, filterUsableOutbounds, mergeProfileBaseConfigs } = require('./lib/group-builder');
 const { buildStickyTokenKey, createStickyStore } = require('./lib/sticky');
 const { createRequestGuard } = require('./lib/request-guard');
 const { readEffectiveRuntime } = require('./lib/runtime-config');
 const { createNodeProtectionManager } = require('./lib/node-protection');
+const {
+    createSubscriptionIdentity,
+    normalizeAddress,
+    outboundEndpoints,
+    readHostNodeIds,
+} = require('./lib/subscription-identity');
 const { transformMihomoYaml } = require('./lib/mihomo');
 const { createHealthChecker } = require('./lib/health-checker');
 const {
@@ -310,9 +315,13 @@ function panelHeaders() {
 
 // Кэш статистики нод: { "Finland2": { usersOnline: 9, totalRamGb: 2.06, cpuCount: 1, ramLoad: 4.37, cpuLoad: 9, load: 0.23 }, ... }
 let nodeStatsCache = {};
+let nodeIdentityCache = [];
+let lastNodeCatalogAttemptAt = 0;
+let nodeCatalogFetchInFlight = null;
 const nodeHealthChecker = createHealthChecker({ maxHistory: 10 });
 let hostCatalogCache = [];
 let rawHostCatalogCache = [];
+let hostIdentityCache = [];
 let lastHostCatalogRefreshAt = 0;
 let lastHostCatalogAttemptAt = 0;
 let lastHostCatalogError = null;
@@ -632,7 +641,7 @@ function fetchUrl(targetUrl, headers = {}, maxRedirects = MAX_REDIRECTS, deadlin
                 return;
             }
 
-            let data = '';
+            const chunks = [];
             let size = 0;
             res.on('data', (chunk) => {
                 if (settled) return;
@@ -643,9 +652,13 @@ function fetchUrl(targetUrl, headers = {}, maxRedirects = MAX_REDIRECTS, deadlin
                     fail(err);
                     return;
                 }
-                data += chunk;
+                chunks.push(chunk);
             });
-            res.on('end', () => succeed({ status: res.statusCode, headers: res.headers, body: data }));
+            res.on('end', () => succeed({
+                status: res.statusCode,
+                headers: res.headers,
+                body: Buffer.concat(chunks, size).toString('utf8'),
+            }));
         });
         req.on('error', fail);
         req.setTimeout(remainingMs, () => {
@@ -1374,20 +1387,49 @@ function updateAutoDrainFromNodes(nodes) {
 
 // ─── Node Stats — опрос панели ───
 
+async function fetchPanelNodes() {
+    if (nodeCatalogFetchInFlight) return nodeCatalogFetchInFlight;
+    lastNodeCatalogAttemptAt = Date.now();
+    nodeCatalogFetchInFlight = (async () => {
+        const response = await fetchUrl(`${REMNAWAVE_URL}/api/nodes/`, panelHeaders());
+        if (response.status !== 200) throw new Error(`Panel API returned ${response.status}`);
+        const data = JSON.parse(response.body);
+        const payload = data?.response ?? data;
+        const nodes = Array.isArray(payload) ? payload : payload?.nodes;
+        if (!Array.isArray(nodes)) throw new Error('Panel API response does not contain nodes');
+        const identities = nodes.filter((node) => node?.name || node?.uuid || node?.id).map((node) => ({
+            id: normalizeNodeName(node.uuid || node.id),
+            name: normalizeNodeName(node.name),
+            displayName: String(node.name || '').trim(),
+            address: normalizeAddress(node.address),
+        })).sort((left, right) => (left.id || left.name).localeCompare(right.id || right.name));
+        const changed = JSON.stringify(nodeIdentityCache) !== JSON.stringify(identities);
+        nodeIdentityCache = identities;
+        if (changed && (QUARANTINE_NODES.length || ensureNodeProtectionManager().summary().protected)) {
+            clearSubscriptionCache('node_identity_changed', 'node-catalog');
+        }
+        return nodes;
+    })().finally(() => { nodeCatalogFetchInFlight = null; });
+    return nodeCatalogFetchInFlight;
+}
+
+async function refreshNodeIdentitiesForIsolation() {
+    if (!API_TOKEN || !REMNAWAVE_URL) return;
+    if (!nodeCatalogFetchInFlight && Date.now() - lastNodeCatalogAttemptAt < NODE_STATS_INTERVAL) return;
+    try {
+        await fetchPanelNodes();
+    } catch (err) {
+        logger.warn('node_identity_refresh_failed', { error: err.message });
+    }
+}
+
 async function fetchNodeStatsNow() {
     if (!API_TOKEN || !REMNAWAVE_URL) {
         lastNodeStatsError = 'API token or REMNAWAVE_URL is missing';
         return { ok: false, error: lastNodeStatsError };
     }
     try {
-        const response = await fetchUrl(`${REMNAWAVE_URL}/api/nodes/`, panelHeaders());
-        if (response.status !== 200) {
-            console.error('[node-stats] API вернул', response.status);
-            lastNodeStatsError = `Panel API returned ${response.status}`;
-            return { ok: false, error: lastNodeStatsError };
-        }
-        const data = JSON.parse(response.body);
-        const nodes = data.response || (Array.isArray(data) ? data : []);
+        const nodes = await fetchPanelNodes();
         updateAutoDrainFromNodes(nodes);
         await updateAutoQuarantineFromNodes(nodes);
         await updateNodeProtectionFromNodes(nodes);
@@ -1578,14 +1620,12 @@ async function fetchHostsFromApi() {
 
 function updateHostCatalog(hosts, requestId = 'host-catalog') {
     const nextCatalog = buildAdminHostCatalog(hosts);
-    const bindingState = (catalog) => catalog.map(({ uuid, remark, address, port, is_disabled }) => (
-        { uuid, remark, address, port, is_disabled }
-    ));
-    const previousBindingState = JSON.stringify(bindingState(hostCatalogCache));
-    const nextBindingState = JSON.stringify(bindingState(nextCatalog));
-    const changed = previousBindingState !== nextBindingState;
+    const nodeIdsByHost = new Map(hosts.map((host) => [String(host?.uuid || host?.id || '').trim(), readHostNodeIds(host)]));
+    const nextIdentities = nextCatalog.map((host) => ({ ...host, nodeIds: nodeIdsByHost.get(host.uuid) || [] }));
+    const changed = JSON.stringify(hostIdentityCache) !== JSON.stringify(nextIdentities);
 
     hostCatalogCache = nextCatalog;
+    hostIdentityCache = nextIdentities;
     lastHostCatalogRefreshAt = Date.now();
     lastHostCatalogError = null;
     if (changed) {
@@ -1596,6 +1636,7 @@ function updateHostCatalog(hosts, requestId = 'host-catalog') {
 
 async function refreshHostCatalog(opts = {}) {
     if (!API_TOKEN) return { ok: false, error: 'API token is missing', hosts: hostCatalogCache };
+    if (hostCatalogRefreshInFlight) return hostCatalogRefreshInFlight;
     const fresh = lastHostCatalogRefreshAt > 0
         && (Date.now() - lastHostCatalogRefreshAt) < HOST_CATALOG_TTL;
     if (opts.force !== true && fresh) {
@@ -1613,8 +1654,6 @@ async function refreshHostCatalog(opts = {}) {
             stale: true,
         };
     }
-    if (hostCatalogRefreshInFlight) return hostCatalogRefreshInFlight;
-
     hostCatalogRefreshInFlight = (async () => {
         lastHostCatalogAttemptAt = Date.now();
         const result = await fetchHostsFromApi();
@@ -1640,36 +1679,6 @@ async function refreshHostCatalog(opts = {}) {
         hostCatalogRefreshInFlight = null;
     });
     return hostCatalogRefreshInFlight;
-}
-
-function resolveConfiguredGroups(groups, groupHosts, hosts) {
-    const hostsById = new Map(hosts.map((host) => [host.uuid, host]));
-    return Object.fromEntries(Object.entries(groups).map(([groupName, patterns]) => {
-        const resolvedPatterns = [...patterns];
-        const seen = new Set(resolvedPatterns.map((pattern) => pattern.trim().toLowerCase()));
-        for (const hostId of groupHosts[groupName] || []) {
-            const remark = hostsById.get(hostId)?.remark?.trim();
-            if (!remark || seen.has(remark.toLowerCase())) continue;
-            resolvedPatterns.push(remark);
-            seen.add(remark.toLowerCase());
-        }
-        return [groupName, resolvedPatterns];
-    }).filter(([groupName, patterns]) => patterns.length > 0 || !(groupHosts[groupName]?.length > 0)));
-}
-
-function findUnresolvedGroupHostIds(groupHosts, hosts) {
-    const knownIds = new Set(hosts.map((host) => host.uuid));
-    const unresolved = [];
-    for (const [groupName, hostIds] of Object.entries(groupHosts || {})) {
-        for (const hostId of hostIds || []) {
-            if (!knownIds.has(hostId)) unresolved.push({ groupName, hostId });
-        }
-    }
-    return unresolved;
-}
-
-function getEffectiveGroups() {
-    return resolveConfiguredGroups(GROUPS, GROUP_HOSTS, hostCatalogCache);
 }
 
 function buildGroupsFromHosts(hosts) {
@@ -1731,6 +1740,7 @@ async function refreshGroups(opts = {}) {
 function collectAllProxyOutbounds(configArray) {
     const systemProtocols = new Set(['freedom', 'blackhole', 'dns', 'loopback']);
     const allOutbounds = [];
+    const names = new WeakMap();
     const seenTags = new Set(['proxy', 'direct', 'block']);
 
     for (const cfg of configArray) {
@@ -1771,6 +1781,7 @@ function collectAllProxyOutbounds(configArray) {
         for (let index = 0; index < outbounds.length; index += 1) {
             const cloned = structuredClone(outbounds[index]);
             cloned.tag = assignedTags[index];
+            names.set(cloned, outbounds[index].tag === 'proxy' ? remarks : outbounds[index].tag);
             if (cfg.description && !cloned.description) cloned.description = cfg.description;
             if (cfg.serverDescription && !cloned.serverDescription) cloned.serverDescription = cfg.serverDescription;
             if (cfg.server_description && !cloned.server_description) cloned.server_description = cfg.server_description;
@@ -1788,7 +1799,7 @@ function collectAllProxyOutbounds(configArray) {
         }
     }
 
-    return allOutbounds;
+    return { outbounds: allOutbounds, names };
 }
 
 // ─── HTTP сервер ───
@@ -2002,15 +2013,6 @@ function buildQuarantineSet() {
     return new Set(QUARANTINE_NODES.map(normalizeNodeName).filter(Boolean));
 }
 
-function buildProtectionSet() {
-    return new Set(
-        ensureNodeProtectionManager()
-            .list({ protectedOnly: true })
-            .map((node) => node.normalizedNode)
-            .filter(Boolean)
-    );
-}
-
 function buildGroupNameSet(names) {
     return new Set((Array.isArray(names) ? names : []).map(normalizeNodeName).filter(Boolean));
 }
@@ -2025,6 +2027,17 @@ function isNodeQuarantined(tag, quarantineSet, sourceNode = null) {
     if (normalizedSourceNode && quarantineSet.has(normalizedSourceNode)) return true;
 
     return false;
+}
+
+function getProtectionNodeRef(value) {
+    const key = normalizeNodeName(value);
+    const nodeById = nodeIdentityCache.find(({ id }) => id === key);
+    if (nodeById) return { id: nodeById.id, name: nodeById.displayName || value };
+    const protectedNode = ensureNodeProtectionManager().list({ protectedOnly: true })
+        .find(({ nodeId }) => normalizeNodeName(nodeId) === key);
+    if (protectedNode) return { id: protectedNode.nodeId, name: protectedNode.nodeName };
+    const nodeByName = nodeIdentityCache.find(({ id, name }) => id && name === key);
+    return nodeByName ? { id: nodeByName.id, name: nodeByName.displayName || value } : value;
 }
 
 function getNodeStatsAgeMs(now = Date.now()) {
@@ -2531,15 +2544,9 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
 
+            await refreshNodeIdentitiesForIsolation();
             const manager = ensureNodeProtectionManager();
-            const matchingStats = Object.values(nodeStatsCache).find((stats) => (
-                normalizeNodeName(stats?.sourceNode) === normalizeNodeName(nodeName)
-                && stats?.sourceNodeId
-            ));
-            const nodeRef = matchingStats?.sourceNodeId
-                ? { id: matchingStats.sourceNodeId, name: nodeName }
-                : nodeName;
-            const result = manager.isolateManual(nodeRef, {
+            const result = manager.isolateManual(getProtectionNodeRef(nodeName), {
                 reason,
                 source: 'admin',
                 ttlSec,
@@ -2588,7 +2595,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         const manager = ensureNodeProtectionManager();
-        const result = manager.release(nodeName, { reason: 'manual_release', source: 'admin' });
+        const result = manager.release(getProtectionNodeRef(nodeName), { reason: 'manual_release', source: 'admin' });
         const persisted = await syncProtectionTransitions(manager.drainEvents(), requestId);
         res.writeHead(persisted.persisted ? 200 : 500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -2945,8 +2952,13 @@ const server = http.createServer(async (req, res) => {
 
     const hasHostBindings = Object.values(GROUP_HOSTS)
         .some((hostIds) => Array.isArray(hostIds) && hostIds.length > 0);
+    const hasIsolatedNodes = QUARANTINE_NODES.length > 0 || ensureNodeProtectionManager().summary().protected > 0;
     // Refresh bindings before serving cache so host edits invalidate old responses.
-    if (hasHostBindings) await refreshHostCatalog({ requestId });
+    if (hasIsolatedNodes) {
+        await Promise.all([refreshHostCatalog({ requestId }), refreshNodeIdentitiesForIsolation()]);
+    } else if (hasHostBindings) {
+        await refreshHostCatalog({ requestId });
+    }
 
     const cachedSubscription = subscriptionCache.get(cacheKey);
     if (cachedSubscription) {
@@ -2973,42 +2985,34 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (hasHostBindings) {
-        const unresolvedHostIds = findUnresolvedGroupHostIds(GROUP_HOSTS, hostCatalogCache);
-        // A successful catalog can legitimately omit hosts deleted in the panel.
-        if (unresolvedHostIds.length > 0 && lastHostCatalogRefreshAt === 0) {
-            const fallback = getCachedFallback(cacheKey);
-            if (fallback) {
-                runtimeStats.cache_fallback_total += 1;
-                if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
-                logger.warn('cache_fallback_host_catalog_unavailable', {
-                    request_id: requestId,
-                    cache_kind: fallback.kind,
-                    unresolved_host_ids: unresolvedHostIds.length,
-                });
-                res.writeHead(200, forwardResponseHeaders(
-                    fallback.item.headers,
-                    getResponseContentType(fallback.item.headers)
-                ));
-                res.end(fallback.item.body);
-                return;
-            }
-
-            logger.error('host_catalog_bindings_unresolved', {
+    if (hasHostBindings && lastHostCatalogRefreshAt === 0) {
+        const fallback = getCachedFallback(cacheKey);
+        if (fallback) {
+            runtimeStats.cache_fallback_total += 1;
+            if (fallback.kind === 'stale') runtimeStats.cache_fallback_stale_total += 1;
+            logger.warn('cache_fallback_host_catalog_unavailable', {
                 request_id: requestId,
-                unresolved_host_ids: unresolvedHostIds.length,
+                cache_kind: fallback.kind,
             });
-            res.writeHead(503, {
-                'Content-Type': 'application/json; charset=utf-8',
-                'Retry-After': '30',
-            });
-            res.end(JSON.stringify({
-                status: 'error',
-                code: 'HOST_CATALOG_UNAVAILABLE',
-                request_id: requestId,
-            }));
+            res.writeHead(200, forwardResponseHeaders(
+                fallback.item.headers,
+                getResponseContentType(fallback.item.headers)
+            ));
+            res.end(fallback.item.body);
             return;
         }
+
+        logger.error('host_catalog_bindings_unresolved', { request_id: requestId });
+        res.writeHead(503, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Retry-After': '30',
+        });
+        res.end(JSON.stringify({
+            status: 'error',
+            code: 'HOST_CATALOG_UNAVAILABLE',
+            request_id: requestId,
+        }));
+        return;
     }
 
     const circuitDecision = requestGuard.evaluateCircuit(upstreamKey);
@@ -3076,16 +3080,23 @@ const server = http.createServer(async (req, res) => {
             return;
         }
         const classified = classifyUpstreamPayload(upstream.body);
-        const effectiveGroups = getEffectiveGroups();
+        const effectiveGroups = GROUPS;
+        const quarantineSet = buildQuarantineSet();
+        const protectedNodes = ensureNodeProtectionManager().list({ protectedOnly: true });
+        const identifyProxy = createSubscriptionIdentity({
+            hosts: hostIdentityCache,
+            groupHosts: GROUP_HOSTS,
+            groupOrder: Object.keys(effectiveGroups),
+            nodes: nodeIdentityCache,
+            quarantine: quarantineSet,
+            protectedNodes,
+        });
         if (classified.type === 'non_json') {
             runtimeStats.upstream_non_json_total += 1;
             const runtime = getRuntimeConfig();
-            const excludedNodes = new Set([
-                ...buildQuarantineSet(),
-                ...buildProtectionSet(),
-            ]);
             const mihomo = transformMihomoYaml(upstream.body, {
                 groups: effectiveGroups,
+                identifyProxy,
                 strategy: STRATEGY,
                 fastestEnabled: config.fastest_group !== false,
                 fastestName: config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME,
@@ -3094,7 +3105,6 @@ const server = http.createServer(async (req, res) => {
                 expandGroupsToNodes: EXPAND_GROUPS_TO_NODES,
                 hiddenGroups: HIDDEN_GROUPS,
                 hiddenNodes: HIDDEN_NODES,
-                excludedNodes,
                 probeUrl: PROBE_URL,
                 fastestProbeUrl: runtime.fastestProbeUrl,
                 probeInterval: runtime.probeInterval,
@@ -3180,7 +3190,8 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
-        let allOutbounds = collectAllProxyOutbounds(configArray);
+        const collected = collectAllProxyOutbounds(configArray);
+        let allOutbounds = collected.outbounds;
         logger.info('outbounds_collected', { request_id: requestId, count: allOutbounds.length });
 
         if (allOutbounds.length === 0) {
@@ -3190,6 +3201,11 @@ const server = http.createServer(async (req, res) => {
         }
 
         // ─── Фильтрация и сортировка по нагрузке ───
+        const identities = new Map(allOutbounds.map((outbound) => {
+            const name = collected.names.get(outbound);
+            const identity = identifyProxy(name, outboundEndpoints(outbound));
+            return [outbound, { ...identity, groupName: identity.groupName || matchGroup(effectiveGroups, name) }];
+        }));
         const nodeStatsFresh = isNodeStatsFresh();
         if (NODE_STATS_ENABLED && nodeStatsFresh && Object.keys(nodeStatsCache).length > 0) {
             const before = allOutbounds.length;
@@ -3198,7 +3214,7 @@ const server = http.createServer(async (req, res) => {
             const statsEligible = [];
             const statsExcluded = [];
             for (const outbound of allOutbounds) {
-                const groupName = matchGroup(effectiveGroups, outbound.tag);
+                const { groupName } = identities.get(outbound);
                 if (groupName && excludedGroupSet.has(normalizeNodeName(groupName))) {
                     statsExcluded.push(outbound);
                 } else {
@@ -3225,46 +3241,34 @@ const server = http.createServer(async (req, res) => {
             }
         }
 
-        const quarantineSet = buildQuarantineSet();
-        if (quarantineSet.size > 0) {
+        if (quarantineSet.size > 0 || protectedNodes.length > 0) {
             const before = allOutbounds.length;
             allOutbounds = allOutbounds.filter((ob) => {
-                const stats = nodeStatsFresh ? getNodeStats(nodeStatsCache, ob) : null;
-                return !isNodeQuarantined(ob.tag, quarantineSet, stats?.sourceNode);
+                const { quarantined, isolated } = identities.get(ob);
+                if (quarantined) runtimeStats.quarantine_filtered_total += 1;
+                else if (isolated) runtimeStats.protection_filtered_total += 1;
+                return !quarantined && !isolated;
             });
             const removed = before - allOutbounds.length;
             if (removed > 0) {
-                runtimeStats.quarantine_filtered_total += removed;
-                logger.info('outbounds_filtered_by_quarantine', {
+                logger.warn('outbounds_filtered_by_isolation', {
                     request_id: requestId,
                     before,
                     after: allOutbounds.length,
-                    quarantine_count: QUARANTINE_NODES.length,
-                });
-            }
-        }
-
-        const protectionSet = buildProtectionSet();
-        if (protectionSet.size > 0) {
-            const before = allOutbounds.length;
-            allOutbounds = allOutbounds.filter((ob) => {
-                const stats = nodeStatsFresh ? getNodeStats(nodeStatsCache, ob) : null;
-                return !isNodeQuarantined(ob.tag, protectionSet, stats?.sourceNode);
-            });
-            const removed = before - allOutbounds.length;
-            if (removed > 0) {
-                runtimeStats.protection_filtered_total += removed;
-                logger.warn('outbounds_filtered_by_protection', {
-                    request_id: requestId,
-                    before,
-                    after: allOutbounds.length,
-                    protected_count: protectionSet.size,
+                    protected_count: protectedNodes.length,
+                    quarantine_count: quarantineSet.size,
                 });
             }
         }
 
         const beforeHiddenFilter = allOutbounds.length;
-        allOutbounds = filterHiddenOutbounds(allOutbounds, effectiveGroups, HIDDEN_GROUPS, HIDDEN_NODES);
+        const hiddenGroups = buildGroupNameSet(HIDDEN_GROUPS);
+        const hiddenNodes = buildGroupNameSet(HIDDEN_NODES);
+        allOutbounds = allOutbounds.filter((outbound) => (
+            !hiddenNodes.has(normalizeNodeName(collected.names.get(outbound)))
+            && !hiddenNodes.has(normalizeNodeName(outbound.tag))
+            && !hiddenGroups.has(normalizeNodeName(identities.get(outbound).groupName))
+        ));
         const hiddenRemoved = beforeHiddenFilter - allOutbounds.length;
         if (hiddenRemoved > 0) {
             logger.info('outbounds_hidden_by_config', {
@@ -3276,12 +3280,21 @@ const server = http.createServer(async (req, res) => {
             });
         }
 
+        const beforeDependencyFilter = allOutbounds.length;
+        allOutbounds = filterUsableOutbounds(allOutbounds, baseConfig);
+        if (beforeDependencyFilter > allOutbounds.length) {
+            logger.warn('xray_unusable_proxy_chain', {
+                request_id: requestId,
+                removed: beforeDependencyFilter - allOutbounds.length,
+            });
+        }
+
         if (allOutbounds.length === 0) {
             runtimeStats.all_nodes_unavailable_total += 1;
             logger.error('all_outbounds_unavailable', {
                 request_id: requestId,
                 quarantine_count: QUARANTINE_NODES.length,
-                protection_count: protectionSet.size,
+                protection_count: protectedNodes.length,
             });
             res.writeHead(503, {
                 'Content-Type': 'application/json; charset=utf-8',
@@ -3296,7 +3309,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         // ─── Группируем ───
-        const grouped = {};
+        const grouped = Object.create(null);
         const ungrouped = [];
         const configuredGroupOrder = Object.keys(effectiveGroups);
 
@@ -3306,7 +3319,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         for (const ob of allOutbounds) {
-            const group = matchGroup(effectiveGroups, ob.tag);
+            const { groupName: group } = identities.get(ob);
             if (group) {
                 if (!grouped[group]) grouped[group] = [];
                 grouped[group].push(ob);
@@ -3316,13 +3329,12 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (ungrouped.length > 0) {
-            const firstGroup = configuredGroupOrder[0] || Object.keys(grouped)[0];
-            if (firstGroup) {
-                grouped[firstGroup].push(...ungrouped);
-                logger.info('ungrouped_appended', { request_id: requestId, count: ungrouped.length, group: firstGroup });
-            } else {
-                grouped['🌐 Other'] = ungrouped;
+            let otherGroup = '🌐 Other';
+            let suffix = 2;
+            while (Object.hasOwn(grouped, otherGroup) || otherGroup === config.fastest_group_name) {
+                otherGroup = `🌐 Other #${suffix++}`;
             }
+            grouped[otherGroup] = ungrouped;
         }
 
         // Внутригрупповой порядок уже унаследован из allOutbounds после score-based сортировки.
@@ -3374,6 +3386,7 @@ const server = http.createServer(async (req, res) => {
             }
             const fastestGroupName = (config.fastest_group_name || DEFAULT_FASTEST_GROUP_NAME);
             const fastestConfig = buildGroupConfig(baseConfig, fastestGroupName, selectedFastestOutbounds, {
+                availableOutbounds: allOutbounds,
                 fallbackOutbounds: fastestOutbounds.length > 0 ? fastestFallbackOutbounds : [],
                 probeUrl: runtime.fastestProbeUrl,
                 probeInterval: runtime.probeInterval,
@@ -3445,6 +3458,7 @@ const server = http.createServer(async (req, res) => {
                     .slice(0, runtime.emergencyFallbackMaxNodes)
                 : [];
             const groupConfig = buildGroupConfig(baseConfig, configName, selectedGroupOutbounds, {
+                availableOutbounds: allOutbounds,
                 fallbackOutbounds: emergencyFallbackOutbounds,
                 probeUrl: PROBE_URL,
                 probeInterval: runtime.probeInterval,

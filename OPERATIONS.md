@@ -59,6 +59,7 @@ Admin endpoints are also rate-limited (`admin_rate_limit_per_minute`, `admin_rat
 
 ### Wrong grouping or fallback to `Other`
 - Adjust `groups` patterns.
+- `group_hosts` takes precedence for matching catalog entries. The client formats normally contain no host UUID, so the middleware correlates the exact host remark and endpoint to the panel catalog. Ambiguous entries are left to explicit patterns or the `Other` group.
 - Use `/admin/debug/token/{token}` to inspect payload type and cache behavior.
 
 ### A panel host was removed or replaced
@@ -85,7 +86,10 @@ Admin endpoints are also rate-limited (`admin_rate_limit_per_minute`, `admin_rat
 ### Node is under attack
 - Prefer `/admin/attack-mode` over permanent quarantine: it records a reason and expiry.
 - Isolation immediately clears subscription cache and sticky assignments for the node.
+- Both Xray and Mihomo resolve panel node UUIDs independently of the load statistics freshness window. A host linked to several nodes is omitted if no single endpoint can be identified and one of its linked nodes is isolated.
 - Existing client connections are not migrated; after disconnect, Xray selects an observed reserve outbound.
+- Mihomo uses a fallback group when both preferred and reserve pools exist. The preferred pool retains its configured `url-test` or round-robin strategy.
+- A proxy chain is omitted when its required relay has been removed, hidden or isolated.
 - If every outbound is unavailable, middleware returns `503 NO_HEALTHY_NODES` and does not fail open to the raw subscription.
 - Keep `sticky_mode: prefer`; `pin` removes client-side reserve outbounds.
 
