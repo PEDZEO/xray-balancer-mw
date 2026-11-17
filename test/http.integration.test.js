@@ -974,6 +974,110 @@ test('unresolved UUID host bindings fail closed instead of mixing nodes into the
     assert.equal(body.code, 'HOST_CATALOG_UNAVAILABLE');
 });
 
+function serveSubscriptionProxies(req, res, entries) {
+    if (req.headers['user-agent']?.startsWith('Mihomo')) {
+        res.setHeader('Content-Type', 'application/yaml; charset=utf-8');
+        res.end(YAML.stringify({
+            proxies: entries.map(({ name, address, port }) => ({ name, server: address, port, type: 'vless' })),
+            'proxy-groups': [{ name: 'Main', type: 'select', proxies: entries.map(({ name }) => name) }],
+            rules: ['MATCH,Main'],
+        }));
+    } else {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify(entries.map(({ name, address, port }) => ({
+            remarks: name,
+            outbounds: [{ protocol: 'vless', tag: 'proxy', settings: { vnext: [{ address, port }] } }],
+        }))));
+    }
+}
+
+test('UUID bindings match full host identity and leave unrelated servers in Other in both formats', async (t) => {
+    const entries = [
+        { name: 'Edge', address: 'edge.example', port: 443 },
+        { name: 'Edge Backup', address: 'edge.example', port: 443 },
+        { name: 'Unmatched', address: 'other.example', port: 443 },
+    ];
+    const panel = http.createServer((req, res) => res.end(JSON.stringify({ response: entries.slice(0, 2).map((entry, index) => ({
+        uuid: 'host-' + index, remark: entry.name, address: entry.address, port: entry.port,
+    })) })));
+    const upstream = http.createServer((req, res) => serveSubscriptionProxies(req, res, entries));
+    const upstreamPort = await listenOnRandomPort(upstream);
+    const panelPort = await listenOnRandomPort(panel);
+    t.after(() => Promise.all([closeServer(panel), closeServer(upstream)]));
+    const balancer = await startBalancer(t, {
+        upstreamPort, remnawave_url: 'http://127.0.0.1:' + panelPort,
+        groups: { Patterns: ['Edge Backup'], Chosen: [] }, group_hosts: { Chosen: ['host-0'] },
+    }, { API_TOKEN: 'integration-api-token' });
+
+    const xray = await (await fetch(balancer.baseUrl + '/uuid-exact-xray')).json();
+    const xrayGroups = new Map(xray.map((profile) => [profile.remarks, profile.routing.balancers[0].selector]));
+    assert.equal(xrayGroups.get('Chosen').length, 1);
+    assert.match(xrayGroups.get('Chosen')[0], /:Edge$/);
+    assert.match(xrayGroups.get('Patterns')[0], /:Edge Backup$/);
+    assert.match([...xrayGroups.values()].flat().find((tag) => tag.endsWith(':Unmatched')), /:Unmatched$/);
+    assert.deepEqual([...xrayGroups.keys()], ['Patterns', 'Chosen', '\u{1f310} Other']);
+
+    const mihomo = YAML.parse(await (await fetch(balancer.baseUrl + '/uuid-exact-mihomo', {
+        headers: { 'User-Agent': 'Mihomo/1.19.15' },
+    })).text());
+    const mihomoGroups = new Map(mihomo['proxy-groups'].map((group) => [group.name, group.proxies]));
+    assert.deepEqual(mihomoGroups.get('Chosen'), ['Chosen \u00b7 1']);
+    assert.deepEqual(mihomoGroups.get('Patterns'), ['Patterns \u00b7 1']);
+    assert.deepEqual(mihomoGroups.get('\u{1f310} \u0414\u0440\u0443\u0433\u0438\u0435 \u0441\u0435\u0440\u0432\u0435\u0440\u044b'), ['Unmatched']);
+});
+
+test('concurrent subscriptions wait for the same initial host catalog', async (t) => {
+    let finishCatalog;
+    let catalogHits = 0;
+    const panel = http.createServer((req, res) => {
+        catalogHits += 1;
+        finishCatalog = () => res.end(JSON.stringify({ response: [{
+            uuid: 'host', remark: 'Germany-1', address: 'node.example.com', port: 443,
+        }] }));
+    });
+    const upstream = http.createServer((req, res) => res.end(validXrayPayload()));
+    const upstreamPort = await listenOnRandomPort(upstream);
+    const panelPort = await listenOnRandomPort(panel);
+    t.after(() => Promise.all([closeServer(panel), closeServer(upstream)]));
+    const balancer = await startBalancer(t, {
+        upstreamPort, remnawave_url: 'http://127.0.0.1:' + panelPort, request_timeout_ms: 4000,
+        groups: { Germany: [] }, group_hosts: { Germany: ['host'] },
+    }, { API_TOKEN: 'integration-api-token' });
+    await waitFor(() => finishCatalog);
+    const pending = ['cold-one', 'cold-two'].map((token) => fetch(balancer.baseUrl + '/' + token));
+    try {
+        await waitFor(() => [...balancer.output().matchAll(/"event":"request_start"/g)].length === 2);
+    } finally {
+        finishCatalog();
+    }
+    for (const response of await Promise.all(pending)) {
+        assert.equal(response.status, 200);
+        assert.equal((await response.json())[0].remarks, 'Germany');
+    }
+    assert.equal(catalogHits, 1);
+});
+
+test('upstream UTF-8 split over HTTP chunks preserves group names and matches', async (t) => {
+    const name = '\u041f\u043e\u043b\u044c\u0448\u0430 \u{1f1f5}\u{1f1f1}';
+    const body = Buffer.from(JSON.stringify([{
+        remarks: name,
+        outbounds: [{ tag: 'proxy', protocol: 'vless', settings: { vnext: [{ address: 'pl.example', port: 443 }] } }],
+    }]));
+    const split = body.indexOf(Buffer.from(name)) + 1;
+    const upstream = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.write(body.subarray(0, split));
+        setTimeout(() => res.end(body.subarray(split)), 40);
+    });
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, { upstreamPort, groups: { [name]: [name] } });
+    const response = await fetch(balancer.baseUrl + '/utf8-split');
+    const [profile] = await response.json();
+    assert.equal(profile.remarks, name);
+    assert.ok(profile.routing.balancers[0].selector[0].endsWith(name));
+});
+
 for (const catalog of [[], {}]) {
     test(`missing bindings handle ${Array.isArray(catalog) ? 'an empty' : 'a malformed'} panel catalog safely`, async (t) => {
         const panel = http.createServer((req, res) => {
@@ -1977,6 +2081,101 @@ test('expired automatic isolation remains protected after restart until recovery
     const body = await response.json();
     assert.equal(response.status, 503);
     assert.equal(body.code, 'NO_HEALTHY_NODES');
+});
+
+test('restored UUID isolation follows renamed nodes and protects both formats with stale stats', async (t) => {
+    const entries = [
+        { name: 'Public CDN', address: 'cdn.example', port: 443 },
+        { name: 'Public direct', address: 'attack.example', port: 443 },
+        { name: 'Before rename', address: 'reserve.example', port: 443 },
+    ];
+    let nodesAvailable = true;
+    const panel = http.createServer((req, res) => {
+        if (req.url === '/api/hosts/') {
+            return res.end(JSON.stringify({ response: [{
+                uuid: 'host-cdn', remark: 'Public CDN', address: 'cdn.example', port: 443, nodes: ['isolated-id'],
+            }] }));
+        }
+        if (!nodesAvailable) return res.writeHead(503).end();
+        res.end(JSON.stringify({ response: [
+            { uuid: 'isolated-id', name: 'After rename', address: 'attack.example', isConnected: true, latencyMs: 20 },
+            { uuid: 'reserve-id', name: 'Before rename', address: 'reserve.example', isConnected: true, latencyMs: 30 },
+        ] }));
+    });
+    const upstream = http.createServer((req, res) => serveSubscriptionProxies(req, res, entries));
+    const panelPort = await listenOnRandomPort(panel);
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => Promise.all([closeServer(panel), closeServer(upstream)]));
+    const balancer = await startBalancer(t, {
+        upstreamPort, remnawave_url: 'http://127.0.0.1:' + panelPort,
+        groups: { Nodes: ['Public', 'Before rename'] },
+        testRuntimePatch: { attack_nodes: [{
+            node: 'Before rename', node_id: 'isolated-id', mode: 'manual',
+            reason: 'test isolation', source: 'admin', expires_at: new Date(Date.now() + 60000).toISOString(),
+        }] },
+    }, { API_TOKEN: 'integration-api-token', NODE_STATS: 'true', NODE_STATS_STALE_SEC: '1' });
+    const adminHeaders = { 'X-Admin-Token': 'integration-admin-token' };
+    const stats = async () => (await fetch(balancer.baseUrl + '/admin/debug/stats', { headers: adminHeaders })).json();
+    await waitFor(async () => (await stats()).node_stats_fresh);
+    nodesAvailable = false;
+    await waitFor(async () => !(await stats()).node_stats_fresh);
+    await fetch(balancer.baseUrl + '/admin/refresh-stats', { method: 'POST', headers: adminHeaders });
+
+    const assertFiltered = async (token, headers) => {
+        const response = await fetch(balancer.baseUrl + '/' + token, { headers });
+        assert.equal(response.status, 200);
+        const body = await response.text();
+        assert.doesNotMatch(body, /cdn\.example|attack\.example/);
+        assert.match(body, /reserve\.example/);
+    };
+    await assertFiltered('stale-protection-xray', { 'User-Agent': 'Happ/1.0' });
+    await assertFiltered('stale-protection-mihomo', { 'User-Agent': 'Mihomo/1.19.15' });
+
+    const release = await fetch(balancer.baseUrl + '/admin/attack-mode/isolated-id', {
+        method: 'DELETE', headers: adminHeaders,
+    });
+    assert.equal(release.status, 200);
+    assert.equal((await release.json()).released, true);
+    const restored = await (await fetch(balancer.baseUrl + '/stale-protection-xray', {
+        headers: { 'User-Agent': 'Happ/1.0' },
+    })).text();
+    assert.match(restored, /cdn\.example/);
+    assert.match(restored, /attack\.example/);
+});
+
+test('Xray keeps chain dependencies across groups and drops the chain when its relay is hidden', async (t) => {
+    const upstream = http.createServer((req, res) => res.end(JSON.stringify([{
+        remarks: 'Entry',
+        outbounds: [
+            { tag: 'proxy', protocol: 'vless', settings: { vnext: [{ address: 'entry.example', port: 443 }] },
+                streamSettings: { sockopt: { dialerProxy: 'Relay' } } },
+            { tag: 'Relay', protocol: 'vless', settings: { vnext: [{ address: 'relay.example', port: 443 }] } },
+            { tag: 'Spare', protocol: 'vless', settings: { vnext: [{ address: 'spare.example', port: 443 }] } },
+        ],
+    }])));
+    const upstreamPort = await listenOnRandomPort(upstream);
+    t.after(() => closeServer(upstream));
+    const balancer = await startBalancer(t, {
+        upstreamPort, strategy: 'leastPing', testRuntimePatch: {},
+        groups: { Entry: ['Entry'], Relay: ['Relay'], Spare: ['Spare'] },
+    });
+    const read = async () => {
+        const response = await fetch(balancer.baseUrl + '/chain-test');
+        assert.equal(response.status, 200);
+        return new Map((await response.json()).map((profile) => [profile.remarks, profile]));
+    };
+    const entry = (await read()).get('Entry');
+    const relayTag = entry.outbounds.find((outbound) => outbound.settings?.vnext?.[0]?.address === 'relay.example').tag;
+    assert.equal(entry.outbounds[0].streamSettings.sockopt.dialerProxy, relayTag);
+    assert.equal(entry.routing.balancers[0].selector.length, 1);
+    assert.ok(!entry.burstObservatory.subjectSelector.includes(relayTag));
+    const update = await fetch(balancer.baseUrl + '/admin/groups', {
+        method: 'PUT',
+        headers: { 'X-Admin-Token': 'integration-admin-token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hidden_groups: ['Relay'] }),
+    });
+    assert.equal(update.status, 200, await update.text());
+    assert.deepEqual([...(await read()).keys()], ['Spare']);
 });
 
 test('subscription fails closed when every outbound is isolated', async (t) => {

@@ -5,6 +5,62 @@ const assert = require('node:assert/strict');
 const YAML = require('yaml');
 const { matchMihomoProxyGroup, transformMihomoYaml } = require('../lib/mihomo');
 
+test('Mihomo fastest leastPing keeps preferred strategy and adds eligible reserves', () => {
+    const result = transformMihomoYaml(YAML.stringify({
+        proxies: ['Main1', 'Main2', 'Spare', 'Excluded'].map((name) => ({
+            name, server: name.toLowerCase() + '.example', port: 443, type: 'vless',
+        })),
+        'proxy-groups': [{ name: 'Main', type: 'select', proxies: ['Main1', 'Main2', 'Spare'] }],
+        rules: ['MATCH,Main'],
+    }), {
+        groups: { MainPool: ['Main1', 'Main2'], Reserve: ['Spare'], Skip: ['Excluded'] },
+        fastestFallbackGroups: ['Reserve'], fastestExcludeGroups: ['Skip'],
+        fastestName: 'Fast', strategy: 'leastPing', probeInterval: '45s', probeTimeout: '2s',
+        fastestProbeUrl: 'https://example.test/check',
+    });
+    const groups = new Map(result.document['proxy-groups'].map((group) => [group.name, group]));
+    const fastest = groups.get('Fast');
+    assert.equal(fastest.type, 'fallback');
+    assert.deepEqual(fastest.proxies, ['Fast (primary)', 'Reserve \u00b7 1']);
+    assert.equal(fastest.url, 'https://example.test/check');
+    assert.equal(fastest.interval, 45);
+    assert.equal(fastest.timeout, 2000);
+    assert.equal(groups.get('Fast (primary)').type, 'url-test');
+    assert.deepEqual(groups.get('Fast (primary)').proxies, ['MainPool \u00b7 1', 'MainPool \u00b7 2']);
+});
+
+test('Mihomo drops chains with hidden relays and preserves healthy alternatives without looping', () => {
+    const run = (hiddenNodes) => transformMihomoYaml(YAML.stringify({
+        proxies: [
+            { name: 'Entry', type: 'vless', server: 'entry.example', port: 443, 'dialer-proxy': 'Dialer' },
+            { name: 'Chained', type: 'vless', server: 'chain.example', port: 443, 'dialer-proxy': 'Relay' },
+            { name: 'Relay', type: 'vless', server: 'relay.example', port: 443 },
+            { name: 'Spare', type: 'vless', server: 'spare.example', port: 443 },
+        ],
+        'proxy-groups': [
+            { name: 'Dialer', type: 'select', proxies: ['Entry', 'Relay'], 'default-selected': 'Entry' },
+            { name: 'Route', type: 'select', proxies: ['Entry', 'Spare'] },
+        ],
+        rules: ['MATCH,Route'],
+    }), {
+        groups: { Dialer: ['Entry', 'Chained'], Relays: ['Relay'], Spares: ['Spare'] },
+        fastestName: 'Fast', strategy: 'leastPing', hiddenNodes,
+    }).document;
+
+    const available = run([]);
+    const entry = available.proxies.find((proxy) => proxy.server === 'entry.example');
+    const relay = available.proxies.find((proxy) => proxy.server === 'relay.example');
+    const dialerGroup = available['proxy-groups'].find((group) => group.name === entry['dialer-proxy']);
+    assert.equal(dialerGroup.name, 'Dialer (panel)');
+    assert.deepEqual(dialerGroup.proxies, [relay.name]);
+    assert.equal(available.proxies.find((proxy) => proxy.server === 'chain.example')['dialer-proxy'], relay.name);
+
+    const isolated = run(['Relay']);
+    assert.deepEqual(isolated.proxies.map((proxy) => proxy.server), ['spare.example']);
+    assert.deepEqual(isolated['proxy-groups'].find((group) => group.name === 'Dialer (panel)').proxies, ['REJECT']);
+});
+
+
 function liveLikeMihomoYaml() {
     return YAML.stringify({
         profile: { 'store-selected': true },
